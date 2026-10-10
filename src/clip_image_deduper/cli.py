@@ -395,6 +395,12 @@ def review_status(db: str, review_db: str | None) -> None:
             click.echo(f"  {status:8s} {n}{extra}")
         moves = review.plan_apply()
         click.echo(f"  {len(moves)} files would be moved by review-apply")
+        discarded = review.groups("decided", discarded=True)
+        if discarded:
+            click.echo(f"  {len(discarded)} decided groups are discarded whole (every member is moved)")
+        keepless = review.groups("decided", keeps_nothing=True)
+        if keepless:
+            click.echo(f"  {len(keepless)} decided groups keep nothing and are skipped: {', '.join(str(g.id) for g in keepless[:20])}{' …' if len(keepless) > 20 else ''}")
 
 
 @cli.command("review-apply")
@@ -410,6 +416,12 @@ def review_apply(image_dir: str, db: str, review_db: str | None, trash_dir: str,
         raise click.ClickException(f"No review database at {path}. Run dedupe --review-threshold first.")
     with ReviewDB(path) as review:
         decided = review.groups("decided")
+        keepless = review.groups("decided", keeps_nothing=True)
+        if keepless:
+            logger.warning(
+                "%d decided groups keep nothing and are skipped (keep a member, or discard the whole group with R in the GUI): %s",
+                len(keepless), ", ".join(str(g.id) for g in keepless),
+            )
         with _progress(len(decided), "Applying", "group") as progress:
             moved, refused = apply_decisions(review, image_dir, trash_dir, dry_run=dry_run, progress=progress)
     logger.info("Done: %d files %s, %d groups refused because files changed on disk%s", moved, "would be moved" if dry_run else "moved", len(refused), " (dry run)" if dry_run else "")

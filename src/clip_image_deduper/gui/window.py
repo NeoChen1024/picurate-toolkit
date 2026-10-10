@@ -45,8 +45,9 @@ from .models import GROUP_ROLE, STATUS_BADGES, BadgeDelegate, GroupListModel
 logger = logging.getLogger(__name__)
 
 THUMB = (96, 96)
-FILTERS = ("all", "pending", "decided", "skipped", "applied", "stale", "compression only", "pixel differences")
+FILTERS = ("all", "pending", "decided", "skipped", "applied", "stale", "compression only", "pixel differences", "keeps nothing", "discarded")
 PIXEL_FILTERS = {"compression only": "same", "pixel differences": "different"}  # any status but stale
+KEEP_FILTERS = {"keeps nothing": {"keeps_nothing": True}, "discarded": {"discarded": True}}  # any status but stale
 
 
 class ReviewWindow(QMainWindow):
@@ -149,6 +150,7 @@ class ReviewWindow(QMainWindow):
         self._action(bar, "Previous (Z)", lambda: self.navigate(-1), "Alt+Left")
         self._action(bar, "Next (X)", lambda: self.navigate(1), "Alt+Right")
         self._action(bar, "Policy pick (P)", self.reset_pending_to_policy)
+        self._action(bar, "Trash group (R)", self.discard_and_next)
         self._action(bar, "Undo (U)", self.undo)
         bar.addSeparator()
         self._action(bar, "Apply…", self.apply_dialog, "Ctrl+Return")
@@ -223,6 +225,8 @@ class ReviewWindow(QMainWindow):
         status = self.filter.currentText()
         if status in PIXEL_FILTERS:
             groups = self.review.groups(None, pixel=PIXEL_FILTERS[status])
+        elif status in KEEP_FILTERS:
+            groups = self.review.groups(None, **KEEP_FILTERS[status])
         else:
             groups = self.review.groups(None if status == "all" else status)
         self.groups_model.set_groups(groups)
@@ -243,7 +247,11 @@ class ReviewWindow(QMainWindow):
     def _update_counts(self) -> None:
         c = self.review.counts()
         moves = len(self.review.plan_apply())
-        self.counts_label.setText(f"{c['pending']} pending · {c['decided']} decided · {c['skipped']} skipped · {c['applied']} applied · {moves} files to trash")
+        keepless = len(self.review.groups("decided", keeps_nothing=True))
+        self.counts_label.setText(
+            f"{c['pending']} pending · {c['decided']} decided · {c['skipped']} skipped · {c['applied']} applied · {moves} files to trash"
+            + (f" · {keepless} decided keep nothing" if keepless else "")
+        )
 
     def navigate(self, delta: int, pending_only: bool = False) -> None:
         n = self.groups_model.rowCount()
@@ -367,7 +375,13 @@ class ReviewWindow(QMainWindow):
         label = STATUS_BADGES.get(g.status, STATUS_BADGES["pending"])[1]
         self.group_label.setText(f"Group {g.id}: {g.n} images · distances {g.min_distance:.3f} – {g.max_distance:.3f}")
         kept = sum(1 for m in self.members if m.keep)
-        self.status_label.setText(f"Status: {label} (C cycles) · keeping {kept} of {len(self.members)}")
+        if g.discard:
+            keeps = f"whole group discarded: Apply moves all {len(self.members)} (R restores)"
+        elif kept == 0:
+            keeps = "keeps nothing: Apply skips it; tick a member, or R to discard the whole group"
+        else:
+            keeps = f"keeping {kept} of {len(self.members)}"
+        self.status_label.setText(f"Status: {label} (C cycles) · {keeps}")
 
     # -- members -------------------------------------------------------------------------------------------------------
 
@@ -582,15 +596,16 @@ class ReviewWindow(QMainWindow):
 
     # -- decisions -----------------------------------------------------------------------------------------------------
 
-    def _decide(self, **kwargs) -> None:
+    def _decide(self, **kwargs) -> bool:
         if self.current is None:
-            return
+            return False
         try:
             self.review.decide(self.current.id, **kwargs)
         except ValueError as e:
             self.message(str(e))
-            return
+            return False
         self._after_change()
+        return True
 
     def _after_change(self) -> None:
         assert self.current is not None
@@ -656,10 +671,27 @@ class ReviewWindow(QMainWindow):
     def decide_and_next(self) -> None:
         if self.current is None:
             return
-        if not any(m.keep for m in self.members):
-            self.message("Nothing is kept in this group; tick at least one member before deciding")
+        if self._decide(status="decided"):
+            self.navigate(1, pending_only=True)
+
+    def discard_and_next(self) -> None:
+        """Mark the whole group to be moved by Apply, keeping none (R); on a discarded group, take the mark back."""
+        if self.current is None:
             return
-        self._decide(status="decided")
+        if self.current.status in ("applied", "stale"):
+            self.message(f"A{'n' if self.current.status == 'applied' else ''} {self.current.status} group cannot be discarded")
+            return
+        if self.current.discard:
+            if self._decide(discard=False, status="pending"):
+                self.message("No longer discarded; tick the members to keep")
+            return
+        try:
+            self.review.discard(self.current.id)
+        except ValueError as e:
+            self.message(str(e))
+            return
+        self._after_change()
+        self.message(f"Group {self.current.id} discarded: Apply moves all {len(self.members)} files")
         self.navigate(1, pending_only=True)
 
     def cycle_status(self) -> None:
@@ -694,7 +726,7 @@ class ReviewWindow(QMainWindow):
 
     def plan_text(self) -> tuple[str, int]:
         moves = self.review.plan_apply()
-        lines = [f"{m.path}  →  trash   (keeping {', '.join(m.keep)})" for m in moves]
+        lines = [f"{m.path}  →  trash   ({'keeping ' + ', '.join(m.keep) if m.keep else 'whole group discarded'})" for m in moves]
         return "\n".join(lines), len(moves)
 
     def _ensure_trash_dir(self) -> bool:
@@ -716,6 +748,11 @@ class ReviewWindow(QMainWindow):
         dialog.resize(800, 600)
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel(f"{n} files will be moved to the trash directory{': ' + self.trash_dir if self.trash_dir else ''}. Nothing is deleted."))
+        keepless = self.review.groups("decided", keeps_nothing=True)
+        if keepless:
+            layout.addWidget(
+                QLabel(f"{len(keepless)} decided group(s) keep nothing and are skipped. Show → keeps nothing lists them; R discards a whole group.")
+            )
         view = QPlainTextEdit()
         view.setReadOnly(True)
         view.setPlainText(text)
@@ -804,6 +841,8 @@ class ReviewWindow(QMainWindow):
                 self.cycle_status()
         elif key == Qt.Key.Key_S:
             self.skip_and_next()
+        elif key == Qt.Key.Key_R and not shift:
+            self.discard_and_next()
         elif key == Qt.Key.Key_U:
             self.undo()
         elif key == Qt.Key.Key_F:
@@ -859,12 +898,16 @@ HELP_HTML = """
 <p>A group marked <b>≈</b> passed the pixel check: every pair differs by lossy compression only, so it starts decided.
 The member panel shows each pair's result (≈ or ≠ and the largest local difference). The Show box can list only
 those groups, or only the ones with pixel differences.</p>
+<p>A group marked <b>∅</b> keeps nothing: every keep is unticked. It cannot be decided, and Apply skips it, since that
+is as often a slip as an intent. To move every member on purpose, discard it with <b>R</b>; it is then marked <b>✕</b>.
+Show → keeps nothing / discarded lists either kind.</p>
 <h3>Groups</h3>
 <table cellspacing="6">
 <tr><td><b>Z / X</b>, wheel, Alt+Left / Right</td><td>Previous / next group</td></tr>
 <tr><td><b>Shift+Z / Shift+X</b></td><td>Previous / next <i>pending</i> group</td></tr>
 <tr><td><b>Enter</b></td><td>Mark decided and go to the next pending group</td></tr>
 <tr><td><b>S</b></td><td>Skip and go to the next pending group</td></tr>
+<tr><td><b>R</b></td><td>Discard the whole group: Apply moves every member, keeping none; R again takes it back</td></tr>
 <tr><td><b>C</b></td><td>Cycle pending → decided → skipped</td></tr>
 <tr><td><b>U</b></td><td>Undo the last change of this group</td></tr>
 <tr><td><b>F</b></td><td>Edit the note</td></tr>

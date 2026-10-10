@@ -253,6 +253,32 @@ class GuiTests(unittest.TestCase):
             w.diff_images = original
         self.assertEqual(calls, [])  # served from the cache
 
+    def test_keeping_nothing_is_refused_and_r_discards_the_whole_group(self):
+        self.key(Qt.Key.Key_X)
+        gid = self.win.current.id
+        self.key(Qt.Key.Key_K)  # untick a.png, the only keep
+        self.assertIn("keeps nothing", self.win.status_label.text())
+        self.assertTrue(self.win.groups_model.data(self.win.groups_model.index(1)).startswith("∅ "))
+        self.key(Qt.Key.Key_Return)
+        self.key(Qt.Key.Key_C)
+        with ReviewDB(self.review_path) as db:
+            self.assertEqual(db.group(gid).status, "pending")  # neither Enter nor C decides it
+        self.win.filter.setCurrentText("keeps nothing")
+        self.win.wait_idle()
+        self.assertEqual([g.id for g in self.win.groups_model.groups], [gid])
+        self.key(Qt.Key.Key_R)
+        with ReviewDB(self.review_path) as db:
+            g = db.group(gid)
+            self.assertEqual((g.status, g.discard), ("decided", True))
+        self.assertTrue(self.win.groups_model.data(self.win.groups_model.index(0)).startswith("✕ "))
+        text, n = self.win.plan_text()
+        self.assertIn("sub/b.png  →  trash   (whole group discarded)", text)
+        self.assertEqual(n, 3)
+        self.key(Qt.Key.Key_R)  # takes it back
+        with ReviewDB(self.review_path) as db:
+            g = db.group(gid)
+            self.assertEqual((g.status, g.discard), ("pending", False))
+
     def test_filter(self):
         self.win.filter.setCurrentText("pending")
         self.win.wait_idle()

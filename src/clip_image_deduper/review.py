@@ -12,6 +12,9 @@ new rule (the pixel check, another auto threshold) reaches the groups still wait
 
 Starting status: with the pixel check, ``decided`` when every edge differs only by compression, else ``pending``;
 without it, ``decided`` when every edge is within the auto threshold.
+
+A decided group must keep at least one member, unless the reviewer marked it ``discard``: then applying it moves every
+member. Unticking every keep is not enough on its own, since that is as often a slip as an intent.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ from .pixel_check import SAME, PixelVerdict
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 STATUSES = ("pending", "decided", "skipped", "applied", "stale")
 
 _SCHEMA = """
@@ -50,7 +53,8 @@ CREATE TABLE IF NOT EXISTS groups (
     note         TEXT NOT NULL DEFAULT '',
     updated_at   REAL NOT NULL,
     pixel        TEXT,              -- 'same' when every edge differs only by compression, 'different', NULL: unchecked
-    touched      INTEGER NOT NULL DEFAULT 0  -- changed by the reviewer since it was created
+    touched      INTEGER NOT NULL DEFAULT 0, -- changed by the reviewer since it was created
+    discard      INTEGER NOT NULL DEFAULT 0  -- the reviewer chose to move every member, keeping none
 );
 CREATE INDEX IF NOT EXISTS groups_status ON groups (status, min_distance);
 CREATE TABLE IF NOT EXISTS members (
@@ -82,7 +86,8 @@ CREATE TABLE IF NOT EXISTS history (
     at        REAL NOT NULL,
     keep_json TEXT NOT NULL,
     status    TEXT NOT NULL,
-    note      TEXT NOT NULL
+    note      TEXT NOT NULL,
+    discard   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS history_group ON history (group_id, id);
 CREATE TABLE IF NOT EXISTS applied (
@@ -116,6 +121,8 @@ class GroupRow:
     updated_at: float
     pixel: str | None = None
     touched: bool = False
+    discard: bool = False
+    kept: int | None = None  # members kept; None when not read
 
 
 @dataclass(slots=True, frozen=True)
@@ -158,7 +165,7 @@ EdgeKey = tuple[str, str]
 class Move:
     group_id: int
     path: str
-    keep: tuple[str, ...]
+    keep: tuple[str, ...]  # empty for a discarded group
 
 
 class ReviewDB:
@@ -179,7 +186,7 @@ class ReviewDB:
         self.conn.commit()
 
     def _migrate(self) -> None:
-        """Add the columns of schema 2 to a schema 1 file. ``touched`` is derived from the history: a group was
+        """Add the columns of schemas 2 and 3 to an older file. ``touched`` is derived from the history: a group was
         touched when its status or note ever left the first snapshot's, or when its keeps differ from both the first
         snapshot and the recorded policy's choice (a bulk Policy pick is not a review decision)."""
         def columns(table: str) -> set[str]:
@@ -196,6 +203,10 @@ class ReviewDB:
             self.conn.execute("ALTER TABLE groups ADD COLUMN touched INTEGER NOT NULL DEFAULT 0")
             self._derive_touched()
             logger.info("Review database %s upgraded: %d groups were changed by a reviewer", self.path, self.conn.execute("SELECT COUNT(*) FROM groups WHERE touched").fetchone()[0])
+        if "discard" not in group_cols:
+            self.conn.execute("ALTER TABLE groups ADD COLUMN discard INTEGER NOT NULL DEFAULT 0")
+        if "discard" not in columns("history"):
+            self.conn.execute("ALTER TABLE history ADD COLUMN discard INTEGER NOT NULL DEFAULT 0")
         if self.get_meta("schema_version") not in (None, SCHEMA_VERSION):
             self.set_meta("schema_version", SCHEMA_VERSION)
 
@@ -372,16 +383,22 @@ class ReviewDB:
 
     # -- reading -----------------------------------------------------------------------------------------------------
 
+    _GROUP_SELECT = "SELECT g.*, (SELECT COUNT(*) FROM members m WHERE m.group_id = g.id AND m.keep) AS kept FROM groups g"
+
     @staticmethod
     def _group(row: sqlite3.Row) -> GroupRow:
         return GroupRow(
             row["id"], row["key"], row["n"], row["min_distance"], row["max_distance"], row["status"], row["note"], row["updated_at"],
-            row["pixel"], bool(row["touched"]),
+            row["pixel"], bool(row["touched"]), bool(row["discard"]), row["kept"],
         )
 
-    def groups(self, status: str | Sequence[str] | None = None, *, pixel: str | None = None) -> list[GroupRow]:
+    def groups(
+        self, status: str | Sequence[str] | None = None, *, pixel: str | None = None, keeps_nothing: bool = False, discarded: bool = False
+    ) -> list[GroupRow]:
         """Groups ordered by minimum distance (the surest first). ``status`` filters; ``None`` means every status
-        except ``stale``. ``pixel`` ("same" / "different") filters on the pixel check."""
+        except ``stale``. ``pixel`` ("same" / "different") filters on the pixel check. ``keeps_nothing`` lists only
+        groups with every keep unticked that are not marked discard (Apply refuses those when decided);
+        ``discarded`` only groups marked discard."""
         if status is None:
             statuses: tuple[str, ...] = ("pending", "decided", "skipped", "applied")
         elif isinstance(status, str):
@@ -389,16 +406,20 @@ class ReviewDB:
         else:
             statuses = tuple(status)
         marks = ",".join("?" * len(statuses))
-        sql = f"SELECT * FROM groups WHERE status IN ({marks})"
+        sql = f"SELECT * FROM ({self._GROUP_SELECT}) WHERE status IN ({marks})"
         args: list[object] = list(statuses)
         if pixel is not None:
             sql += " AND pixel = ?"
             args.append(pixel)
+        if keeps_nothing:
+            sql += " AND kept = 0 AND NOT discard"
+        if discarded:
+            sql += " AND discard"
         rows = self.conn.execute(sql + " ORDER BY min_distance, id", args).fetchall()
         return [self._group(r) for r in rows]
 
     def group(self, group_id: int) -> GroupRow:
-        row = self.conn.execute("SELECT * FROM groups WHERE id = ?", (group_id,)).fetchone()
+        row = self.conn.execute(f"{self._GROUP_SELECT} WHERE g.id = ?", (group_id,)).fetchone()
         if row is None:
             raise KeyError(group_id)
         return self._group(row)
@@ -452,35 +473,54 @@ class ReviewDB:
 
     def _snapshot(self, group_id: int, now: float) -> None:
         keeps = {r["path"]: bool(r["keep"]) for r in self.conn.execute("SELECT path, keep FROM members WHERE group_id = ?", (group_id,))}
-        g = self.conn.execute("SELECT status, note FROM groups WHERE id = ?", (group_id,)).fetchone()
+        g = self.conn.execute("SELECT status, note, discard FROM groups WHERE id = ?", (group_id,)).fetchone()
         self.conn.execute(
-            "INSERT INTO history (group_id, at, keep_json, status, note) VALUES (?, ?, ?, ?, ?)",
-            (group_id, now, json.dumps(keeps, sort_keys=True), g["status"], g["note"]),
+            "INSERT INTO history (group_id, at, keep_json, status, note, discard) VALUES (?, ?, ?, ?, ?, ?)",
+            (group_id, now, json.dumps(keeps, sort_keys=True), g["status"], g["note"], g["discard"]),
         )
 
     def decide(
-        self, group_id: int, *, keeps: dict[str, bool] | None = None, status: str | None = None, note: str | None = None, touch: bool = True
+        self,
+        group_id: int,
+        *,
+        keeps: dict[str, bool] | None = None,
+        status: str | None = None,
+        note: str | None = None,
+        discard: bool | None = None,
+        touch: bool = True,
     ) -> None:
-        """Change keep flags, status and/or note of a group in one committed step that ``undo`` can revert.
-        ``touch=False`` records the step without marking the group as reviewed (a bulk Policy pick)."""
+        """Change keep flags, status, note and/or the discard mark of a group in one committed step that ``undo`` can
+        revert. ``touch=False`` records the step without marking the group as reviewed (a bulk Policy pick).
+
+        Ticking a keep clears the discard mark. Setting ``status="decided"`` on a group that would keep nothing
+        without being marked discard raises ``ValueError``."""
         if status is not None and status not in STATUSES:
             raise ValueError(f"Unknown status {status!r}")
         g = self.group(group_id)
         if g.status == "applied":
             raise ValueError("An applied group cannot be changed; undo the apply first")
         now = time.time()
-        current = {m.path: m.keep for m in self.members(group_id)} if keeps else {}
+        current = {m.path: m.keep for m in self.members(group_id)}
         if keeps:
             unknown = set(keeps) - set(current)
             if unknown:
                 raise KeyError(f"Not members of group {group_id}: {sorted(unknown)}")
-        changes = (keeps and any(current[p] != bool(v) for p, v in keeps.items())) or (status is not None and status != g.status) or (note is not None and note != g.note)
+        after = {**current, **{p: bool(v) for p, v in (keeps or {}).items()}}
+        if discard is None:
+            discard = g.discard and not any(after.values())
+        if discard and any(after.values()):
+            raise ValueError("A discarded group keeps nothing; untick every member")
+        if status == "decided" and not any(after.values()) and not discard:
+            raise ValueError(f"Group {group_id} keeps nothing; tick a member to keep, or discard the whole group")
+        changes = (
+            after != current or (status is not None and status != g.status) or (note is not None and note != g.note) or discard != g.discard
+        )
         if not changes:
             return  # nothing to record: no history step, and the group stays untouched
         if keeps:
             self.conn.executemany("UPDATE members SET keep = ? WHERE group_id = ? AND path = ?", [(int(v), group_id, p) for p, v in keeps.items()])
-        sets: list[str] = ["updated_at = ?"] + (["touched = 1"] if touch else [])
-        args: list[object] = [now]
+        sets: list[str] = ["updated_at = ?", "discard = ?"] + (["touched = 1"] if touch else [])
+        args: list[object] = [now, int(discard)]
         if status is not None:
             sets.append("status = ?")
             args.append(status)
@@ -490,6 +530,10 @@ class ReviewDB:
         self.conn.execute(f"UPDATE groups SET {', '.join(sets)} WHERE id = ?", (*args, group_id))
         self._snapshot(group_id, now)
         self.conn.commit()
+
+    def discard(self, group_id: int) -> None:
+        """Mark a group to have every member moved by Apply (keeps nothing, decided)."""
+        self.decide(group_id, keeps={m.path: False for m in self.members(group_id)}, status="decided", discard=True)
 
     def keep_only(self, group_id: int, path: str, *, status: str | None = "decided") -> None:
         keeps = {m.path: m.path == path for m in self.members(group_id)}
@@ -513,7 +557,7 @@ class ReviewDB:
 
     def undo(self, group_id: int) -> bool:
         """Revert the last ``decide`` of a group. Returns False when there is nothing left to undo."""
-        rows = self.conn.execute("SELECT id, keep_json, status, note FROM history WHERE group_id = ? ORDER BY id DESC LIMIT 2", (group_id,)).fetchall()
+        rows = self.conn.execute("SELECT id, keep_json, status, note, discard FROM history WHERE group_id = ? ORDER BY id DESC LIMIT 2", (group_id,)).fetchall()
         if len(rows) < 2:
             return False
         current, previous = rows
@@ -522,7 +566,8 @@ class ReviewDB:
         for path, keep in json.loads(previous["keep_json"]).items():
             self.conn.execute("UPDATE members SET keep = ? WHERE group_id = ? AND path = ?", (int(keep), group_id, path))
         self.conn.execute(
-            "UPDATE groups SET status = ?, note = ?, updated_at = ? WHERE id = ?", (previous["status"], previous["note"], time.time(), group_id)
+            "UPDATE groups SET status = ?, note = ?, discard = ?, updated_at = ? WHERE id = ?",
+            (previous["status"], previous["note"], previous["discard"], time.time(), group_id),
         )
         self.conn.execute("DELETE FROM history WHERE id = ?", (current["id"],))
         if self.conn.execute("SELECT COUNT(*) FROM history WHERE group_id = ?", (group_id,)).fetchone()[0] == 1:
@@ -533,7 +578,8 @@ class ReviewDB:
     # -- applying ----------------------------------------------------------------------------------------------------
 
     def plan_apply(self, group_ids: Sequence[int] | None = None) -> list[Move]:
-        """Files that applying the decided groups would move, with what is kept instead."""
+        """Files that applying the decided groups would move, with what is kept instead. A decided group keeping
+        nothing is left out unless it is marked discard (see :meth:`groups` with ``keeps_nothing``)."""
         if group_ids is None:
             targets = [g.id for g in self.groups("decided")]
         else:
@@ -542,8 +588,8 @@ class ReviewDB:
         for gid in targets:
             members = self.members(gid)
             keep = tuple(m.path for m in members if m.keep)
-            if not keep:
-                logger.debug("Group %d keeps nothing; refusing to move all of its files", gid)
+            if not keep and not self.group(gid).discard:
+                logger.debug("Group %d keeps nothing and is not marked discard; refusing to move all of its files", gid)
                 continue
             moves.extend(Move(gid, m.path, keep) for m in members if not m.keep)
         return moves
@@ -607,7 +653,7 @@ def apply_decisions(
             continue
         done: list[tuple[str, str]] = []
         for mv in group_moves:
-            if move_to_trash(image_dir, mv.path, trash_dir, dry_run=dry_run, reason=f"keeping {', '.join(mv.keep)}"):
+            if move_to_trash(image_dir, mv.path, trash_dir, dry_run=dry_run, reason=f"keeping {', '.join(mv.keep)}" if mv.keep else "whole group discarded"):
                 done.append((mv.path, os.path.join(trash_dir, mv.path)))
         moved_total += len(done)
         if not dry_run:

@@ -49,15 +49,16 @@ Out (for now): editing images, cross-directory `dedupe-import` review, running t
   ```
   meta      key, value                       schema_version, review_threshold, auto_threshold, policy, model_id,
                                              image_dir, created_at
-  groups    id, key, n, min_distance, max_distance, status, note, updated_at, pixel, touched
+  groups    id, key, n, min_distance, max_distance, status, note, updated_at, pixel, touched, discard
                                              key = sha256 of the sorted member paths; UNIQUE
                                              pixel: same / different / NULL (unchecked); touched: changed by
-                                             the reviewer (an untouched group's status is re-derived per run)
+                                             the reviewer (an untouched group's status is re-derived per run);
+                                             discard: the reviewer chose to move every member (R)
   members   group_id, path, keep, width, height, size, format, mtime, distance_to_winner
                                              PRIMARY KEY (group_id, path); INDEX (path)
   edges     group_id, path_a, path_b, distance, pixel, pixel_peak, pixel_mean
                                              pixel check per pair; reused on re-runs when the files are unchanged
-  history   id, group_id, at, keep_json, status, note
+  history   id, group_id, at, keep_json, status, note, discard
                                              append-only; undo pops the last row of a group
   applied   path, trash_path, group_id, at   one row per moved file; "Undo apply" reads it back
   ```
@@ -130,6 +131,7 @@ as in the editor. Everything is also reachable from the toolbar / menu, and F1 l
 | Shift+P | reset this group's keeps to the policy's choice |
 | Enter | mark group decided and go to the next pending one |
 | C | cycle status pending → decided → skipped |
+| R | discard the whole group: keep nothing, decided, Apply moves every member; R again takes it back |
 | S | skip (same as cycling to skipped) and advance |
 | U | undo the last decision change (per-group history, like the editor's Undo Image) |
 | F | focus the note field; Esc returns to the canvas |
@@ -147,6 +149,11 @@ The Apply dialog lists `keep → trash` per decided group, with totals (files, b
 `dedupe.py` for each loser in a background job with progress, and records `applied` in the session with the trash
 paths in the `applied` table so an "Undo apply" can move them back as long as the trash directory is untouched. Groups whose files changed
 on disk since matching (mtime or missing) are refused and flagged; re-run `update-db` and Re-match.
+
+A group must keep at least one member to be decided (Enter and C refuse otherwise), and Apply skips a decided group
+keeping nothing (one from an older version, or whose last keep was unticked after deciding); the dialog says how many.
+Unticking every keep is as often a slip as an intent, so moving every member takes R, which marks the group `discard`
+(✕ in the list, ∅ for a group that merely keeps nothing). Show → "keeps nothing" / "discarded" lists either kind.
 
 ## Thresholds
 

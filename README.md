@@ -164,7 +164,8 @@ image views in the middle (side by side, flip while holding Space, or an amplifi
 thumbnails and keep checkboxes on the right. Z/X move between groups, 1-9 pick which member is shown as A
 (Shift+1-9 for B), K toggles keep on A, Enter marks the group decided and jumps to the next pending one, U undoes,
 F1 lists everything. Groups that passed the pixel check are marked ≈, and the Show box can list only those or only
-the ones with pixel differences. The keeping policy is chosen in the toolbar (custom ones via `--keeping-config`); P resets the
+the ones with pixel differences. A group can only be decided while it keeps a member; R discards a whole group on
+purpose (every member is moved), and Show → "keeps nothing" finds groups with every keep unticked. The keeping policy is chosen in the toolbar (custom ones via `--keeping-config`); P resets the
 keeps of every pending group to its choice, Shift+P only the current group's. Decisions are committed to the review database as they are made. **Apply** (Ctrl+Enter) lists
 every move, then moves the losers of decided groups to the trash directory; groups whose files changed on disk since
 matching are refused, and an applied group can be undone while the trash directory is untouched. Nothing is ever

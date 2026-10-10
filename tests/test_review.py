@@ -138,9 +138,37 @@ class ReviewDBTests(unittest.TestCase):
     def test_plan_apply_skips_groups_keeping_nothing(self):
         self.db.upsert_groups(self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.05)]), (["c.png", "d.png"], [("c.png", "d.png", 0.05)])), LARGEST, 0.1)
         g1, g2 = self.db.groups()
-        self.db.decide(g2.id, keeps={"c.png": False, "d.png": False})
+        self.db.decide(g2.id, keeps={"c.png": False, "d.png": False})  # unticked after deciding: allowed, but flagged
         moves = self.db.plan_apply()
         self.assertEqual([(m.group_id, m.path, m.keep) for m in moves], [(g1.id, "a.png", ("b.png",))])
+        self.assertEqual([(g.id, g.kept) for g in self.db.groups("decided", keeps_nothing=True)], [(g2.id, 0)])
+        with self.assertRaises(ValueError):
+            self.db.decide(g2.id, status="decided")  # deciding it again needs a keep or the discard mark
+
+    def test_discard_moves_every_member_and_undoes(self):
+        self.db.upsert_groups(self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.4)])), LARGEST, 0.1)
+        gid = self.db.groups()[0].id
+        with self.assertRaises(ValueError):
+            self.db.decide(gid, keeps={"b.png": False}, status="decided")
+        self.db.discard(gid)
+        g = self.db.group(gid)
+        self.assertEqual((g.status, g.discard, g.kept, g.touched), ("decided", True, 0, True))
+        self.assertEqual(self.db.groups(keeps_nothing=True), [])
+        self.assertEqual(self.db.groups(discarded=True), [g])
+        self.assertEqual(sorted((m.path, m.keep) for m in self.db.plan_apply()), [("a.png", ()), ("b.png", ())])
+        # a re-match leaves the reviewer's discard alone
+        self.db.upsert_groups(self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.4)])), LARGEST, 0.1)
+        g2 = self.db.group(gid)
+        self.assertEqual((g2.status, g2.discard, g2.kept), ("decided", True, 0))
+        self.assertTrue(self.db.undo(gid))
+        g = self.db.group(gid)
+        self.assertEqual((g.status, g.discard, g.kept), ("pending", False, 1))
+        self.db.discard(gid)
+        self.db.decide(gid, keeps={"a.png": True})  # ticking a keep takes the mark back
+        g = self.db.group(gid)
+        self.assertEqual((g.status, g.discard, g.kept), ("decided", False, 1))
+        with self.assertRaises(ValueError):
+            self.db.decide(gid, discard=True)
 
 
 class ApplyTests(unittest.TestCase):
@@ -222,6 +250,9 @@ class MigrationTests(unittest.TestCase):
                 # 1: no-op snapshots; 2: decided by hand; 3: keeps moved to what "largest" picks (a bulk Policy
                 # pick); 4: keeps moved away from the policy's choice by hand
                 self.assertEqual([(g.id, g.touched, g.pixel) for g in db.groups()], [(1, False, None), (2, True, None), (3, False, None), (4, True, None)])
+                self.assertFalse(any(g.discard for g in db.groups()))
+                self.assertTrue(db.undo(4))  # history rows from before the discard column restore as not discarded
+                self.assertFalse(db.group(4).discard)
 
 
 class CliReviewTests(unittest.TestCase):
