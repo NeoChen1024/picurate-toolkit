@@ -7,7 +7,11 @@ drive this module.
 
 Group identity is the hash of its sorted member paths. Re-matching upserts by that key: an unchanged group keeps
 its row, decision and history; a group whose membership changed is a new group, and the old row is marked
-``stale``.
+``stale``. A group nobody has changed yet (``touched`` is 0) gets its starting status re-derived on every run, so a
+new rule (the pixel check, another auto threshold) reaches the groups still waiting for review.
+
+Starting status: with the pixel check, ``decided`` when every edge differs only by compression, else ``pending``;
+without it, ``decided`` when every edge is within the auto threshold.
 """
 
 from __future__ import annotations
@@ -23,11 +27,12 @@ from dataclasses import dataclass
 
 from .db_store import ImageRecord
 from .dedupe import DuplicateGroup, move_to_trash
-from .keeping import Policy
+from .keeping import Policy, load_policies
+from .pixel_check import SAME, PixelVerdict
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 STATUSES = ("pending", "decided", "skipped", "applied", "stale")
 
 _SCHEMA = """
@@ -43,7 +48,9 @@ CREATE TABLE IF NOT EXISTS groups (
     max_distance REAL NOT NULL,
     status       TEXT NOT NULL,
     note         TEXT NOT NULL DEFAULT '',
-    updated_at   REAL NOT NULL
+    updated_at   REAL NOT NULL,
+    pixel        TEXT,              -- 'same' when every edge differs only by compression, 'different', NULL: unchecked
+    touched      INTEGER NOT NULL DEFAULT 0  -- changed by the reviewer since it was created
 );
 CREATE INDEX IF NOT EXISTS groups_status ON groups (status, min_distance);
 CREATE TABLE IF NOT EXISTS members (
@@ -63,7 +70,10 @@ CREATE TABLE IF NOT EXISTS edges (
     group_id INTEGER NOT NULL REFERENCES groups (id) ON DELETE CASCADE,
     path_a   TEXT NOT NULL,
     path_b   TEXT NOT NULL,
-    distance REAL NOT NULL
+    distance REAL NOT NULL,
+    pixel    TEXT,                  -- pixel_check verdict: same, different, aspect, error; NULL: unchecked
+    pixel_peak REAL,
+    pixel_mean REAL
 );
 CREATE INDEX IF NOT EXISTS edges_group ON edges (group_id);
 CREATE TABLE IF NOT EXISTS history (
@@ -104,6 +114,8 @@ class GroupRow:
     status: str
     note: str
     updated_at: float
+    pixel: str | None = None
+    touched: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -127,7 +139,19 @@ class UpsertStats:
     new: int = 0
     kept: int = 0
     stale: int = 0
-    predecided: int = 0
+    predecided: int = 0  # new groups that start decided
+    redecided: int = 0  # untouched groups that went from pending to decided under the current rule
+    reopened: int = 0  # untouched groups that went from decided back to pending
+    pixel_same: int = 0  # groups of this run whose every edge differs only by compression
+
+
+def initial_status(max_distance: float, pixel: str | None, auto_threshold: float) -> str:
+    if pixel is not None:
+        return "decided" if pixel == SAME else "pending"
+    return "decided" if max_distance <= auto_threshold else "pending"
+
+
+EdgeKey = tuple[str, str]
 
 
 @dataclass(slots=True, frozen=True)
@@ -149,9 +173,56 @@ class ReviewDB:
         self.conn.execute("PRAGMA synchronous = NORMAL")
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(_SCHEMA)
+        self._migrate()
         if self.get_meta("schema_version") is None:
             self.set_meta("schema_version", SCHEMA_VERSION)
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Add the columns of schema 2 to a schema 1 file. ``touched`` is derived from the history: a group was
+        touched when its status or note ever left the first snapshot's, or when its keeps differ from both the first
+        snapshot and the recorded policy's choice (a bulk Policy pick is not a review decision)."""
+        def columns(table: str) -> set[str]:
+            return {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+
+        edge_cols = columns("edges")
+        for name, kind in (("pixel", "TEXT"), ("pixel_peak", "REAL"), ("pixel_mean", "REAL")):
+            if name not in edge_cols:
+                self.conn.execute(f"ALTER TABLE edges ADD COLUMN {name} {kind}")
+        group_cols = columns("groups")
+        if "pixel" not in group_cols:
+            self.conn.execute("ALTER TABLE groups ADD COLUMN pixel TEXT")
+        if "touched" not in group_cols:
+            self.conn.execute("ALTER TABLE groups ADD COLUMN touched INTEGER NOT NULL DEFAULT 0")
+            self._derive_touched()
+            logger.info("Review database %s upgraded: %d groups were changed by a reviewer", self.path, self.conn.execute("SELECT COUNT(*) FROM groups WHERE touched").fetchone()[0])
+        if self.get_meta("schema_version") not in (None, SCHEMA_VERSION):
+            self.set_meta("schema_version", SCHEMA_VERSION)
+
+    def _derive_touched(self) -> None:
+        policy = load_policies().get(self.get_meta("policy") or "")
+        first: dict[int, tuple[str, str, str]] = {}
+        touched: set[int] = set()
+        keeps_changed: set[int] = set()
+        for r in self.conn.execute("SELECT group_id, keep_json, status, note FROM history ORDER BY group_id, id"):
+            gid = r["group_id"]
+            if gid not in first:
+                first[gid] = (r["keep_json"], r["status"], r["note"])
+                continue
+            keep0, status0, note0 = first[gid]
+            if r["status"] != status0 or r["note"] != note0:
+                touched.add(gid)
+            elif r["keep_json"] != keep0:
+                keeps_changed.add(gid)
+        for gid in keeps_changed - touched:
+            members = self.members(gid)
+            if policy is None or not members:
+                touched.add(gid)
+                continue
+            winner = policy.select([m.record for m in members])
+            if any(m.keep != (m.path == winner.path) for m in members):
+                touched.add(gid)
+        self.conn.executemany("UPDATE groups SET touched = 1 WHERE id = ?", [(gid,) for gid in touched])
 
     def __enter__(self) -> ReviewDB:
         return self
@@ -202,14 +273,19 @@ class ReviewDB:
     # -- matching results --------------------------------------------------------------------------------------------
 
     def upsert_groups(
-        self, groups: Iterable[tuple[Sequence[ImageRecord], Sequence[tuple[str, str, float]]]], policy: Policy, auto_threshold: float
+        self,
+        groups: Iterable[tuple[Sequence[ImageRecord], Sequence[tuple[str, str, float]]]],
+        policy: Policy,
+        auto_threshold: float,
+        pixel: dict[EdgeKey, PixelVerdict] | None = None,
     ) -> UpsertStats:
         """Store the groups of one matching run.
 
-        Each item is ``(member records, edges as (path_a, path_b, distance))``. New groups get the policy's winner
-        as the only kept member; groups whose every edge is at or below ``auto_threshold`` start ``decided`` (that
-        is what ``dedupe`` would have merged without asking). Existing groups keep their decision; file metadata is
-        refreshed. Groups not in this run that were still open are marked ``stale``.
+        Each item is ``(member records, edges as (path_a, path_b, distance))``; ``pixel`` holds the pixel check of
+        every edge, or is ``None`` when the check is off. New groups get the policy's winner as the only kept member
+        and start as :func:`initial_status` says. Existing groups keep their decision; file metadata, edges and
+        pixel results are refreshed, and an untouched group's status is re-derived. Groups not in this run that
+        were still open are marked ``stale``.
         """
         stats = UpsertStats()
         now = time.time()
@@ -221,17 +297,22 @@ class ReviewDB:
                 raise ValueError("A group needs at least one edge")
             dmin = min(d for _, _, d in edges)
             dmax = max(d for _, _, d in edges)
+            verdicts = None if pixel is None else [pixel[(a, b)] for a, b, _ in edges]
+            group_pixel = None if verdicts is None else ("same" if all(v.same for v in verdicts) else "different")
+            if group_pixel == "same":
+                stats.pixel_same += 1
+            start = initial_status(dmax, group_pixel, auto_threshold)
             winner = policy.select(records)
             by_pair = {}
             for a, b, d in edges:
                 by_pair[(a, b)] = d
                 by_pair[(b, a)] = d
-            row = self.conn.execute("SELECT id, status FROM groups WHERE key = ?", (key,)).fetchone()
+            row = self.conn.execute("SELECT id, status, touched FROM groups WHERE key = ?", (key,)).fetchone()
             if row is None:
-                status = "decided" if dmax <= auto_threshold else "pending"
+                status = start
                 cur = self.conn.execute(
-                    "INSERT INTO groups (key, n, min_distance, max_distance, status, note, updated_at) VALUES (?, ?, ?, ?, ?, '', ?)",
-                    (key, len(records), dmin, dmax, status, now),
+                    "INSERT INTO groups (key, n, min_distance, max_distance, status, note, updated_at, pixel) VALUES (?, ?, ?, ?, ?, '', ?, ?)",
+                    (key, len(records), dmin, dmax, status, now, group_pixel),
                 )
                 assert cur.lastrowid is not None
                 gid = int(cur.lastrowid)
@@ -248,13 +329,25 @@ class ReviewDB:
                     stats.predecided += 1
             else:
                 gid = int(row["id"])
-                new_status = row["status"]
+                old_status = new_status = row["status"]
                 if new_status == "stale":
                     new_status = "pending"
+                rederive = not row["touched"] and new_status in ("pending", "decided")
+                if rederive:
+                    new_status = start
+                    if old_status == "pending" and new_status == "decided":
+                        stats.redecided += 1
+                    elif old_status == "decided" and new_status == "pending":
+                        stats.reopened += 1
                 self.conn.execute(
-                    "UPDATE groups SET n = ?, min_distance = ?, max_distance = ?, status = ?, updated_at = ? WHERE id = ?",
-                    (len(records), dmin, dmax, new_status, now, gid),
+                    "UPDATE groups SET n = ?, min_distance = ?, max_distance = ?, status = ?, updated_at = ?, pixel = ? WHERE id = ?",
+                    (len(records), dmin, dmax, new_status, now, group_pixel, gid),
                 )
+                if rederive and new_status != old_status:
+                    # Still the starting point, not a decision: restart the history from it so undo cannot step
+                    # back into a status the old rule produced.
+                    self.conn.execute("DELETE FROM history WHERE group_id = ?", (gid,))
+                    self._snapshot(gid, now)
                 for r in records:
                     self.conn.execute(
                         "UPDATE members SET width = ?, height = ?, size = ?, format = ?, mtime = ?, distance_to_winner = ? WHERE group_id = ? AND path = ?",
@@ -262,7 +355,13 @@ class ReviewDB:
                     )
                 self.conn.execute("DELETE FROM edges WHERE group_id = ?", (gid,))
                 stats.kept += 1
-            self.conn.executemany("INSERT INTO edges (group_id, path_a, path_b, distance) VALUES (?, ?, ?, ?)", [(gid, a, b, d) for a, b, d in edges])
+            self.conn.executemany(
+                "INSERT INTO edges (group_id, path_a, path_b, distance, pixel, pixel_peak, pixel_mean) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (gid, a, b, d, *((None, None, None) if verdicts is None else (verdicts[k].status, verdicts[k].peak, verdicts[k].mean)))
+                    for k, (a, b, d) in enumerate(edges)
+                ],
+            )
         open_rows = self.conn.execute("SELECT id, key FROM groups WHERE status IN ('pending', 'decided', 'skipped')").fetchall()
         for r in open_rows:
             if r["key"] not in seen:
@@ -275,11 +374,14 @@ class ReviewDB:
 
     @staticmethod
     def _group(row: sqlite3.Row) -> GroupRow:
-        return GroupRow(row["id"], row["key"], row["n"], row["min_distance"], row["max_distance"], row["status"], row["note"], row["updated_at"])
+        return GroupRow(
+            row["id"], row["key"], row["n"], row["min_distance"], row["max_distance"], row["status"], row["note"], row["updated_at"],
+            row["pixel"], bool(row["touched"]),
+        )
 
-    def groups(self, status: str | Sequence[str] | None = None) -> list[GroupRow]:
+    def groups(self, status: str | Sequence[str] | None = None, *, pixel: str | None = None) -> list[GroupRow]:
         """Groups ordered by minimum distance (the surest first). ``status`` filters; ``None`` means every status
-        except ``stale``."""
+        except ``stale``. ``pixel`` ("same" / "different") filters on the pixel check."""
         if status is None:
             statuses: tuple[str, ...] = ("pending", "decided", "skipped", "applied")
         elif isinstance(status, str):
@@ -287,7 +389,12 @@ class ReviewDB:
         else:
             statuses = tuple(status)
         marks = ",".join("?" * len(statuses))
-        rows = self.conn.execute(f"SELECT * FROM groups WHERE status IN ({marks}) ORDER BY min_distance, id", statuses).fetchall()
+        sql = f"SELECT * FROM groups WHERE status IN ({marks})"
+        args: list[object] = list(statuses)
+        if pixel is not None:
+            sql += " AND pixel = ?"
+            args.append(pixel)
+        rows = self.conn.execute(sql + " ORDER BY min_distance, id", args).fetchall()
         return [self._group(r) for r in rows]
 
     def group(self, group_id: int) -> GroupRow:
@@ -302,6 +409,10 @@ class ReviewDB:
             out[r["status"]] = r["c"]
         return out
 
+    def pixel_counts(self) -> dict[tuple[str, str | None], int]:
+        """``{(status, pixel): count}`` over every group."""
+        return {(r["status"], r["pixel"]): r["c"] for r in self.conn.execute("SELECT status, pixel, COUNT(*) AS c FROM groups GROUP BY status, pixel")}
+
     def members(self, group_id: int) -> list[MemberRow]:
         rows = self.conn.execute("SELECT * FROM members WHERE group_id = ? ORDER BY path", (group_id,)).fetchall()
         return [MemberRow(r["path"], bool(r["keep"]), r["width"], r["height"], r["size"], r["format"], r["mtime"], r["distance_to_winner"]) for r in rows]
@@ -309,6 +420,30 @@ class ReviewDB:
     def edges(self, group_id: int) -> list[tuple[str, str, float]]:
         rows = self.conn.execute("SELECT path_a, path_b, distance FROM edges WHERE group_id = ? ORDER BY distance", (group_id,)).fetchall()
         return [(r["path_a"], r["path_b"], r["distance"]) for r in rows]
+
+    def edge_pixels(self, group_id: int) -> dict[EdgeKey, PixelVerdict]:
+        rows = self.conn.execute("SELECT path_a, path_b, pixel, pixel_peak, pixel_mean FROM edges WHERE group_id = ? AND pixel IS NOT NULL", (group_id,))
+        return {(r["path_a"], r["path_b"]): PixelVerdict(r["pixel"], r["pixel_peak"], r["pixel_mean"]) for r in rows}
+
+    def pixel_cache(self) -> dict[EdgeKey, tuple[PixelVerdict, tuple[float, int, float, int]]]:
+        """Stored pixel results by edge, with ``(mtime_a, size_a, mtime_b, size_b)`` as recorded when they were
+        measured, so a re-run can skip pairs whose files did not change. Verdicts are re-derived from peak and mean,
+        so a changed rule applies without re-reading anything; unreadable pairs are not cached."""
+        rows = self.conn.execute(
+            """SELECT e.path_a, e.path_b, e.pixel, e.pixel_peak, e.pixel_mean, ma.mtime AS mta, ma.size AS sa, mb.mtime AS mtb, mb.size AS sb
+               FROM edges e
+               JOIN members ma ON ma.group_id = e.group_id AND ma.path = e.path_a
+               JOIN members mb ON mb.group_id = e.group_id AND mb.path = e.path_b
+               WHERE e.pixel IS NOT NULL AND e.pixel != 'error'"""
+        )
+        out = {}
+        for r in rows:
+            if r["pixel_peak"] is not None:
+                verdict = PixelVerdict.measured(r["pixel_peak"], r["pixel_mean"])
+            else:
+                verdict = PixelVerdict(r["pixel"])
+            out[(r["path_a"], r["path_b"])] = (verdict, (r["mta"], r["sa"], r["mtb"], r["sb"]))
+        return out
 
     def groups_of(self, path: str) -> list[int]:
         return [r["group_id"] for r in self.conn.execute("SELECT group_id FROM members WHERE path = ?", (path,))]
@@ -323,21 +458,28 @@ class ReviewDB:
             (group_id, now, json.dumps(keeps, sort_keys=True), g["status"], g["note"]),
         )
 
-    def decide(self, group_id: int, *, keeps: dict[str, bool] | None = None, status: str | None = None, note: str | None = None) -> None:
-        """Change keep flags, status and/or note of a group in one committed step that ``undo`` can revert."""
+    def decide(
+        self, group_id: int, *, keeps: dict[str, bool] | None = None, status: str | None = None, note: str | None = None, touch: bool = True
+    ) -> None:
+        """Change keep flags, status and/or note of a group in one committed step that ``undo`` can revert.
+        ``touch=False`` records the step without marking the group as reviewed (a bulk Policy pick)."""
         if status is not None and status not in STATUSES:
             raise ValueError(f"Unknown status {status!r}")
         g = self.group(group_id)
         if g.status == "applied":
             raise ValueError("An applied group cannot be changed; undo the apply first")
         now = time.time()
+        current = {m.path: m.keep for m in self.members(group_id)} if keeps else {}
         if keeps:
-            known = {m.path for m in self.members(group_id)}
-            unknown = set(keeps) - known
+            unknown = set(keeps) - set(current)
             if unknown:
                 raise KeyError(f"Not members of group {group_id}: {sorted(unknown)}")
+        changes = (keeps and any(current[p] != bool(v) for p, v in keeps.items())) or (status is not None and status != g.status) or (note is not None and note != g.note)
+        if not changes:
+            return  # nothing to record: no history step, and the group stays untouched
+        if keeps:
             self.conn.executemany("UPDATE members SET keep = ? WHERE group_id = ? AND path = ?", [(int(v), group_id, p) for p, v in keeps.items()])
-        sets: list[str] = ["updated_at = ?"]
+        sets: list[str] = ["updated_at = ?"] + (["touched = 1"] if touch else [])
         args: list[object] = [now]
         if status is not None:
             sets.append("status = ?")
@@ -355,17 +497,17 @@ class ReviewDB:
             raise KeyError(path)
         self.decide(group_id, keeps=keeps, status=status)
 
-    def reset_to_policy(self, group_id: int, policy: Policy) -> None:
+    def reset_to_policy(self, group_id: int, policy: Policy, *, touch: bool = True) -> None:
         members = self.members(group_id)
         winner = policy.select([m.record for m in members])
-        self.decide(group_id, keeps={m.path: m.path == winner.path for m in members})
+        self.decide(group_id, keeps={m.path: m.path == winner.path for m in members}, touch=touch)
 
     def reset_pending_to_policy(self, policy: Policy) -> int:
-        """Set the keeps of every pending group to ``policy``'s winner (status unchanged, one history step each).
-        Returns the number of groups changed."""
+        """Set the keeps of every pending group to ``policy``'s winner (status unchanged, one history step each, not
+        counted as reviewing the group). Returns the number of pending groups."""
         n = 0
         for g in self.groups(status="pending"):
-            self.reset_to_policy(g.id, policy)
+            self.reset_to_policy(g.id, policy, touch=False)
             n += 1
         return n
 
@@ -383,6 +525,8 @@ class ReviewDB:
             "UPDATE groups SET status = ?, note = ?, updated_at = ? WHERE id = ?", (previous["status"], previous["note"], time.time(), group_id)
         )
         self.conn.execute("DELETE FROM history WHERE id = ?", (current["id"],))
+        if self.conn.execute("SELECT COUNT(*) FROM history WHERE group_id = ?", (group_id,)).fetchone()[0] == 1:
+            self.conn.execute("UPDATE groups SET touched = 0 WHERE id = ?", (group_id,))  # back at the starting point
         self.conn.commit()
         return True
 
@@ -409,7 +553,7 @@ class ReviewDB:
         self.conn.executemany(
             "INSERT OR REPLACE INTO applied (path, trash_path, group_id, at) VALUES (?, ?, ?, ?)", [(p, t, group_id, now) for p, t in moved]
         )
-        self.conn.execute("UPDATE groups SET status = 'applied', updated_at = ? WHERE id = ?", (now, group_id))
+        self.conn.execute("UPDATE groups SET status = 'applied', touched = 1, updated_at = ? WHERE id = ?", (now, group_id))
         self._snapshot(group_id, now)
         self.conn.commit()
 
@@ -492,8 +636,15 @@ def unapply_group(review: ReviewDB, image_dir: str, group_id: int) -> int:
 
 
 def store_matches(
-    review: ReviewDB, groups: Sequence[DuplicateGroup], records: Sequence[ImageRecord], policy: Policy, auto_threshold: float
+    review: ReviewDB,
+    groups: Sequence[DuplicateGroup],
+    records: Sequence[ImageRecord],
+    policy: Policy,
+    auto_threshold: float,
+    pixel: dict[tuple[int, int], PixelVerdict] | None = None,
 ) -> UpsertStats:
-    """Translate row-index groups from :func:`~.dedupe.group_edges` into path-keyed rows and upsert them."""
+    """Translate row-index groups from :func:`~.dedupe.group_edges` (and pixel results keyed by row pairs) into
+    path-keyed rows and upsert them."""
     items = [([records[i] for i in g.members], [(records[i].path, records[j].path, d) for i, j, d in g.edges]) for g in groups]
-    return review.upsert_groups(items, policy, auto_threshold)
+    by_path = None if pixel is None else {(records[i].path, records[j].path): v for (i, j), v in pixel.items()}
+    return review.upsert_groups(items, policy, auto_threshold, by_path)

@@ -77,14 +77,16 @@ class GroupListModel(QAbstractListModel):
             return None
         g = self.groups[index.row()]
         if role == Qt.ItemDataRole.DisplayRole:
-            return f"{g.n} images · {g.min_distance:.2f}" + (f" – {g.max_distance:.2f}" if g.max_distance - g.min_distance > 0.005 else "")
+            mark = "≈ " if g.pixel == "same" else ""
+            return f"{mark}{g.n} images · {g.min_distance:.2f}" + (f" – {g.max_distance:.2f}" if g.max_distance - g.min_distance > 0.005 else "")
         if role == STATUS_ROLE:
             return g.status
         if role == GROUP_ROLE:
             return g
         if role == Qt.ItemDataRole.ToolTipRole:
             label = STATUS_BADGES.get(g.status, STATUS_BADGES["pending"])[1]
-            return f"Group {g.id}: {g.n} images, distances {g.min_distance:.3f} to {g.max_distance:.3f} — {label}" + (f"\n{g.note}" if g.note else "")
+            pixel = {"same": "\nPixels: every pair differs by compression only", "different": "\nPixels: some pair differs by more than compression"}.get(g.pixel or "", "")
+            return f"Group {g.id}: {g.n} images, distances {g.min_distance:.3f} to {g.max_distance:.3f} — {label}{pixel}" + (f"\n{g.note}" if g.note else "")
         if role == Qt.ItemDataRole.SizeHintRole:
             return QSize(180, 26)
         return None

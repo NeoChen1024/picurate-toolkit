@@ -15,11 +15,12 @@ import tqdm
 
 from .db_store import EmbeddingDB, ImageRecord, load_database
 from .calibrate import VARIANTS, calibrate, default_variants, report
-from .dedupe import find_cross_duplicates, find_duplicate_edges, find_duplicate_groups, group_edges, move_to_trash, trash_duplicate_groups
+from .dedupe import find_cross_pairs, find_duplicate_edges, group_edges, move_to_trash, trash_duplicate_groups
 from .encoder import CLIPImageEncoder, default_model_id, default_seq_len, precision_choices
 from .encoding_pipeline import update_database
 from .keeping import PolicyError, load_policies
 from .log import setup_logging
+from .pixel_check import PixelVerdict, check_pairs, default_buffer_mib
 from .review import ReviewDB, apply_decisions, default_review_path, store_matches
 from .similarity import DistanceIndex, default_euclidean_distance_threshold, euclidean_distance
 
@@ -52,7 +53,11 @@ model_options = _options(
 
 update_options = _options(
     click.option("--batch-size", "-b", type=int, default=4, show_default=True, help="Images per model forward pass; raise if VRAM allows."),
-    click.option("--workers", "-j", type=int, default=None, help="Image decoder processes, 2x this many reads are kept in flight (default: number of CPUs; raise it on network/slow storage). Independent of --batch-size."),
+    click.option(
+        "--workers", "-j", type=int, default=None,
+        help="Image decoder processes, 2x this many reads are kept in flight (default: number of CPUs; raise it on network/slow storage). "
+        "Independent of --batch-size. Also the number of pixel-check processes.",
+    ),
     click.option("--force-update", "-f", is_flag=True, help="Re-encode every image, ignoring modification times. Also rebinds the DB to --model-id."),
     click.option("--clean-orphans/--no-clean-orphans", default=True, show_default=True, help="Remove DB entries whose image no longer exists."),
     click.option("--skip-update", is_flag=True, help="Do not touch the database, only match what is already in it."),
@@ -65,6 +70,18 @@ match_options = _options(
     ),
     click.option("--trash-dir", type=click.Path(file_okay=False), default=None, help="Move duplicates here (mirroring their relative paths). Omit to only report."),
     click.option("--dry-run", "-n", is_flag=True, help="Report what would be moved without moving. The DB is still refreshed unless --skip-update."),
+)
+
+pixel_options = _options(
+    click.option(
+        "--pixel-check/--no-pixel-check", default=True, show_default=True,
+        help="Compare the pixels of every matched pair and only treat it as a duplicate when the two differ by lossy compression alone "
+        "(not by a signature, an edit, a revision). Only ever blocks matches; in review mode it also decides which groups start decided.",
+    ),
+    click.option(
+        "--pixel-buffer", type=click.IntRange(64), default=default_buffer_mib, show_default=True,
+        help="MiB of decoded images the pixel check keeps across all its processes, so an image shared by several pairs is decoded once.",
+    ),
 )
 
 image_dir_arg = click.option("--image-dir", "-i", type=click.Path(exists=True, file_okay=False), required=True, help="Directory of images.")
@@ -125,6 +142,15 @@ def _load_index(db: str, device: str, what: str = "database") -> tuple[list[Imag
     return records, index
 
 
+def _pixel_check(pairs: list[tuple[str, str]], workers: int | None, buffer_mib: int) -> list[PixelVerdict]:
+    with _progress(len(pairs), "Pixel check", "pair") as progress:
+        return check_pairs(pairs, workers=workers, buffer_bytes=buffer_mib << 20, progress=progress)
+
+
+def _log_blocked(label_a: str, label_b: str, verdict: PixelVerdict) -> None:
+    logger.info('Not a duplicate by pixels: "%s" and "%s": %s', label_a, label_b, verdict.describe())
+
+
 def _policy(name: str, config: str | None):
     try:
         policies = load_policies(config)
@@ -157,13 +183,15 @@ def cli(verbose: bool) -> None:
 @click.option(
     "--review-threshold", type=float, default=None,
     help="Review mode: match at this looser distance and store every group in the review database for the GUI / review-apply "
-    "instead of moving anything. Groups entirely within --threshold start pre-decided by the keeping policy.",
+    "instead of moving anything. Groups whose every pair passes the pixel check start decided (keeping-policy winner kept); "
+    "with --no-pixel-check, groups entirely within --threshold do.",
 )
 @click.option("--review-db", type=click.Path(dir_okay=False), default=None, help="Review database path (default: <db>.review.sqlite).")
+@pixel_options
 def dedupe(
     image_dir: str, db: str, model_id: str, device: str, compile_: bool, seq_len: int, batch_size: int, workers: int | None, force_update: bool, clean_orphans: bool,
     skip_update: bool, threshold: float, trash_dir: str | None, dry_run: bool, keeping_logic: str, keeping_config: str | None,
-    review_threshold: float | None, review_db: str | None,
+    review_threshold: float | None, review_db: str | None, pixel_check: bool, pixel_buffer: int,
 ) -> None:
     """Find duplicates within one image directory."""
     policy = _policy(keeping_logic, keeping_config)  # validate before spending time on encoding
@@ -180,7 +208,7 @@ def dedupe(
     paths = [r.path for r in records]
     if review_threshold is not None:
         with _progress(index.n, "Matching") as progress:
-            groups = group_edges(index.n, find_duplicate_edges(paths, index, review_threshold, progress))
+            edges = find_duplicate_edges(paths, index, review_threshold, progress)
         index.release()
         review_path = review_db or default_review_path(db)
         with EmbeddingDB(db) as store, ReviewDB(review_path) as review:
@@ -190,18 +218,30 @@ def dedupe(
                 )
             except ValueError as e:
                 raise click.ClickException(str(e)) from e
-            stats = store_matches(review, groups, records, policy, threshold)
+            review.set_meta("pixel_check", "on" if pixel_check else "off")
+            pixel = _review_pixel_check(review, edges, records, image_dir, workers, pixel_buffer) if pixel_check else None
+            stats = store_matches(review, group_edges(index.n, edges), records, policy, threshold, pixel)
             counts = review.counts()
+        rule = "every pair differs by compression only" if pixel_check else f"within {threshold:g}"
         logger.info(
-            "Review database %s: %d groups this run (%d new, %d pre-decided within %g, %d seen before), %d went stale; "
-            "now %d pending, %d decided, %d skipped, %d applied",
-            review_path, len(groups), stats.new, stats.predecided, threshold, stats.kept, stats.stale,
+            "Review database %s: %d groups this run (%d new, %d of them start decided because %s; %d seen before, of which %d untouched ones "
+            "were re-decided and %d reopened), %d went stale; now %d pending, %d decided, %d skipped, %d applied",
+            review_path, stats.new + stats.kept, stats.new, stats.predecided, rule, stats.kept, stats.redecided, stats.reopened, stats.stale,
             counts["pending"], counts["decided"], counts["skipped"], counts["applied"],
         )
         return
     with _progress(index.n, "Matching") as progress:
-        groups = find_duplicate_groups(paths, index, threshold, progress)
+        edges = find_duplicate_edges(paths, index, threshold, progress)
     index.release()
+    if pixel_check and edges:
+        verdicts = _pixel_check([(os.path.join(image_dir, paths[i]), os.path.join(image_dir, paths[j])) for i, j, _ in edges], workers, pixel_buffer)
+        for (i, j, _), v in zip(edges, verdicts):
+            if not v.same:
+                _log_blocked(paths[i], paths[j], v)
+        blocked = sum(1 for v in verdicts if not v.same)
+        edges = [e for e, v in zip(edges, verdicts) if v.same]
+        logger.info("Pixel check: %d of %d matched pairs differ by more than compression and are not merged", blocked, len(verdicts))
+    groups = [g.members for g in group_edges(index.n, edges)]
 
     duplicates = sum(len(g) - 1 for g in groups)
     moved = 0
@@ -215,6 +255,29 @@ def dedupe(
     )
 
 
+def _review_pixel_check(
+    review: ReviewDB, edges: list[tuple[int, int, float]], records: list[ImageRecord], image_dir: str, workers: int | None, buffer_mib: int
+) -> dict[tuple[int, int], PixelVerdict]:
+    """Pixel verdicts for every edge, reusing the review database's results for pairs whose files are unchanged."""
+    cached = review.pixel_cache()
+    out: dict[tuple[int, int], PixelVerdict] = {}
+    todo: list[tuple[int, int]] = []
+    for i, j, _ in edges:
+        a, b = records[i], records[j]
+        hit = cached.get((a.path, b.path))
+        if hit is not None and hit[1] == (a.mtime, a.size, b.mtime, b.size):
+            out[(i, j)] = hit[0]
+        else:
+            todo.append((i, j))
+    logger.info("Pixel check: %d pairs to compare, %d unchanged since the last run", len(todo), len(edges) - len(todo))
+    if todo:
+        verdicts = _pixel_check([(os.path.join(image_dir, records[i].path), os.path.join(image_dir, records[j].path)) for i, j in todo], workers, buffer_mib)
+        out.update(zip(todo, verdicts))
+    same = sum(1 for v in out.values() if v.same)
+    logger.info("Pixel check: %d of %d pairs differ by compression only", same, len(out))
+    return out
+
+
 @cli.command("dedupe-import")
 @click.option("--base-image-dir", type=click.Path(exists=True, file_okay=False), required=True, help="Directory of images already in the collection.")
 @click.option("--base-db", type=click.Path(dir_okay=False), required=True, help="Embedding database for --base-image-dir.")
@@ -223,9 +286,10 @@ def dedupe(
 @model_options
 @update_options
 @match_options
+@pixel_options
 def dedupe_import(
     base_image_dir: str, base_db: str, import_image_dir: str, import_db: str, model_id: str, device: str, compile_: bool, seq_len: int, batch_size: int, workers: int | None,
-    force_update: bool, clean_orphans: bool, skip_update: bool, threshold: float, trash_dir: str | None, dry_run: bool,
+    force_update: bool, clean_orphans: bool, skip_update: bool, threshold: float, trash_dir: str | None, dry_run: bool, pixel_check: bool, pixel_buffer: int,
 ) -> None:
     """Remove images from an import directory that already exist in a base directory."""
     if not skip_update:
@@ -238,9 +302,21 @@ def dedupe_import(
     base_paths = [r.path for r in base_records]
     import_paths = [r.path for r in import_records]
     with _progress(import_index.n, "Matching") as progress:
-        hits = find_cross_duplicates(import_paths, import_index, base_paths, base_index, threshold, progress)
+        pairs = find_cross_pairs(import_paths, import_index, base_paths, base_index, threshold, progress)
     base_index.release()
     import_index.release()
+    if pixel_check and pairs:
+        verdicts = _pixel_check(
+            [(os.path.join(import_image_dir, import_paths[i]), os.path.join(base_image_dir, base_paths[j])) for i, j, _ in pairs], workers, pixel_buffer
+        )
+        for (i, j, _), v in zip(pairs, verdicts):
+            if not v.same:
+                _log_blocked(import_paths[i], f"base: {base_paths[j]}", v)
+        logger.info("Pixel check: %d of %d matched pairs differ by more than compression and do not count", sum(1 for v in verdicts if not v.same), len(verdicts))
+        pairs = [p for p, v in zip(pairs, verdicts) if v.same]
+    hits: dict[int, int] = {}
+    for i, _, _ in pairs:
+        hits[i] = hits.get(i, 0) + 1
 
     moved = 0
     if trash_dir is not None:
@@ -310,8 +386,13 @@ def review_status(db: str, review_db: str | None) -> None:
     with ReviewDB(path) as review:
         counts = review.counts()
         click.echo(f"{path}: model {review.get_meta('model_id')}, review threshold {review.review_threshold}, auto threshold {review.auto_threshold}, policy {review.get_meta('policy')}")
+        pixel = review.pixel_counts()
+        click.echo(f"  pixel check: {review.get_meta('pixel_check') or 'off'}")
         for status, n in counts.items():
-            click.echo(f"  {status:8s} {n}")
+            same = pixel.get((status, "same"), 0)
+            different = pixel.get((status, "different"), 0)
+            extra = f"  ({same} compression only, {different} with pixel differences)" if same or different else ""
+            click.echo(f"  {status:8s} {n}{extra}")
         moves = review.plan_apply()
         click.echo(f"  {len(moves)} files would be moved by review-apply")
 

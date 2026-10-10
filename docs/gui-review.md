@@ -49,11 +49,14 @@ Out (for now): editing images, cross-directory `dedupe-import` review, running t
   ```
   meta      key, value                       schema_version, review_threshold, auto_threshold, policy, model_id,
                                              image_dir, created_at
-  groups    id, key, n, min_distance, max_distance, status, note, updated_at
+  groups    id, key, n, min_distance, max_distance, status, note, updated_at, pixel, touched
                                              key = sha256 of the sorted member paths; UNIQUE
+                                             pixel: same / different / NULL (unchecked); touched: changed by
+                                             the reviewer (an untouched group's status is re-derived per run)
   members   group_id, path, keep, width, height, size, format, mtime, distance_to_winner
                                              PRIMARY KEY (group_id, path); INDEX (path)
-  edges     group_id, path_a, path_b, distance
+  edges     group_id, path_a, path_b, distance, pixel, pixel_peak, pixel_mean
+                                             pixel check per pair; reused on re-runs when the files are unchanged
   history   id, group_id, at, keep_json, status, note
                                              append-only; undo pops the last row of a group
   applied   path, trash_path, group_id, at   one row per moved file; "Undo apply" reads it back
@@ -149,9 +152,11 @@ on disk since matching (mtime or missing) are refused and flagged; re-run `updat
 
 The review threshold is the user's choice, made after looking at the `calibrate` histograms, and given once to
 `dedupe --review-threshold`; it is recorded in the review database's `meta` and shown by the GUI and
-`review-status`. The automatic threshold of the CLI (0.1 by default) is recorded alongside it: groups whose every
-pair is within it are what `dedupe` would have merged on its own, so they start pre-decided with the policy's
-choice, and the reviewer only looks at the band between the two values. Changing either value means re-running the
+`review-status`. Which groups start pre-decided with the policy's choice is the pixel check's call: those whose
+every pair differs by compression only, at any distance up to the review threshold. Groups with a pixel difference
+start pending even within the automatic threshold, because that is where artist revisions and pages of one pixiv
+set hide. With `--no-pixel-check` the automatic threshold of the CLI (0.1 by default) decides instead, as
+`dedupe` would have merged on its own. Changing either value means re-running the
 match from the CLI; decisions of groups whose membership did not change survive that.
 
 `calibrate` deliberately does not feed the GUI: its suggestion only exists when the variant and different-image

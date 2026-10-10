@@ -16,6 +16,8 @@ default 1152-dimensional model, so a million images need about 2.3 GiB of RAM an
 * Exact distances: on CUDA a small Triton kernel reads the FP16 embeddings and computes `sum((a-b)^2)` in FP32
   directly, avoiding the `|a|^2+|b|^2-2ab` cancellation that costs `torch.cdist` about 1e-2 of precision on
   unnormalized CLIP embeddings.
+* Pixel check: a matched pair only counts as a duplicate when its pixels differ by lossy compression alone, not by a
+  signature, an edit or an artist revision that the embedding cannot see. On by default; it only ever blocks matches.
 * Configurable keeping policies (which copy of a duplicate group survives), declared in TOML; four built in.
 * Three-stage pipeline: decoder processes read and fully preprocess images, the main thread gathers batches, and
   the GPU runs one batch while the next is being decoded. Decoder count and batch size are independent knobs.
@@ -90,6 +92,11 @@ clip-image-deduper calibrate -i pictures -d pictures.sqlite -s 200 --seed 0 --va
   `webp80`, `half`, `quarter`), `-t` may be repeated to see what several thresholds would catch. The suggestion is
   the largest variant distance rounded up, provided it is below the nearest different image; the default 0.1 is
   intentionally far below it and is not what this command recommends.
+* `--pixel-check/--no-pixel-check` (default on): for every pair within the threshold, compare the pixels and drop the
+  pair unless the two differ by compression alone. `dedupe` then never merges an edited or revised copy, and
+  `dedupe-import` never counts one as already present. See "How it works" for what is compared.
+* `--pixel-buffer` (default 2048 MiB): decoded pixels the pixel check keeps across all its processes, so an image
+  shared by several pairs is decoded once. The two images of each pair in progress are always held.
 * `-k, --keeping-logic` (default `largest`) and `--keeping-config`: see below.
 * `-n, --dry-run`: report what would be moved without moving. The database is still refreshed; add `--skip-update`
   for a run that writes nothing at all.
@@ -144,17 +151,20 @@ criteria = [
 ## Reviewing duplicates
 
 `dedupe --review-threshold T` matches at `T` and writes every group into `pictures.review.sqlite` (next to the
-embedding database) instead of moving anything. Groups whose every pair is within the normal `--threshold` start
-*decided* with the keeping policy's winner ticked, so what `dedupe` would have merged on its own needs no attention;
-everything else starts *pending*. Groups are keyed by their member paths, so re-running the match (after adding
-images, or with another threshold) keeps the decisions of groups whose membership did not change and marks the
-others stale.
+embedding database) instead of moving anything. Groups whose every pair passes the pixel check start *decided* with
+the keeping policy's winner ticked, whatever their embedding distance; every other group starts *pending*, even one
+within the normal `--threshold` (that is how artist revisions and pages of one pixiv set reach a human). With
+`--no-pixel-check` the old rule applies: groups entirely within `--threshold` start decided. Groups are keyed by their
+member paths, so re-running the match (after adding images, or with another threshold) keeps the decisions of groups
+whose membership did not change and marks the others stale. Groups nobody has changed yet get their starting status
+re-derived on every run, and pixel results are reused for files that did not change.
 
 `clip-image-deduper-review` opens that file: group list on the left (surest first, status badge per row), two linked
 image views in the middle (side by side, flip while holding Space, or an amplified difference), members with
 thumbnails and keep checkboxes on the right. Z/X move between groups, 1-9 pick which member is shown as A
 (Shift+1-9 for B), K toggles keep on A, Enter marks the group decided and jumps to the next pending one, U undoes,
-F1 lists everything. The keeping policy is chosen in the toolbar (custom ones via `--keeping-config`); P resets the
+F1 lists everything. Groups that passed the pixel check are marked ≈, and the Show box can list only those or only
+the ones with pixel differences. The keeping policy is chosen in the toolbar (custom ones via `--keeping-config`); P resets the
 keeps of every pending group to its choice, Shift+P only the current group's. Decisions are committed to the review database as they are made. **Apply** (Ctrl+Enter) lists
 every move, then moves the losers of decided groups to the trash directory; groups whose files changed on disk since
 matching are refused, and an applied group can be undone while the trash directory is untouched. Nothing is ever
@@ -176,6 +186,18 @@ On CUDA with Triton (bundled with PyTorch on Linux) the embeddings stay FP16 on 
 computes exact L2 distances with FP32 arithmetic. Elsewhere they are upcast to FP32 and `torch.cdist` is used; its
 matmul form loses about 1e-2 near zero distance, which is why the kernel exists. Peak VRAM for 100k images is about
 0.7 GiB on the Triton path and 1.1 GiB on the fallback.
+
+**Pixel check.** Both images are reduced to the smaller one's size (at most 1024 px on the long side, box filter),
+blurred with a Gaussian of sigma 1.5 px to remove JPEG block edges and ringing, and compared per pixel (largest
+difference over the three channels). The *peak* is the largest mean over 16x16 windows, the *mean* the average over
+the whole picture. A pair differs by compression only when the peak is at most 0.5, or when the peak is at most 12,
+the mean at most 3 (a global colour change fails here) and the peak at most 20 times the mean (a small mark on an
+otherwise identical copy fails here: compression noise is spread out, an edit is not). Pairs whose aspect ratios
+differ by more than 1% (crops) and unreadable files never pass; transparency is composited on grey first. Measured on
+the author's library with synthetic variants: JPEG q60-q90, WebP 80, double compression and a halved re-encode pass
+94.5-100%, 2%-high text and a 6-level colour shift 0%, 1%-high text and 1.5-3% patches 1-2%. Pairs sharing images go
+to the same process, which keeps decoded images within its share of `--pixel-buffer`; about 0.4 s per pair per core
+on a network share.
 
 **Encoding pipeline.** `--workers` processes each open a file, decode it, and run the model's full preprocessing
 (resize, normalize, patchify, cast to the model dtype), so the main process only ever sees ready-to-stack arrays. It keeps

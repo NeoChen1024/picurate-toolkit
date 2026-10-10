@@ -45,7 +45,8 @@ from .models import GROUP_ROLE, STATUS_BADGES, BadgeDelegate, GroupListModel
 logger = logging.getLogger(__name__)
 
 THUMB = (96, 96)
-FILTERS = ("all", "pending", "decided", "skipped", "applied", "stale")
+FILTERS = ("all", "pending", "decided", "skipped", "applied", "stale", "compression only", "pixel differences")
+PIXEL_FILTERS = {"compression only": "same", "pixel differences": "different"}  # any status but stale
 
 
 class ReviewWindow(QMainWindow):
@@ -220,7 +221,10 @@ class ReviewWindow(QMainWindow):
         if select_id is None and self.current is not None:
             select_id = self.current.id
         status = self.filter.currentText()
-        groups = self.review.groups(None if status == "all" else status)
+        if status in PIXEL_FILTERS:
+            groups = self.review.groups(None, pixel=PIXEL_FILTERS[status])
+        else:
+            groups = self.review.groups(None if status == "all" else status)
         self.groups_model.set_groups(groups)
         self._update_counts()
         row = self.groups_model.row_of(select_id) if select_id is not None else -1
@@ -279,7 +283,23 @@ class ReviewWindow(QMainWindow):
         self.note.blockSignals(False)
         self._show_members()
         names = {m.path: str(i + 1) for i, m in enumerate(self.members)}
-        self.edges_label.setText("  ".join(f"{names.get(a, '?')}–{names.get(b, '?')}: {d:.3f}" for a, b, d in edges[:30]) + ("  …" if len(edges) > 30 else ""))
+        pixels = self.review.edge_pixels(group.id)
+
+        def edge_text(a: str, b: str, d: float) -> str:
+            text = f"{names.get(a, '?')}–{names.get(b, '?')}: {d:.3f}"
+            v = pixels.get((a, b))
+            if v is None:
+                return text
+            if v.peak is not None:
+                return text + f" ({'≈' if v.same else '≠'} px {v.peak:.1f})"
+            return text + f" ({v.status})"
+
+        self.edges_label.setText("  ".join(edge_text(a, b, d) for a, b, d in edges[:30]) + ("  …" if len(edges) > 30 else ""))
+        self.edges_label.setToolTip(
+            "Embedding distance per pair, then the pixel check: ≈ differs by compression only, ≠ has pixel differences; "
+            "px is the largest local difference. It passes at 12 or less, and only when the rest of the picture carries "
+            "comparable compression noise: a small px on an otherwise identical copy is a local edit"
+        )
         self._refresh_group_label()
         self._request_images()
         self._prefetch()
@@ -836,6 +856,9 @@ _SHIFTED_DIGITS = {
 HELP_HTML = """
 <h2>Keyboard Shortcuts</h2>
 <p>Single letters are ignored while the note field has focus; Esc returns to the canvas.</p>
+<p>A group marked <b>≈</b> passed the pixel check: every pair differs by lossy compression only, so it starts decided.
+The member panel shows each pair's result (≈ or ≠ and the largest local difference). The Show box can list only
+those groups, or only the ones with pixel differences.</p>
 <h3>Groups</h3>
 <table cellspacing="6">
 <tr><td><b>Z / X</b>, wheel, Alt+Left / Right</td><td>Previous / next group</td></tr>

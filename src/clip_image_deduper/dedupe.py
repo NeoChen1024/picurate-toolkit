@@ -101,19 +101,28 @@ def find_duplicate_groups(paths: Sequence[str], index: DistanceIndex, threshold:
     return [g.members for g in group_edges(index.n, find_duplicate_edges(paths, index, threshold, progress))]
 
 
+def find_cross_pairs(
+    query_paths: Sequence[str], queries: DistanceIndex, base_paths: Sequence[str], base: DistanceIndex, threshold: float, progress: Progress = None
+) -> list[tuple[int, int, float]]:
+    """Every ``(query_row, base_row, distance)`` with ``distance <= threshold``."""
+    pairs: list[tuple[int, int, float]] = []
+    for start, end in queries.iter_blocks(other=base):
+        ii, jj, dd = find_close_pairs_cross(queries, base, threshold, start, end)
+        if len(ii):
+            _log_matches("Already in base:", query_paths, base_paths, ii, jj, dd)
+            pairs.extend(zip(ii.tolist(), jj.tolist(), dd.tolist()))
+        if progress:
+            progress(end - start)
+    return pairs
+
+
 def find_cross_duplicates(
     query_paths: Sequence[str], queries: DistanceIndex, base_paths: Sequence[str], base: DistanceIndex, threshold: float, progress: Progress = None
 ) -> dict[int, int]:
     """For every query row that has a match in ``base``: ``{query_row: number_of_matches}``."""
     hits: dict[int, int] = {}
-    for start, end in queries.iter_blocks(other=base):
-        ii, jj, dd = find_close_pairs_cross(queries, base, threshold, start, end)
-        if len(ii):
-            _log_matches("Already in base:", query_paths, base_paths, ii, jj, dd)
-            for i, count in zip(*np.unique(ii, return_counts=True)):
-                hits[int(i)] = int(count)
-        if progress:
-            progress(end - start)
+    for i, _, _ in find_cross_pairs(query_paths, queries, base_paths, base, threshold, progress):
+        hits[i] = hits.get(i, 0) + 1
     return hits
 
 
