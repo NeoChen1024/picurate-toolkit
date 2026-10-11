@@ -6,9 +6,11 @@ authors = [{name = "Neo_Chen", email = "chenkolei@gmail.com"}]
 requires-python = ">=3.11"
 dependencies = [
     "click",
+    "huggingface_hub",
     "humanize",
     "numpy",
     "pillow",
+    "safetensors",
     "timm",
     "torch",
     "torchvision",
@@ -36,6 +38,7 @@ training = [
 clip-image-deduper = "clip_image_deduper.cli:cli"
 clip-image-deduper-review = "clip_image_deduper.gui.app:main"
 clip-dataset-preprocess = "clip_training.dataset_preprocessing:main"
+vit-tagger = "vit_tagger.cli:main"
 
 [build-system]
 requires = ["setuptools>=64"]

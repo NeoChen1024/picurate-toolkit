@@ -171,6 +171,55 @@ every move, then moves the losers of decided groups to the trash directory; grou
 matching are refused, and an applied group can be undone while the trash directory is untouched. Nothing is ever
 deleted. `review-status` and `review-apply` do the same from the CLI.
 
+## Tagging images (`vit-tagger`)
+
+A separate command writes Danbooru-tag captions (`image.txt` next to `image.png`) for training, with
+[pixai-labs/pixai-tagger-v1.0](https://huggingface.co/pixai-labs/pixai-tagger-v1.0) (1.9 GiB download, 30877 tags in
+general/character/copyright/artist/meta/rating). It shares the decoder pipeline with the deduper.
+
+```shell
+vit-tagger run dataset --style anima --prefix "masterpiece, best quality"   # tag + write captions in one go
+vit-tagger run dataset --style sdxl -r --existing skip                       # sd-scripts WD14-style captions
+```
+
+For anything large, tag into a score database once and render captions from it as often as needed:
+
+```shell
+vit-tagger update dataset -r -d dataset.tags.sqlite          # GPU; Ctrl-C any time, rerun to resume
+vit-tagger export dataset -d dataset.tags.sqlite --style anima --override-artist-tag "nnn yryr"   # CPU, seconds
+```
+
+`update` commits every batch as it finishes and skips images whose mtime matches their row, so an interrupted run
+(Ctrl-C, crash, power loss) loses at most the batch on the GPU and the next run carries on; it also drops rows of
+deleted images. The database (`meta`, `tags`, `images`, `scores(image_id, tag_id, prob)`) keeps every tag scoring at
+least `--score-floor` (0.05) plus all ratings, ~60 rows per image, and is bound to the model revision, dtype and floor
+like the embedding database is to its model. `export` takes every caption option of `run`, refuses thresholds below
+the floor and skips images changed since they were tagged. Captions match `run`'s, up to the order of near-tied tags
+(fp16 results depend slightly on which images share a batch).
+
+* `--style anima` follows [Anima](https://huggingface.co/circlestone-labs/Anima)'s order,
+  `[prefix/meta/safety] [1girl/1boy/1other] [character] [series] [@artist] [general]`: spaces instead of underscores,
+  `@` before artists, safety as `safe/sensitive/nsfw/explicit`. Quality and year tags are not something a tagger
+  can know; put them in `--prefix`.
+* `--style sdxl` reproduces sd-scripts' `tag_images_by_wd14_tagger.py --remove_underscore --character_tags_first
+  --character_tag_expand --use_rating_tags_as_last_tag --always_first_tags "1girl,1boy"`: characters as
+  `name, series`, general tags in Danbooru popularity order, `general/sensitive/questionable/explicit` last, and like sd-scripts the
+  last always-first tag ends up first (`1boy, 1girl, ...`). Series,
+  artists (no `@`) follow the characters and meta tags precede the rating, as WD14 has no such categories.
+* Thresholds default to the checkpoint's per-category F1-optimal values (general 0.17, character 0.27, copyright
+  0.24, meta 0.17) except artists, at `--artist-threshold 0.5`: the model names an artist for any image, including
+  ones it never saw. `--no-artist` turns them off.
+* Meta tags are filtered to the ones describing the image (`--meta all` keeps Danbooru bookkeeping such as
+  `md5 mismatch`), and `lowres/highres/absurdres` come from the pixel size by Danbooru's rules (`--resolution`).
+* `--override-artist-tag "name"` writes that artist (comma-separated for several) for every image instead of any
+  prediction.
+* `--existing overwrite|skip|append`, `--undesired-tags`, `--tag-replacement`, `-o captions.json(l)`, `--frequency`
+  and `--debug` behave like their sd-scripts counterparts.
+
+The network is reimplemented in `src/vit_tagger/model.py` (no `trust_remote_code`; fp32 outputs match the
+checkpoint's own code to 2e-6). fp16 is the default on CUDA, within ~1e-3 of fp32. `--compile` compiles one static
+shape: 9.7 → 14.4 img/s on an RTX 4080 SUPER, about 1 GiB of VRAM at batch 1.
+
 ## How it works
 
 **Database.** Table `embeddings` has one row per image: `path` (relative to the image directory), `mtime`, `size`,
