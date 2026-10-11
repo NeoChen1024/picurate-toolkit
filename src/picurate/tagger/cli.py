@@ -17,7 +17,7 @@ import click
 import torch
 import tqdm
 
-from ..common.images import ImageRecord, is_image_path, walk_directory_relative
+from ..common.images import ImageRecord, is_hidden, is_image_path, walk_directory_relative
 from ..common.log import setup_logging
 from ..common.pipeline import run_pipeline
 from .captions import (
@@ -28,7 +28,6 @@ from .captions import (
     CaptionOptions,
     Captioner,
     Vocabulary,
-    default_artist_threshold,
     normalize,
     parse_replacements,
     split_tag_list,
@@ -46,11 +45,11 @@ _DEFAULT_ALWAYS_FIRST = {"anima": "", "sdxl": "1girl,1boy"}
 # -- helpers ---------------------------------------------------------------------------------------------------------
 
 
-def _list_images(image_dir: str, recursive: bool) -> list[str]:
+def _list_images(image_dir: str, recursive: bool, include_hidden: bool) -> list[str]:
     if recursive:
-        rels = walk_directory_relative(image_dir)
+        rels = walk_directory_relative(image_dir, include_hidden=include_hidden)
     else:
-        rels = (e.name for e in os.scandir(image_dir) if e.is_file())
+        rels = (e.name for e in os.scandir(image_dir) if e.is_file() and (include_hidden or not is_hidden(e.name)))
     return sorted(r for r in rels if is_image_path(r))
 
 
@@ -141,6 +140,7 @@ def _threshold_help(category: str, default: str) -> str:
 
 image_dir_arg = click.argument("image_dir", type=click.Path(exists=True, file_okay=False))
 recursive_option = click.option("--recursive", "-r", is_flag=True, help="Also include images in subdirectories.")
+hidden_option = click.option("--include-hidden", is_flag=True, help="Also include hidden (dot) files and directories, which are skipped by default.")
 
 caption_options = _options(
     click.option("--style", type=click.Choice(STYLES), default="anima", show_default=True,
@@ -159,8 +159,8 @@ caption_options = _options(
     click.option("--character-threshold", type=float, default=None, help=_threshold_help("character", "checkpoint, 0.27")),
     click.option("--copyright-threshold", type=float, default=None, help=_threshold_help("copyright (series)", "checkpoint, 0.24")),
     click.option("--meta-threshold", type=float, default=None, help=_threshold_help("meta", "checkpoint, 0.17")),
-    click.option("--artist-threshold", type=float, default=default_artist_threshold, show_default=True,
-                 help="Minimum confidence for artist tags; not affected by --threshold. The model guesses an artist for every image, so keep it high. Above 1 disables them."),
+    click.option("--artist-threshold", type=float, default=None,
+                 help="Minimum confidence for artist tags; not affected by --threshold. Default: the checkpoint's value, 0.15. Above 1 disables them."),
     click.option("--no-artist", is_flag=True, help="Never emit artist tags (same as --artist-threshold 2)."),
     click.option("--override-artist-tag", default=None,
                  help="Comma-separated artist(s) written for every image instead of whatever the model predicts, e.g. 'nnn yryr' "
@@ -256,10 +256,11 @@ def cli() -> None:
 @cli.command()
 @image_dir_arg
 @recursive_option
+@hidden_option
 @caption_options
 @model_options
 @verbose_option
-def run(image_dir: str, recursive: bool, verbose: bool, **kw) -> None:
+def run(image_dir: str, recursive: bool, include_hidden: bool, verbose: bool, **kw) -> None:
     """Tag the images in IMAGE_DIR and write captions in one go, without a database.
 
     Caption files are written as each batch finishes, so after an interruption '--existing skip' carries on. A JSON
@@ -267,7 +268,7 @@ def run(image_dir: str, recursive: bool, verbose: bool, **kw) -> None:
     """
     setup_logging(verbose)
     options, writer, frequency = _caption_setup(image_dir, kw)
-    images = _list_images(image_dir, recursive)
+    images = _list_images(image_dir, recursive, include_hidden)
     if writer.existing == "skip":
         images = [r for r in images if not writer.has_caption(r)]
     logger.info("%d images to tag", len(images))
@@ -298,20 +299,21 @@ def run(image_dir: str, recursive: bool, verbose: bool, **kw) -> None:
 @image_dir_arg
 @click.option("--db", "-d", type=click.Path(dir_okay=False), required=True, help="SQLite score database for IMAGE_DIR (created if missing).")
 @recursive_option
+@hidden_option
 @click.option("--force-update", "-f", is_flag=True, help="Re-tag every image, ignoring modification times. Also rebinds the database to the requested model/dtype/floor.")
 @click.option("--clean-orphans/--no-clean-orphans", default=True, show_default=True, help="Remove database entries whose image no longer exists.")
 @click.option("--score-floor", type=click.FloatRange(0, 1), default=default_score_floor, show_default=True,
               help="Store every tag scoring at least this (ratings always). Exports cannot use a lower threshold; part of the database binding.")
 @model_options
 @verbose_option
-def update(image_dir: str, db: str, recursive: bool, force_update: bool, clean_orphans: bool, score_floor: float, verbose: bool, **kw) -> None:
+def update(image_dir: str, db: str, recursive: bool, include_hidden: bool, force_update: bool, clean_orphans: bool, score_floor: float, verbose: bool, **kw) -> None:
     """Tag new and changed images of IMAGE_DIR into a score database.
 
     Every batch is committed as it finishes, and images whose modification time matches their row are skipped, so an
     interrupted update (Ctrl-C, crash, power loss) resumes where it stopped when run again.
     """
     setup_logging(verbose)
-    images = _list_images(image_dir, recursive)
+    images = _list_images(image_dir, recursive, include_hidden)
     with TagDB(db) as store:
         index = store.load_index()
         if clean_orphans:

@@ -61,6 +61,7 @@ update_options = _options(
     ),
     click.option("--force-update", "-f", is_flag=True, help="Re-encode every image, ignoring modification times. Also rebinds the DB to --model-id."),
     click.option("--clean-orphans/--no-clean-orphans", default=True, show_default=True, help="Remove DB entries whose image no longer exists."),
+    click.option("--include-hidden", is_flag=True, help="Also include hidden (dot) files and directories, which are skipped by default."),
     click.option("--skip-update", is_flag=True, help="Do not touch the database, only match what is already in it."),
 )
 
@@ -120,11 +121,11 @@ def _encoder(
         encoder.close()
 
 
-def _update(encoder: CLIPImageEncoder, image_dir: str, db: str, *, force_update: bool, clean_orphans: bool, batch_size: int, workers: int | None) -> None:
+def _update(encoder: CLIPImageEncoder, image_dir: str, db: str, *, force_update: bool, clean_orphans: bool, include_hidden: bool, batch_size: int, workers: int | None) -> None:
     logger.info("Updating database %s from %s", db, image_dir)
     try:
         update_database(
-            encoder, image_dir, db, force_update=force_update, clean_orphans=clean_orphans, batch_size=batch_size, workers=workers,
+            encoder, image_dir, db, force_update=force_update, clean_orphans=clean_orphans, include_hidden=include_hidden, batch_size=batch_size, workers=workers,
             progress_factory=_progress_factory("Encoding", "image"),
         )
     except RuntimeError as e:
@@ -190,7 +191,7 @@ def cli(verbose: bool) -> None:
 @click.option("--review-db", type=click.Path(dir_okay=False), default=None, help="Review database path (default: <db>.review.sqlite).")
 @pixel_options
 def dedupe(
-    image_dir: str, db: str, model_id: str, device: str, compile_: bool, seq_len: int, batch_size: int, workers: int | None, force_update: bool, clean_orphans: bool,
+    image_dir: str, db: str, model_id: str, device: str, compile_: bool, seq_len: int, batch_size: int, workers: int | None, force_update: bool, clean_orphans: bool, include_hidden: bool,
     skip_update: bool, threshold: float, trash_dir: str | None, dry_run: bool, keeping_logic: str, keeping_config: str | None,
     review_threshold: float | None, review_db: str | None, pixel_check: bool, pixel_buffer: int,
 ) -> None:
@@ -203,7 +204,7 @@ def dedupe(
             raise click.ClickException(f"--review-threshold ({review_threshold}) must be at least --threshold ({threshold}).")
     if not skip_update:
         with _encoder(model_id, device, compile_=compile_, seq_len=seq_len) as encoder:
-            _update(encoder, image_dir, db, force_update=force_update, clean_orphans=clean_orphans, batch_size=batch_size, workers=workers)
+            _update(encoder, image_dir, db, force_update=force_update, clean_orphans=clean_orphans, include_hidden=include_hidden, batch_size=batch_size, workers=workers)
 
     records, index = _load_index(db, device)
     paths = [r.path for r in records]
@@ -290,13 +291,13 @@ def _review_pixel_check(
 @pixel_options
 def dedupe_import(
     base_image_dir: str, base_db: str, import_image_dir: str, import_db: str, model_id: str, device: str, compile_: bool, seq_len: int, batch_size: int, workers: int | None,
-    force_update: bool, clean_orphans: bool, skip_update: bool, threshold: float, trash_dir: str | None, dry_run: bool, pixel_check: bool, pixel_buffer: int,
+    force_update: bool, clean_orphans: bool, include_hidden: bool, skip_update: bool, threshold: float, trash_dir: str | None, dry_run: bool, pixel_check: bool, pixel_buffer: int,
 ) -> None:
     """Remove images from an import directory that already exist in a base directory."""
     if not skip_update:
         with _encoder(model_id, device, compile_=compile_, seq_len=seq_len) as encoder:
-            _update(encoder, base_image_dir, base_db, force_update=force_update, clean_orphans=clean_orphans, batch_size=batch_size, workers=workers)
-            _update(encoder, import_image_dir, import_db, force_update=force_update, clean_orphans=clean_orphans, batch_size=batch_size, workers=workers)
+            _update(encoder, base_image_dir, base_db, force_update=force_update, clean_orphans=clean_orphans, include_hidden=include_hidden, batch_size=batch_size, workers=workers)
+            _update(encoder, import_image_dir, import_db, force_update=force_update, clean_orphans=clean_orphans, include_hidden=include_hidden, batch_size=batch_size, workers=workers)
 
     base_records, base_index = _load_index(base_db, device, "base database")
     import_records, import_index = _load_index(import_db, device, "import database")
@@ -338,12 +339,12 @@ def dedupe_import(
 @model_options
 @update_options
 def update_db(
-    image_dir: str, db: str, model_id: str, device: str, compile_: bool, seq_len: int, batch_size: int, workers: int | None, force_update: bool, clean_orphans: bool, skip_update: bool
+    image_dir: str, db: str, model_id: str, device: str, compile_: bool, seq_len: int, batch_size: int, workers: int | None, force_update: bool, clean_orphans: bool, include_hidden: bool, skip_update: bool
 ) -> None:
     """Only (re)encode images into the database, without matching."""
     if not skip_update:
         with _encoder(model_id, device, compile_=compile_, seq_len=seq_len) as encoder:
-            _update(encoder, image_dir, db, force_update=force_update, clean_orphans=clean_orphans, batch_size=batch_size, workers=workers)
+            _update(encoder, image_dir, db, force_update=force_update, clean_orphans=clean_orphans, include_hidden=include_hidden, batch_size=batch_size, workers=workers)
     records, embeddings = load_database(db)
     logger.info("%s holds %d embeddings of shape %s", db, len(records), embeddings.shape[1:])
 
@@ -442,7 +443,7 @@ def review_apply(image_dir: str, db: str, review_db: str | None, trash_dir: str,
 @click.option("--threshold", "-t", "thresholds", type=float, multiple=True, help="Threshold(s) to evaluate against the distributions (default: the dedupe default).")
 def calibrate_cmd(
     image_dir: str, db: str, model_id: str, device: str, compile_: bool, seq_len: int, batch_size: int, workers: int | None, force_update: bool,
-    clean_orphans: bool, skip_update: bool, samples: int, seed: int, variants: str, thresholds: tuple[float, ...],
+    clean_orphans: bool, include_hidden: bool, skip_update: bool, samples: int, seed: int, variants: str, thresholds: tuple[float, ...],
 ) -> None:
     """Measure how far lossy copies and different images sit, and suggest a threshold.
 
@@ -455,7 +456,7 @@ def calibrate_cmd(
         raise click.ClickException(f"Unknown variants {', '.join(unknown)}; available: {', '.join(VARIANTS)}")
     with _encoder(model_id, device, compile_=compile_, seq_len=seq_len) as encoder:
         if not skip_update:
-            _update(encoder, image_dir, db, force_update=force_update, clean_orphans=clean_orphans, batch_size=batch_size, workers=workers)
+            _update(encoder, image_dir, db, force_update=force_update, clean_orphans=clean_orphans, include_hidden=include_hidden, batch_size=batch_size, workers=workers)
         with EmbeddingDB(db) as store:
             if store.model_id != encoder.model_id:
                 raise click.ClickException(f"Database {db} was encoded with model '{store.model_id}', but '{encoder.model_id}' is loaded.")

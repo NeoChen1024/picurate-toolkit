@@ -26,10 +26,6 @@ STYLES = ("anima", "sdxl")
 CATEGORIES = ("general", "character", "copyright", "artist", "meta", "rating")
 _CHECKPOINT_CATEGORY: dict[str, str] = {"style": "artist"}
 
-# Artist predictions guess an artist for any image, including artists the model never saw; a wrong ``@artist`` in a
-# training caption is worse than none, so the default is far above the checkpoint's F1-optimal 0.15.
-default_artist_threshold = 0.5
-
 RATING_WORDS = {
     "anima": {"rating:g": "safe", "rating:s": "sensitive", "rating:q": "nsfw", "rating:e": "explicit"},
     "sdxl": {"rating:g": "general", "rating:s": "sensitive", "rating:q": "questionable", "rating:e": "explicit"},

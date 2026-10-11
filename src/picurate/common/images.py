@@ -20,11 +20,22 @@ PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True
 IMAGE_EXTENSIONS = frozenset(ext for ext, fmt in PIL.Image.registered_extensions().items() if fmt in PIL.Image.OPEN)
 
 
-def walk_directory_relative(directory: str) -> Iterator[str]:
-    """Yield file paths relative to ``directory``, depth first."""
-    for root, _, files in os.walk(directory):
+def is_hidden(name: str) -> bool:
+    return name.startswith(".")
+
+
+def walk_directory_relative(directory: str, *, include_hidden: bool = False) -> Iterator[str]:
+    """Yield file paths relative to ``directory``, depth first.
+
+    Unless ``include_hidden``, hidden files and directories (dot names) are skipped: build output, caches, VCS
+    metadata and macOS ``._*`` sidecars live there, rarely pictures anyone meant to include.
+    """
+    for root, dirs, files in os.walk(directory):
+        if not include_hidden:
+            dirs[:] = [d for d in dirs if not is_hidden(d)]
         for file in files:
-            yield os.path.relpath(os.path.join(root, file), directory)
+            if include_hidden or not is_hidden(file):
+                yield os.path.relpath(os.path.join(root, file), directory)
 
 
 def is_image_path(relative_path: str) -> bool:

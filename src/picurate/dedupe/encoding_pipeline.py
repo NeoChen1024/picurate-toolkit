@@ -18,7 +18,9 @@ logger = logging.getLogger(__name__)
 __all__ = ["encode_images", "find_candidates", "is_image_path", "update_database"]
 
 
-def find_candidates(image_dir: str, index: dict[str, float], *, force: bool = False) -> tuple[list[str], set[str]]:
+def find_candidates(
+    image_dir: str, index: dict[str, float], *, force: bool = False, include_hidden: bool = False
+) -> tuple[list[str], set[str]]:
     """Images under ``image_dir`` that need (re)encoding, and the set of all image paths seen.
 
     An image needs encoding when it has no row or its mtime differs from the stored one (``!=`` rather than ``>``,
@@ -26,7 +28,7 @@ def find_candidates(image_dir: str, index: dict[str, float], *, force: bool = Fa
     """
     candidates: list[str] = []
     seen: set[str] = set()
-    for rel in walk_directory_relative(image_dir):
+    for rel in walk_directory_relative(image_dir, include_hidden=include_hidden):
         if not is_image_path(rel):
             continue
         seen.add(rel)
@@ -67,6 +69,7 @@ def update_database(
     *,
     force_update: bool = False,
     clean_orphans: bool = True,
+    include_hidden: bool = False,
     batch_size: int = 4,
     workers: int | None = None,
     progress_factory: Callable[[int], Callable[[int], object]] | None = None,
@@ -83,7 +86,7 @@ def update_database(
             raise RuntimeError(str(e)) from e
 
         index = db.load_index()
-        candidates, seen = find_candidates(image_dir, index, force=force_update)
+        candidates, seen = find_candidates(image_dir, index, force=force_update, include_hidden=include_hidden)
         logger.info("%d images, %d to encode", len(seen), len(candidates))
         if candidates:
             progress = progress_factory(len(candidates)) if progress_factory else None
