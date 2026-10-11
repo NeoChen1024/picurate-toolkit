@@ -20,11 +20,12 @@ class TqdmHandler(logging.Handler):
             self.handleError(record)
 
 
-def setup_logging(verbose: bool = False) -> None:
-    root = logging.getLogger("clip_image_deduper")
-    root.setLevel(logging.DEBUG if verbose else logging.INFO)
-    if not any(isinstance(h, TqdmHandler) for h in root.handlers):
-        handler = TqdmHandler()
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        root.addHandler(handler)
-    root.propagate = False
+def setup_logging(verbose: bool = False, packages: tuple[str, ...] = ("clip_image_deduper",)) -> None:
+    for package in packages:
+        root = logging.getLogger(package)
+        root.setLevel(logging.DEBUG if verbose else logging.INFO)
+        if not any(isinstance(h, TqdmHandler) for h in root.handlers):
+            handler = TqdmHandler()
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            root.addHandler(handler)
+        root.propagate = False

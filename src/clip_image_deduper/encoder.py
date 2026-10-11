@@ -43,14 +43,14 @@ precision_choices = tuple(_PRECISIONS)
 
 
 class _FixedPreprocess:
-    """PIL -> ``(C, H, W)`` array in ``dtype``, fully preprocessed for a fixed-resolution tower. Picklable for workers."""
+    """PIL (any mode) -> ``(C, H, W)`` array in ``dtype``, fully preprocessed for a fixed-resolution tower. Picklable for workers."""
 
     def __init__(self, transform: Callable, dtype: np.dtype):
         self.transform = transform
         self.dtype = dtype
 
     def __call__(self, img: PIL.Image.Image) -> np.ndarray:
-        return self.transform(img).numpy().astype(self.dtype, copy=False)
+        return self.transform(img.convert("RGB")).numpy().astype(self.dtype, copy=False)
 
 
 class _NaFlexPreprocess:
@@ -62,7 +62,7 @@ class _NaFlexPreprocess:
         self.dtype = dtype
 
     def __call__(self, img: PIL.Image.Image) -> tuple[np.ndarray, np.ndarray]:
-        d = self.transform(img)
+        d = self.transform(img.convert("RGB"))
         return d["patches"].numpy().astype(self.dtype, copy=False), d["patch_coord"].numpy().astype(np.int32, copy=False)
 
 
