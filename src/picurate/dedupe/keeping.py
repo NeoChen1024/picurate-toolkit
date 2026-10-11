@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from importlib import resources
 from typing import Any
 
-from .db_store import ImageRecord
+from ..common.images import ImageRecord
 
 NUMERIC_ATTRS = ("size", "mtime", "width", "height", "pixels")
 STRING_ATTRS = ("path", "dirname", "basename", "ext")

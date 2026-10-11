@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .db_store import ImageRecord
+from ..common.images import ImageRecord
 from .keeping import Policy
 from .similarity import DistanceIndex, find_close_pairs_cross, find_close_pairs_self
 

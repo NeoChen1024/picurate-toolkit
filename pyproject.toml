@@ -1,7 +1,7 @@
 [project]
-name = "clip-image-deduper"
+name = "picurate-toolkit"
 version = "0.1.0"
-description = "Image deduplication by CLIP embedding similarity."
+description = "Deduplication, tagging and dataset editing for very large image collections."
 authors = [{name = "Neo_Chen", email = "chenkolei@gmail.com"}]
 requires-python = ">=3.11"
 dependencies = [
@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The PySide6 review GUI (clip-image-deduper-review). The CLI never imports Qt.
+# The PySide6 GUIs (picurate-dedupe-review). The CLIs never import Qt.
 gui = ["PySide6>=6.7"]
 # Dataset preprocessing and CLIP fine-tuning scripts (src/clip_training), not needed for deduplication.
 training = [
@@ -35,10 +35,10 @@ training = [
 ]
 
 [project.scripts]
-clip-image-deduper = "clip_image_deduper.cli:cli"
-clip-image-deduper-review = "clip_image_deduper.gui.app:main"
+picurate-dedupe = "picurate.dedupe.cli:cli"
+picurate-dedupe-review = "picurate.dedupe.gui.app:main"
+picurate-tag = "picurate.tagger.cli:main"
 clip-dataset-preprocess = "clip_training.dataset_preprocessing:main"
-vit-tagger = "vit_tagger.cli:main"
 
 [build-system]
 requires = ["setuptools>=64"]
@@ -48,7 +48,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-clip_image_deduper = ["policies.toml"]
+"picurate.dedupe" = ["policies.toml"]
 
 [tool.black]
 line-length = 132

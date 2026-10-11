@@ -11,7 +11,7 @@ import torch
 from click.testing import CliRunner
 from safetensors.torch import save_file
 
-from vit_tagger.captions import (
+from picurate.tagger.captions import (
     CaptionOptions,
     Captioner,
     Vocabulary,
@@ -20,10 +20,10 @@ from vit_tagger.captions import (
     prompt_form,
     resolution_tags,
 )
-from vit_tagger import cli as cli_mod
-from vit_tagger.cli import cli
-from vit_tagger.model import TaggerConfig, TaggerPreprocess, ViTDetTagger, load_model
-from vit_tagger.tag_db import Binding, TagDB, TagDBMismatchError
+from picurate.tagger import cli as cli_mod
+from picurate.tagger.cli import cli
+from picurate.tagger.model import TaggerConfig, TaggerPreprocess, ViTDetTagger, load_model
+from picurate.tagger.tag_db import Binding, TagDB, TagDBMismatchError
 
 # A vocabulary in the checkpoint's layout (category blocks in this order, "style" = artists), general tags in
 # popularity order like the real one.
@@ -352,7 +352,7 @@ class UpdateExportTests(unittest.TestCase):
             # orphans and stale files
             os.remove(os.path.join(image_dir, "0.png"))
             os.utime(os.path.join(image_dir, "1.png"), (1_000, 1_000))
-            with self.assertLogs("vit_tagger.cli", level="WARNING") as logs:
+            with self.assertLogs("picurate.tagger.cli", level="WARNING") as logs:
                 r = runner.invoke(cli, ["export", image_dir, "-d", db], catch_exceptions=False)
             self.assertTrue(any("1.png" in m for m in logs.output))
             self.assertFalse(os.path.exists(os.path.join(image_dir, "1.txt")))

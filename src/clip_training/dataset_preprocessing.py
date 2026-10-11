@@ -20,7 +20,7 @@ import tqdm
 from jsonlines import jsonlines
 from transformers import CLIPProcessor  # for trial tokenization
 
-from clip_image_deduper.encoding_pipeline import walk_directory_relative
+from picurate.common.images import walk_directory_relative
 
 default_clip_model = "laion/CLIP-ViT-L-14-laion2B-s32B-b82K"
 max_clip_tokens = 75

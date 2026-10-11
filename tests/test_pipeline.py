@@ -7,9 +7,9 @@ import numpy as np
 import PIL.Image
 import torch
 
-from clip_image_deduper import encoding_pipeline
-from clip_image_deduper.db_store import EmbeddingDB, load_database
-from clip_image_deduper.encoding_pipeline import find_candidates, is_image_path, update_database
+from picurate.dedupe import encoding_pipeline
+from picurate.dedupe.db_store import EmbeddingDB, load_database
+from picurate.dedupe.encoding_pipeline import find_candidates, is_image_path, update_database
 
 
 def _fake_preprocess(img):
@@ -56,7 +56,7 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             image_dir, db_path = os.path.join(tmp, "img"), os.path.join(tmp, "db.sqlite")
             _make_images(image_dir)
-            with self.assertLogs("clip_image_deduper.encoding_pipeline", level="WARNING") as logs:
+            with self.assertLogs("picurate.common.pipeline", level="WARNING") as logs:
                 update_database(StubEncoder(), image_dir, db_path, batch_size=2, workers=2)
             self.assertTrue(any("broken.jpg" in m for m in logs.output))
             records, emb = load_database(db_path)

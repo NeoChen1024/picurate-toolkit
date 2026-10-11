@@ -2,8 +2,8 @@ import os
 import tempfile
 import unittest
 
-from clip_image_deduper.db_store import ImageRecord
-from clip_image_deduper.keeping import Policy, PolicyError, builtin_policies, load_policies
+from picurate.common.images import ImageRecord
+from picurate.dedupe.keeping import Policy, PolicyError, builtin_policies, load_policies
 
 
 def rec(path, mtime=0.0, size=0, width=1, height=1, fmt="JPEG"):

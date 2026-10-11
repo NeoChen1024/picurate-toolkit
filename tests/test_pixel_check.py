@@ -8,7 +8,7 @@ import numpy as np
 import PIL.Image
 import PIL.ImageDraw
 
-from clip_image_deduper import pixel_check as pc
+from picurate.dedupe import pixel_check as pc
 
 
 def picture(w=640, h=480, seed=0) -> PIL.Image.Image:

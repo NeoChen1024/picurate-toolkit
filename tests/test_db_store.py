@@ -5,7 +5,7 @@ from unittest import mock
 
 import numpy as np
 
-from clip_image_deduper.db_store import SCHEMA_VERSION, EmbeddingDB, ImageRecord, ModelMismatchError, load_database
+from picurate.dedupe.db_store import SCHEMA_VERSION, EmbeddingDB, ImageRecord, ModelMismatchError, load_database
 
 
 def rec(path, mtime=1.0, size=1, width=4, height=3, fmt="JPEG"):

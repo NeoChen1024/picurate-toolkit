@@ -28,7 +28,7 @@ import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
-from .db_store import ImageRecord
+from ..common.images import ImageRecord
 from .dedupe import DuplicateGroup, move_to_trash
 from .keeping import Policy, load_policies
 from .pixel_check import SAME, PixelVerdict

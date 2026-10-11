@@ -1,4 +1,4 @@
-"""Command line interface: ``clip-image-deduper <subcommand>``."""
+"""Command line interface: ``picurate-dedupe <subcommand>``."""
 
 from __future__ import annotations
 
@@ -13,13 +13,14 @@ import numpy as np
 import torch
 import tqdm
 
-from .db_store import EmbeddingDB, ImageRecord, load_database
+from ..common.images import ImageRecord
+from ..common.log import setup_logging
+from .db_store import EmbeddingDB, load_database
 from .calibrate import VARIANTS, calibrate, default_variants, report
 from .dedupe import find_cross_pairs, find_duplicate_edges, group_edges, move_to_trash, trash_duplicate_groups
 from .encoder import CLIPImageEncoder, default_model_id, default_seq_len, precision_choices
 from .encoding_pipeline import update_database
 from .keeping import PolicyError, load_policies
-from .log import setup_logging
 from .pixel_check import PixelVerdict, check_pairs, default_buffer_mib
 from .review import ReviewDB, apply_decisions, default_review_path, store_matches
 from .similarity import DistanceIndex, default_euclidean_distance_threshold, euclidean_distance

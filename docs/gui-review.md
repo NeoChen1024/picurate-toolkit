@@ -1,6 +1,6 @@
 # Duplicate review GUI (PySide6)
 
-Status: implemented (`src/clip_image_deduper/gui`, `clip-image-deduper-review`). The text below is the design it
+Status: implemented (`src/picurate/dedupe/gui`, `picurate-dedupe-review`). The text below is the design it
 follows; deviations are noted inline.
 
 A reviewer for the cases the CLI must not decide on its own: pairs that are clearly related but not bit-identical
@@ -31,7 +31,7 @@ Out (for now): editing images, cross-directory `dedupe-import` review, running t
 
 ## Data model
 
-`src/clip_image_deduper/review.py` (no Qt, testable without a display):
+`src/picurate/dedupe/review.py` (no Qt, testable without a display):
 
 * `DuplicateGroup`: `members: list[int]` (DB row indices), `edges: list[tuple[int, int, float]]` (pairs under the
   review threshold with their distance), `min_distance`, `max_distance`. `find_duplicate_groups` currently throws
@@ -173,19 +173,19 @@ worth a human look", which may well be looser.
 ## Code layout and packaging
 
 ```
-src/clip_image_deduper/review.py          groups with edges, Decision, ReviewSession on SQLite (no Qt)
-src/clip_image_deduper/gui/__init__.py
-src/clip_image_deduper/gui/app.py         main(), QApplication, CLI args (--db, --image-dir, --trash-dir, --threshold)
-src/clip_image_deduper/gui/window.py      QMainWindow, toolbar, event filter, key map, help text
-src/clip_image_deduper/gui/models.py      GroupListModel, MemberListModel, thumbnail cache + jobs
-src/clip_image_deduper/gui/canvas.py      CompareCanvas (two linked views, flip, diff)
-src/clip_image_deduper/gui/jobs.py        Job(QRunnable) + Signals, image loading helpers
+src/picurate/dedupe/review.py             groups with edges, Decision, ReviewSession on SQLite (no Qt)
+src/picurate/dedupe/gui/__init__.py
+src/picurate/dedupe/gui/app.py            main(), QApplication, CLI args (--db, --image-dir, --trash-dir, --threshold)
+src/picurate/dedupe/gui/window.py         QMainWindow, toolbar, event filter, key map, help text
+src/picurate/dedupe/gui/models.py         GroupListModel, MemberListModel, thumbnail cache + jobs
+src/picurate/dedupe/gui/canvas.py         CompareCanvas (two linked views, flip, diff)
+src/picurate/dedupe/gui/jobs.py           Job(QRunnable) + Signals, image loading helpers
 tests/test_review.py                      session persistence, group identity, decision undo (no Qt)
 tests/test_gui.py                         QT_QPA_PLATFORM=offscreen: key map, focus rules, flip/diff, apply dry-run
 ```
 
 `pyproject.toml`: optional dependency group `gui = ["PySide6>=6.7"]`, script entry
-`clip-image-deduper-review = "clip_image_deduper.gui.app:main"`. The core package keeps zero Qt imports so the CLI
+`picurate-dedupe-review = "picurate.dedupe.gui.app:main"`. The core package keeps zero Qt imports so the CLI
 install stays small. Tests for the GUI run under `QT_QPA_PLATFORM=offscreen` and are skipped when PySide6 is not
 installed.
 

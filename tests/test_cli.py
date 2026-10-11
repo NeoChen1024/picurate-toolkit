@@ -6,9 +6,9 @@ from unittest import mock
 import numpy as np
 from click.testing import CliRunner
 
-from clip_image_deduper import cli as cli_mod
-from clip_image_deduper.cli import cli
-from clip_image_deduper.db_store import ImageRecord
+from picurate.dedupe import cli as cli_mod
+from picurate.dedupe.cli import cli
+from picurate.common.images import ImageRecord
 
 
 def _records(*names):
@@ -124,7 +124,7 @@ class PixelCheckCliTests(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.trash)), ["b.jpg", "c.png"])
 
     def test_review_mode_stores_pixel_results_and_reuses_them(self):
-        from clip_image_deduper import review as rv
+        from picurate.dedupe import review as rv
 
         res = self.run_cli("dedupe", "-i", self.img, "-d", self.db, "--review-threshold", "0.5")
         self.assertEqual(res.exit_code, 0, res.output)
@@ -140,7 +140,7 @@ class PixelCheckCliTests(unittest.TestCase):
         self.assertIn("with pixel differences", res.output)
 
     def test_review_mode_decides_a_compression_only_group(self):
-        from clip_image_deduper import review as rv
+        from picurate.dedupe import review as rv
 
         two, emb = self.records[:2], np.array([[0.0], [0.3]], dtype=np.float32)  # far beyond the auto threshold
         res = self.run_cli("dedupe", "-i", self.img, "-d", self.db, "--review-threshold", "0.5", records=two, emb=emb)

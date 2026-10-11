@@ -26,8 +26,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from clip_image_deduper.db_store import ImageRecord
-
+from ..common.images import ImageRecord
 from .captions import Vocabulary
 
 SCHEMA_VERSION = "1"
@@ -145,7 +144,7 @@ class TagDB:
         """The stored vocabulary in the checkpoint-config shape ``Vocabulary`` reads."""
         rows = self.conn.execute("SELECT id, name, category FROM tags ORDER BY id").fetchall()
         if not rows:
-            raise RuntimeError(f"Tag database {self.path} is empty; run 'vit-tagger update' first.")
+            raise RuntimeError(f"Tag database {self.path} is empty; run 'picurate-tag update' first.")
         split: list[list] = []
         for i, (tag_id, _, cat) in enumerate(rows):
             if tag_id != i:

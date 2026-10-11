@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import PIL.Image
 
-from .db_store import ImageRecord
+from ..common.images import ImageRecord
 from .encoder import CLIPImageEncoder, Preprocessed
 from .similarity import DistanceIndex
 

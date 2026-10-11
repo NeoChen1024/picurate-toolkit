@@ -1,5 +1,6 @@
-"""Incremental encoding: find images that are new or changed, decode them in worker processes, encode on the model
-device in batches, and store the embeddings plus file metadata in the database.
+"""The decode-and-batch pipeline every model in the toolkit runs on: worker processes decode and fully preprocess
+images, the main thread gathers batches and submits them to the model device, and results are collected one batch
+behind so the GPU never waits for the decoders (or the other way round).
 """
 
 from __future__ import annotations
@@ -15,41 +16,18 @@ from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wai
 from typing import TypeVar
 
 import PIL.Image
-import PIL.ImageFile
 import torch
 
-from .db_store import EmbeddingDB, ImageRecord, ModelMismatchError
-from .encoder import CLIPImageEncoder, PendingBatch, Preprocessed
+from .images import ImageRecord
 
 logger = logging.getLogger(__name__)
 
-P = TypeVar("P")
-
-# This is a tool for the user's own collection, not a server decoding untrusted uploads: behave like an image viewer.
-# Pillow's defaults reject images above ~179 Mpixel ("decompression bomb") and files whose data ends early, both of
-# which ordinary viewers display without complaint. These module globals apply to the process that imports this
-# module; worker processes re-import it, so they inherit the same settings.
-PIL.Image.MAX_IMAGE_PIXELS = None
-PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True
-
-# Extensions Pillow knows how to open. Anything else in the image dir (sidecar .txt, .json, ...) is ignored silently.
-IMAGE_EXTENSIONS = frozenset(ext for ext, fmt in PIL.Image.registered_extensions().items() if fmt in PIL.Image.OPEN)
-
-
-def walk_directory_relative(directory: str) -> Iterator[str]:
-    """Yield file paths relative to ``directory``, depth first."""
-    for root, _, files in os.walk(directory):
-        for file in files:
-            yield os.path.relpath(os.path.join(root, file), directory)
-
-
-def is_image_path(relative_path: str) -> bool:
-    return os.path.splitext(relative_path)[1].lower() in IMAGE_EXTENSIONS
-
+A = TypeVar("A")  # a preprocessed image, whatever the model wants
+P = TypeVar("P")  # a submitted batch
 
 def _load_image(
-    preprocessor: Callable[[PIL.Image.Image], Preprocessed], image_dir: str, relative_path: str
-) -> tuple[str, tuple[ImageRecord, Preprocessed] | Exception]:
+    preprocessor: Callable[[PIL.Image.Image], A], image_dir: str, relative_path: str
+) -> tuple[str, tuple[ImageRecord, A] | Exception]:
     """Worker: decode one image and run the model's full preprocessing (resize, normalize, patchify, dtype cast).
 
     The preprocessor gets the image in its own mode (first frame if animated) and does any color conversion itself,
@@ -96,28 +74,6 @@ def _init_worker() -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
-def find_candidates(image_dir: str, index: dict[str, float], *, force: bool = False) -> tuple[list[str], set[str]]:
-    """Images under ``image_dir`` that need (re)encoding, and the set of all image paths seen.
-
-    An image needs encoding when it has no row or its mtime differs from the stored one (``!=`` rather than ``>``,
-    so a file replaced by an older copy is re-encoded too).
-    """
-    candidates: list[str] = []
-    seen: set[str] = set()
-    for rel in walk_directory_relative(image_dir):
-        if not is_image_path(rel):
-            continue
-        seen.add(rel)
-        try:
-            mtime = os.path.getmtime(os.path.join(image_dir, rel))
-        except OSError as e:
-            logger.warning("Cannot stat %s: %s", rel, e)
-            continue
-        if force or index.get(rel) != mtime:
-            candidates.append(rel)
-    return candidates, seen
-
-
 def default_workers() -> int:
     return os.cpu_count() or 1
 
@@ -125,8 +81,8 @@ def default_workers() -> int:
 def run_pipeline(
     image_dir: str,
     candidates: Sequence[str],
-    preprocessor: Callable[[PIL.Image.Image], Preprocessed],
-    submit: Callable[[list[Preprocessed]], P],
+    preprocessor: Callable[[PIL.Image.Image], A],
+    submit: Callable[[list[A]], P],
     finish: Callable[[list[ImageRecord], P], object],
     *,
     batch_size: int,
@@ -157,7 +113,7 @@ def run_pipeline(
     workers = max(1, workers)
     window = 2 * workers
     done_count = 0
-    batch: list[tuple[ImageRecord, Preprocessed]] = []
+    batch: list[tuple[ImageRecord, A]] = []
     in_flight: tuple[list[ImageRecord], P] | None = None
 
     def finish_in_flight() -> None:
@@ -215,57 +171,3 @@ def run_pipeline(
     return done_count
 
 
-def encode_images(
-    encoder: CLIPImageEncoder,
-    db: EmbeddingDB,
-    image_dir: str,
-    candidates: Sequence[str],
-    *,
-    batch_size: int,
-    workers: int | None = None,
-    progress: Callable[[int], object] | None = None,
-) -> int:
-    """Encode ``candidates`` with ``run_pipeline`` and store their embeddings. Returns #stored."""
-
-    def store(records: list[ImageRecord], pending: PendingBatch) -> None:
-        db.upsert(zip(records, encoder.collect(pending)))
-
-    return run_pipeline(
-        image_dir, candidates, encoder.get_preprocessor(), encoder.submit, store, batch_size=batch_size, workers=workers, progress=progress
-    )
-
-
-def update_database(
-    encoder: CLIPImageEncoder,
-    image_dir: str,
-    db_path: str,
-    *,
-    force_update: bool = False,
-    clean_orphans: bool = True,
-    batch_size: int = 4,
-    workers: int | None = None,
-    progress_factory: Callable[[int], Callable[[int], object]] | None = None,
-) -> None:
-    """Bring ``db_path`` up to date with the images under ``image_dir``.
-
-    ``workers`` is the number of decoder processes (default: one per CPU). ``progress_factory(total)`` may return a
-    callable that is invoked with increments as images are processed.
-    """
-    with EmbeddingDB(db_path) as db:
-        try:
-            db.ensure_model(encoder.model_id, reset_on_mismatch=force_update)
-        except ModelMismatchError as e:
-            raise RuntimeError(str(e)) from e
-
-        index = db.load_index()
-        candidates, seen = find_candidates(image_dir, index, force=force_update)
-        logger.info("%d images, %d to encode", len(seen), len(candidates))
-        if candidates:
-            progress = progress_factory(len(candidates)) if progress_factory else None
-            encode_images(encoder, db, image_dir, candidates, batch_size=batch_size, workers=workers, progress=progress)
-
-        if clean_orphans:
-            orphans = [p for p in index if p not in seen]
-            for p in orphans:
-                logger.info("Removing orphaned database entry: %s", p)
-            db.delete(orphans)

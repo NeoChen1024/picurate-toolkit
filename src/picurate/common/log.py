@@ -20,7 +20,7 @@ class TqdmHandler(logging.Handler):
             self.handleError(record)
 
 
-def setup_logging(verbose: bool = False, packages: tuple[str, ...] = ("clip_image_deduper",)) -> None:
+def setup_logging(verbose: bool = False, packages: tuple[str, ...] = ("picurate",)) -> None:
     for package in packages:
         root = logging.getLogger(package)
         root.setLevel(logging.DEBUG if verbose else logging.INFO)

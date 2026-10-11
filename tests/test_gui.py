@@ -13,14 +13,14 @@ try:
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication
 
-    from clip_image_deduper.gui.canvas import CompareCanvas
-    from clip_image_deduper.gui.window import ReviewWindow
+    from picurate.dedupe.gui.canvas import CompareCanvas
+    from picurate.dedupe.gui.window import ReviewWindow
 except ImportError:  # pragma: no cover
     QApplication = None  # type: ignore[assignment]
 
-from clip_image_deduper.db_store import ImageRecord
-from clip_image_deduper.keeping import builtin_policies
-from clip_image_deduper.review import ReviewDB
+from picurate.common.images import ImageRecord
+from picurate.dedupe.keeping import builtin_policies
+from picurate.dedupe.review import ReviewDB
 
 
 @unittest.skipIf(QApplication is None, "PySide6 not installed")
@@ -240,7 +240,7 @@ class GuiTests(unittest.TestCase):
         self.win.canvas.set_mode("diff")
         self.win.wait_idle()
         self.assertEqual(sorted(self.win.diffs._d), [("a.png", "sub/b.png"), ("d.png", "c.png")])  # current and the group ahead
-        import clip_image_deduper.gui.window as w
+        import picurate.dedupe.gui.window as w
 
         calls = []
         original = w.diff_images
@@ -293,7 +293,7 @@ class CanvasTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def test_each_view_fits_its_own_image_and_zoom_multiplies_both(self):
-        from clip_image_deduper.gui.jobs import qimage
+        from picurate.dedupe.gui.jobs import qimage
 
         canvas = CompareCanvas()
         canvas.resize(400, 200)
@@ -310,7 +310,7 @@ class CanvasTests(unittest.TestCase):
         canvas.close()
 
     def test_fit_ignores_the_hidden_view(self):
-        from clip_image_deduper.gui.jobs import qimage
+        from picurate.dedupe.gui.jobs import qimage
 
         canvas = CompareCanvas()
         canvas.resize(400, 200)
@@ -336,7 +336,7 @@ class CanvasTests(unittest.TestCase):
     def test_fit_follows_the_final_viewport(self):
         """A fit asked for before the layout has settled (mode switch, resize, 100% with scrollbars) must end up
         matching the viewport the view actually gets, not the stale one it had at the time."""
-        from clip_image_deduper.gui.jobs import qimage
+        from picurate.dedupe.gui.jobs import qimage
 
         def expected(view):
             size = view.maximumViewportSize()
@@ -368,7 +368,7 @@ class CanvasTests(unittest.TestCase):
     def test_diff_arriving_later_is_fitted(self):
         """The diff is computed off-thread and swapped in after the group was shown; in fit mode that swap must
         not bring back the scale of the previous picture."""
-        from clip_image_deduper.gui.jobs import qimage
+        from picurate.dedupe.gui.jobs import qimage
 
         canvas = CompareCanvas()
         canvas.resize(400, 200)

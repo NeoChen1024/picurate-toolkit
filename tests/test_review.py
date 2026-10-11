@@ -6,13 +6,13 @@ from unittest import mock
 import numpy as np
 from click.testing import CliRunner
 
-from clip_image_deduper import cli as cli_mod
-from clip_image_deduper import review as rv
-from clip_image_deduper.cli import cli
-from clip_image_deduper.db_store import ImageRecord
-from clip_image_deduper.dedupe import group_edges
-from clip_image_deduper.keeping import builtin_policies
-from clip_image_deduper.pixel_check import PixelVerdict
+from picurate.dedupe import cli as cli_mod
+from picurate.dedupe import review as rv
+from picurate.dedupe.cli import cli
+from picurate.common.images import ImageRecord
+from picurate.dedupe.dedupe import group_edges
+from picurate.dedupe.keeping import builtin_policies
+from picurate.dedupe.pixel_check import PixelVerdict
 
 
 def rec(path, size=1, w=1, h=1, mtime=0.0):

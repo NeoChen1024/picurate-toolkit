@@ -5,10 +5,10 @@ from unittest import mock
 
 import numpy as np
 
-from clip_image_deduper.db_store import ImageRecord
-from clip_image_deduper.dedupe import find_cross_duplicates, find_duplicate_groups, move_to_trash, trash_duplicate_groups
-from clip_image_deduper.keeping import builtin_policies
-from clip_image_deduper.similarity import DistanceIndex
+from picurate.common.images import ImageRecord
+from picurate.dedupe.dedupe import find_cross_duplicates, find_duplicate_groups, move_to_trash, trash_duplicate_groups
+from picurate.dedupe.keeping import builtin_policies
+from picurate.dedupe.similarity import DistanceIndex
 
 
 class FindDuplicateGroupsTests(unittest.TestCase):

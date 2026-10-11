@@ -14,9 +14,10 @@ from __future__ import annotations
 import os
 import sqlite3
 from collections.abc import Iterable
-from dataclasses import dataclass
 
 import numpy as np
+
+from ..common.images import ImageRecord
 
 SCHEMA_VERSION = "2"
 EMBEDDING_DTYPE = np.float16
@@ -42,22 +43,6 @@ CREATE TABLE IF NOT EXISTS embeddings (
 
 class ModelMismatchError(RuntimeError):
     """The database was encoded with a different model or schema than requested."""
-
-
-@dataclass(slots=True, frozen=True)
-class ImageRecord:
-    """Metadata of one encoded image, as stored in the database."""
-
-    path: str  # relative to the image directory
-    mtime: float
-    size: int
-    width: int
-    height: int
-    format: str  # PIL format name: "JPEG", "PNG", "GIF", "WEBP", ...
-
-    @property
-    def pixels(self) -> int:
-        return self.width * self.height
 
 
 class EmbeddingDB:

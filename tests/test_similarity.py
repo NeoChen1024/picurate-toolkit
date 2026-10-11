@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import torch
 
-from clip_image_deduper.similarity import DistanceIndex, euclidean_distance, find_close_pairs_cross, find_close_pairs_self
+from picurate.dedupe.similarity import DistanceIndex, euclidean_distance, find_close_pairs_cross, find_close_pairs_self
 
 
 def _embeddings(n, d, seed=0):

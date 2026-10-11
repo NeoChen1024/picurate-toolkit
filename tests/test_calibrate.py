@@ -7,11 +7,11 @@ import numpy as np
 import PIL.Image
 from click.testing import CliRunner
 
-from clip_image_deduper import calibrate as cal
-from clip_image_deduper import cli as cli_mod
-from clip_image_deduper.cli import cli
-from clip_image_deduper.db_store import ImageRecord
-from clip_image_deduper.similarity import DistanceIndex
+from picurate.dedupe import calibrate as cal
+from picurate.dedupe import cli as cli_mod
+from picurate.dedupe.cli import cli
+from picurate.common.images import ImageRecord
+from picurate.dedupe.similarity import DistanceIndex
 
 
 def _records(*names):

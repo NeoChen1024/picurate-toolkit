@@ -1,4 +1,4 @@
-"""``vit-tagger``: Danbooru-tag captions for a directory of images with the PixAI tagger.
+"""``picurate-tag``: Danbooru-tag captions for a directory of images with the PixAI tagger.
 
 * ``run``: tag and write captions in one go (no database).
 * ``update``: tag into a SQLite score database; resumable, incremental by mtime.
@@ -17,10 +17,9 @@ import click
 import torch
 import tqdm
 
-from clip_image_deduper.db_store import ImageRecord
-from clip_image_deduper.encoding_pipeline import is_image_path, run_pipeline, walk_directory_relative
-from clip_image_deduper.log import setup_logging
-
+from ..common.images import ImageRecord, is_image_path, walk_directory_relative
+from ..common.log import setup_logging
+from ..common.pipeline import run_pipeline
 from .captions import (
     META_MODES,
     RESOLUTION_MODES,
@@ -266,7 +265,7 @@ def run(image_dir: str, recursive: bool, verbose: bool, **kw) -> None:
     Caption files are written as each batch finishes, so after an interruption '--existing skip' carries on. A JSON
     output is only written at the end. For large or repeated jobs prefer 'update' + 'export'.
     """
-    setup_logging(verbose, ("clip_image_deduper", "vit_tagger"))
+    setup_logging(verbose)
     options, writer, frequency = _caption_setup(image_dir, kw)
     images = _list_images(image_dir, recursive)
     if writer.existing == "skip":
@@ -311,7 +310,7 @@ def update(image_dir: str, db: str, recursive: bool, force_update: bool, clean_o
     Every batch is committed as it finishes, and images whose modification time matches their row are skipped, so an
     interrupted update (Ctrl-C, crash, power loss) resumes where it stopped when run again.
     """
-    setup_logging(verbose, ("clip_image_deduper", "vit_tagger"))
+    setup_logging(verbose)
     images = _list_images(image_dir, recursive)
     with TagDB(db) as store:
         index = store.load_index()
@@ -361,7 +360,7 @@ def export(image_dir: str, db: str, verbose: bool, **kw) -> None:
 
     Images that changed on disk since they were tagged are skipped with a warning: run 'update' first.
     """
-    setup_logging(verbose, ("clip_image_deduper", "vit_tagger"))
+    setup_logging(verbose)
     options, writer, frequency = _caption_setup(image_dir, kw)
     with TagDB(db, create=False) as store:
         vocab = store.vocabulary()

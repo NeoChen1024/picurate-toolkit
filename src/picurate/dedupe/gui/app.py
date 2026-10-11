@@ -1,4 +1,4 @@
-"""``clip-image-deduper-review``: open a review database in the GUI."""
+"""``picurate-dedupe-review``: open a review database in the GUI."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import sys
 import click
 
 from ..keeping import PolicyError, load_policies
-from ..log import setup_logging
+from ...common.log import setup_logging
 from ..review import default_review_path
 
 
@@ -23,7 +23,7 @@ from ..review import default_review_path
 def main(
     db: str | None, review_db: str | None, image_dir: str | None, trash_dir: str | None, keeping_config: str | None, prefetch: int, verbose: bool
 ) -> None:
-    """Review duplicate groups found by `clip-image-deduper dedupe --review-threshold`."""
+    """Review duplicate groups found by `picurate-dedupe dedupe --review-threshold`."""
     setup_logging(verbose)
     path = review_db or (default_review_path(db) if db else None)
     if path is None:
