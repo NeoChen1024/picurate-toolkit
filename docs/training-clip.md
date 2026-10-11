@@ -27,7 +27,7 @@ search model is free to lose the detail sensitivity the deduper needs.
 
 ## Model and precision
 
-* Base: SigLIP2 so400m, NaFlex variant (the deduper's default, see README). NaFlex matters here: anime illustrations
+* Base: SigLIP2 so400m, NaFlex variant (the deduper's default, see [dedupe.md](dedupe.md)). NaFlex matters here: anime illustrations
   are mostly portrait, and squashing them to a square is exactly the kind of distortion a fine-tune should not learn.
 * **Precision floor: bf16 (or fp16 with loss scaling). Nothing below.** No 8-bit optimizer states, no 4-bit/8-bit
   weights, no fp8 activations. Memory is to be found by offloading and recomputation, not by quantising.

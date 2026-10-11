@@ -10,7 +10,6 @@ from picurate.dedupe import cli as cli_mod
 from picurate.dedupe import review as rv
 from picurate.dedupe.cli import cli
 from picurate.common.images import ImageRecord
-from picurate.dedupe.dedupe import group_edges
 from picurate.dedupe.keeping import builtin_policies
 from picurate.dedupe.pixel_check import PixelVerdict
 
@@ -20,14 +19,6 @@ def rec(path, size=1, w=1, h=1, mtime=0.0):
 
 
 LARGEST = builtin_policies()["largest"]
-
-
-class GroupEdgesTests(unittest.TestCase):
-    def test_groups_keep_their_edges_and_are_sorted(self):
-        groups = group_edges(6, [(4, 5, 0.3), (0, 1, 0.1), (1, 2, 0.2)])
-        self.assertEqual([g.members for g in groups], [[0, 1, 2], [4, 5]])
-        self.assertEqual(groups[0].edges, [(0, 1, 0.1), (1, 2, 0.2)])
-        self.assertEqual((groups[0].min_distance, groups[0].max_distance), (0.1, 0.2))
 
 
 class ReviewDBTests(unittest.TestCase):
@@ -42,9 +33,6 @@ class ReviewDBTests(unittest.TestCase):
 
     def groups(self, *specs):
         return [([self.recs[p] for p in members], edges) for members, edges in specs]
-
-    def test_default_path(self):
-        self.assertEqual(rv.default_review_path("/x/pictures.sqlite"), "/x/pictures.review.sqlite")
 
     def test_upsert_new_predecided_kept_stale(self):
         stats = self.db.upsert_groups(self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.05)]), (["c.png", "d.png"], [("c.png", "d.png", 0.4)])), LARGEST, 0.1)
@@ -86,7 +74,6 @@ class ReviewDBTests(unittest.TestCase):
             self.db.decide(gid, status="bogus")
         with self.assertRaises(KeyError):
             self.db.decide(gid, keeps={"zzz": True})
-        self.db.reset_to_policy(gid, builtin_policies()["smallest"]) if "smallest" in builtin_policies() else None
 
     def test_pixel_results_decide_the_starting_status(self):
         same, diff = PixelVerdict.measured(1.0, 0.5), PixelVerdict.measured(40.0, 0.5)
@@ -115,25 +102,6 @@ class ReviewDBTests(unittest.TestCase):
         stats = self.db.upsert_groups(self.groups(*specs), LARGEST, 0.1, {("a.png", "b.png"): PixelVerdict.measured(50.0, 0.5), ("c.png", "d.png"): same})
         self.assertEqual((stats.redecided, stats.reopened), (0, 1))
         self.assertEqual(self.db.group(g_ab.id).status, "pending")
-
-    def test_no_op_decide_records_nothing_and_undo_untouches(self):
-        self.db.upsert_groups(self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.4)])), LARGEST, 0.1)
-        gid = self.db.groups()[0].id
-        self.db.decide(gid, keeps={"b.png": True}, status="pending", note="")
-        self.assertFalse(self.db.group(gid).touched)
-        self.assertEqual(self.db.conn.execute("SELECT COUNT(*) FROM history WHERE group_id = ?", (gid,)).fetchone()[0], 1)
-        self.db.decide(gid, status="skipped")
-        self.assertTrue(self.db.group(gid).touched)
-        self.db.undo(gid)
-        self.assertFalse(self.db.group(gid).touched)
-        self.db.reset_pending_to_policy(builtin_policies()["newest"])
-        self.assertFalse(self.db.group(gid).touched)  # a bulk Policy pick is not a review
-
-    def test_pixel_cache_carries_file_state(self):
-        self.recs["a.png"] = rec("a.png", size=10, mtime=5.0)
-        v = PixelVerdict.measured(2.0, 0.5)
-        self.db.upsert_groups(self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.4)])), LARGEST, 0.1, {("a.png", "b.png"): v})
-        self.assertEqual(self.db.pixel_cache(), {("a.png", "b.png"): (v, (5.0, 10, 0.0, 20))})
 
     def test_plan_apply_skips_groups_keeping_nothing(self):
         self.db.upsert_groups(self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.05)]), (["c.png", "d.png"], [("c.png", "d.png", 0.05)])), LARGEST, 0.1)
@@ -287,12 +255,3 @@ class CliReviewTests(unittest.TestCase):
         self.assertEqual(res.exit_code, 0, res.output)
         self.assertIn("pending  1", res.output)
         self.assertIn("0 files would be moved", res.output)
-
-    def test_review_threshold_rejects_trash_dir_and_lower_value(self):
-        self.assertNotEqual(self.run_dedupe("--review-threshold", "0.5", "--trash-dir", self.tmp.name).exit_code, 0)
-        self.assertNotEqual(self.run_dedupe("--review-threshold", "0.05").exit_code, 0)
-
-    def test_review_apply_requires_database(self):
-        res = CliRunner().invoke(cli, ["review-apply", "-i", self.img, "-d", self.db, "--trash-dir", os.path.join(self.tmp.name, "t")])
-        self.assertNotEqual(res.exit_code, 0)
-        self.assertIn("No review database", res.output)

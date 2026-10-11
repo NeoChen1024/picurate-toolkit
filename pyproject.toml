@@ -3,6 +3,8 @@ name = "picurate-toolkit"
 version = "0.1.0"
 description = "Deduplication, tagging and dataset editing for very large image collections."
 authors = [{name = "Neo_Chen", email = "chenkolei@gmail.com"}]
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "click",
@@ -41,7 +43,7 @@ picurate-tag = "picurate.tagger.cli:main"
 clip-dataset-preprocess = "clip_training.dataset_preprocessing:main"
 
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

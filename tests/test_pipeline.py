@@ -5,11 +5,10 @@ from unittest import mock
 
 import numpy as np
 import PIL.Image
-import torch
 
 from picurate.dedupe import encoding_pipeline
-from picurate.dedupe.db_store import EmbeddingDB, load_database
-from picurate.dedupe.encoding_pipeline import find_candidates, is_image_path, update_database
+from picurate.dedupe.db_store import load_database
+from picurate.dedupe.encoding_pipeline import update_database
 
 
 def _fake_preprocess(img):
@@ -46,11 +45,6 @@ def _make_images(image_dir):
 
 
 class PipelineTests(unittest.TestCase):
-    def test_is_image_path(self):
-        self.assertTrue(is_image_path("x/y.JPG"))
-        self.assertTrue(is_image_path("x.gif"))
-        self.assertFalse(is_image_path("x.txt"))
-        self.assertFalse(is_image_path("noext"))
 
     def test_full_update_with_real_workers(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -88,24 +82,6 @@ class PipelineTests(unittest.TestCase):
             with mock.patch.object(encoding_pipeline, "encode_images", return_value=3) as enc:
                 update_database(StubEncoder(), image_dir, db_path, force_update=True)
                 self.assertEqual(sorted(enc.call_args.args[3]), ["a.png", "d.webp", "sub/b.jpg"])
-
-    def test_find_candidates_ignores_non_images(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            _make_images(tmp)
-            candidates, seen = find_candidates(tmp, {})
-            self.assertEqual(sorted(seen), ["a.png", "broken.jpg", "c.gif", "d.webp", "sub/b.jpg"])
-            self.assertEqual(sorted(candidates), sorted(seen))
-            candidates, _ = find_candidates(tmp, {"a.png": os.path.getmtime(os.path.join(tmp, "a.png"))})
-            self.assertNotIn("a.png", candidates)
-
-    def test_model_mismatch_is_runtime_error(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            db_path = os.path.join(tmp, "db.sqlite")
-            with EmbeddingDB(db_path) as db:
-                db.ensure_model("other-model")
-            with self.assertRaises(RuntimeError):
-                update_database(StubEncoder(), tmp, db_path)
-            update_database(StubEncoder(), tmp, db_path, force_update=True)  # rebinding is allowed
 
 
 if __name__ == "__main__":

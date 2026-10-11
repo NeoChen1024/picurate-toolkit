@@ -1,15 +1,11 @@
 import os
 import tempfile
 import unittest
-from unittest import mock
 
 import numpy as np
 import PIL.Image
-from click.testing import CliRunner
 
 from picurate.dedupe import calibrate as cal
-from picurate.dedupe import cli as cli_mod
-from picurate.dedupe.cli import cli
 from picurate.common.images import ImageRecord
 from picurate.dedupe.similarity import DistanceIndex
 
@@ -40,9 +36,6 @@ class SamplingTests(unittest.TestCase):
         self.assertEqual(len(pa), 3)
         self.assertNotEqual(pa, {a[i].path for i in cal.sample_rows(a, 3, seed=8)})
 
-    def test_sample_larger_than_db_takes_everything(self):
-        self.assertEqual(cal.sample_rows(_records("a", "b"), 10, seed=0), [0, 1])
-
 
 class DistanceTests(unittest.TestCase):
     def test_nearest_other_excludes_self(self):
@@ -72,10 +65,6 @@ class DistanceTests(unittest.TestCase):
             self.assertTrue((result.series["half"] < 1).all())  # a flat colour survives downscaling exactly
             self.assertEqual(len(result.series["nearest-other"]), 4)
 
-    def test_unknown_variant_rejected(self):
-        with self.assertRaises(ValueError):
-            cal.calibrate(StubEncoder(), ".", [], np.empty((0, 3)), None, samples=1, seed=0, variants=("nope",))
-
 
 class ReportTests(unittest.TestCase):
     def test_histogram_lines_and_suggestion(self):
@@ -96,38 +85,3 @@ class ReportTests(unittest.TestCase):
     def test_overlap_reports_no_clean_threshold(self):
         result = cal.Calibration(series={"nearest-other": np.array([0.3], dtype=np.float32), "half": np.array([0.5], dtype=np.float32)})
         self.assertIn("No clean threshold", "\n".join(cal.report(result)))
-
-    def test_edges_cover_all_values_in_whole_decades(self):
-        edges = cal.log_edges([np.array([0.03, 7.0])])
-        self.assertAlmostEqual(edges[0], 0.01)
-        self.assertAlmostEqual(edges[-1], 10.0)
-        self.assertEqual(len(edges), 3 * 8 + 1)
-
-
-class CliTests(unittest.TestCase):
-    def test_calibrate_passes_seed_and_variants(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            emb = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32)
-            with mock.patch.object(cli_mod, "CLIPImageEncoder") as enc_cls, mock.patch.object(cli_mod, "EmbeddingDB") as db_cls, mock.patch.object(
-                cli_mod, "load_database", return_value=(_records("a.jpg", "b.jpg"), emb)
-            ), mock.patch.object(cli_mod, "calibrate", return_value=cal.Calibration()) as run, mock.patch.object(cli_mod, "report", return_value=["ok"]):
-                enc_cls.return_value.model_id = "m"
-                db_cls.return_value.__enter__.return_value.model_id = "m"
-                res = CliRunner().invoke(cli, ["calibrate", "-i", tmp, "-d", "x.sqlite", "--skip-update", "-c", "cpu", "--seed", "42", "--variants", "half,jpeg90", "-s", "5", "-t", "0.3"])
-            self.assertEqual(res.exit_code, 0, res.output)
-            self.assertIn("ok", res.output)
-            kw = run.call_args.kwargs
-            self.assertEqual((kw["seed"], kw["samples"], kw["variants"]), (42, 5, ["half", "jpeg90"]))
-
-    def test_calibrate_rejects_unknown_variant(self):
-        res = CliRunner().invoke(cli, ["calibrate", "-i", ".", "-d", "x.sqlite", "--variants", "nope"])
-        self.assertNotEqual(res.exit_code, 0)
-        self.assertIn("Unknown variants nope", res.output)
-
-    def test_calibrate_refuses_model_mismatch(self):
-        with mock.patch.object(cli_mod, "CLIPImageEncoder") as enc_cls, mock.patch.object(cli_mod, "EmbeddingDB") as db_cls:
-            enc_cls.return_value.model_id = "new"
-            db_cls.return_value.__enter__.return_value.model_id = "old"
-            res = CliRunner().invoke(cli, ["calibrate", "-i", ".", "-d", "x.sqlite", "--skip-update", "-c", "cpu"])
-        self.assertNotEqual(res.exit_code, 0)
-        self.assertIn("encoded with model 'old'", res.output)

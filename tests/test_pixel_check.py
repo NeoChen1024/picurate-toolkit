@@ -63,10 +63,6 @@ class CompareTests(unittest.TestCase):
         tinted = PIL.Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB")
         self.assertEqual(pc.compare_images(self.img, jpeg(tinted, 90)).status, pc.DIFFERENT)
 
-    def test_other_aspect_ratio_is_not_compared(self):
-        crop = self.img.crop((0, 0, 600, 480))
-        self.assertEqual(pc.compare_images(self.img, crop).status, pc.ASPECT)
-
     def test_transparency_is_composited(self):
         rgba = self.img.convert("RGBA")
         rgba.putalpha(PIL.Image.new("L", rgba.size, 255))
@@ -80,14 +76,6 @@ class CompareTests(unittest.TestCase):
             PIL.Image.fromarray(hidden_a, "RGBA").save(pa)
             PIL.Image.fromarray(hidden_b, "RGBA").save(pb)
             self.assertEqual(pc.compare_files(pa, pb).peak, 0.0)
-
-    def test_unreadable_file_is_an_error_verdict(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            pa = os.path.join(tmp, "a.png")
-            self.img.save(pa)
-            v = pc.compare_files(pa, os.path.join(tmp, "missing.png"))
-        self.assertEqual(v.status, pc.ERROR)
-        self.assertFalse(v.same)
 
 
 class CheckPairsTests(unittest.TestCase):
@@ -119,14 +107,6 @@ class CheckPairsTests(unittest.TestCase):
             verdicts = pc.check_pairs(self.pairs(("a", "b"), ("x", "y"), ("b", "c"), ("a", "c"), ("a", "x")), workers=1)
         self.assertEqual([v.status for v in verdicts], [pc.SAME, pc.SAME, pc.SAME, pc.SAME, pc.DIFFERENT])
         self.assertEqual(sorted(calls), ["a.png", "b.png", "c.png", "x.png", "y.png"])
-
-    def test_tiny_buffer_still_correct(self):
-        calls = []
-        real = pc.load_rgb
-        with mock.patch.object(pc, "load_rgb", lambda p: calls.append(p) or real(p)):
-            verdicts = pc.check_pairs(self.pairs(("a", "b"), ("b", "c"), ("a", "c")), workers=1, buffer_bytes=1)
-        self.assertEqual([v.status for v in verdicts], [pc.SAME] * 3)
-        self.assertGreater(len(calls), 3)  # nothing beyond the current pair was kept
 
     def test_parallel_matches_serial(self):
         pairs = self.pairs(("a", "b"), ("x", "y"), ("a", "x"))

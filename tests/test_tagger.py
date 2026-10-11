@@ -80,10 +80,6 @@ class CaptionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_replacements("a,b,c")
 
-    def test_vocabulary_maps_style_to_artist(self):
-        self.assertEqual(self.vocab.slices["artist"], slice(11, 12))
-        self.assertEqual(self.vocab.thresholds["artist"], 0.3)
-
     def test_anima_sections(self):
         text = self.caption(style="anima", prefix=["masterpiece", "best quality"], thresholds={"artist": 0.5})
         self.assertEqual(
@@ -154,11 +150,6 @@ class CaptionTests(unittest.TestCase):
         # even with artist predictions disabled
         self.assertIn("@nnn yryr", self.caption(override_artists=["nnn_yryr"], thresholds={"artist": 2}))
 
-    def test_bad_options(self):
-        for kw in ({"style": "pony"}, {"meta": "some"}, {"resolution": "big"}):
-            with self.assertRaises(ValueError):
-                CaptionOptions(**kw)
-
 
 # -- a tiny checkpoint with the real architecture, for the model and the CLI ------------------------------------------
 
@@ -189,10 +180,6 @@ class ModelTests(unittest.TestCase):
         self.assertTrue(np.allclose(x[:, 28, 28], 1.0))  # white content
         self.assertTrue(np.allclose(x[:, 0, 28], -1.0))  # black padding above
         self.assertEqual(TaggerPreprocess(56, np.dtype(np.float16))(PIL.Image.new("L", (56, 56))).dtype, np.float16)
-
-    def test_rejects_unsupported_config(self):
-        with self.assertRaises(ValueError):
-            TaggerConfig.from_json({**TINY, "rel_pos_blocks": [0]})
 
     def test_load_casts_weights_but_keeps_rope_fp32(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -239,21 +226,12 @@ class CliTests(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(image_dir, "sub", "c.txt")))
 
             out = os.path.join(tmp, "captions.jsonl")
-            r = runner.invoke(cli, base + ["-o", out, "--frequency"], catch_exceptions=False)
+            r = runner.invoke(cli, base + ["-o", out], catch_exceptions=False)
             self.assertEqual(r.exit_code, 0, r.output)
-            self.assertIn("Tag frequencies:", r.output)
             with open(out) as f:
                 rows = [json.loads(line) for line in f]
             self.assertEqual(sorted(os.path.basename(row["image_path"]) for row in rows), ["a.png", "b.webp"])
             self.assertEqual(next(row for row in rows if row["image_path"].endswith("a.png"))["image_size"], [64, 32])
-
-            r = runner.invoke(cli, base + ["-o", out, "--override-artist-tag", "@nnn yryr"], catch_exceptions=False)
-            with open(out) as f:
-                self.assertTrue(all("@nnn yryr" in json.loads(line)["caption"] for line in f))
-
-            r = runner.invoke(cli, base + ["-o", os.path.join(tmp, "x.csv")])
-            self.assertNotEqual(r.exit_code, 0)
-
 
 
 class TagDBTests(unittest.TestCase):

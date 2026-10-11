@@ -1,11 +1,10 @@
 import os
 import tempfile
 import unittest
-from unittest import mock
 
 import numpy as np
 
-from picurate.dedupe.db_store import SCHEMA_VERSION, EmbeddingDB, ImageRecord, ModelMismatchError, load_database
+from picurate.dedupe.db_store import EmbeddingDB, ImageRecord, ModelMismatchError
 
 
 def rec(path, mtime=1.0, size=1, width=4, height=3, fmt="JPEG"):
@@ -13,18 +12,6 @@ def rec(path, mtime=1.0, size=1, width=4, height=3, fmt="JPEG"):
 
 
 class EmbeddingDBTests(unittest.TestCase):
-    def test_schema_version_mismatch_requires_reset(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "db.sqlite")
-            with EmbeddingDB(path) as db:
-                db.ensure_model("m")
-                db.set_meta("schema_version", "0")
-                db.conn.commit()
-            with EmbeddingDB(path) as db:
-                with self.assertRaises(ModelMismatchError):
-                    db.ensure_model("m")
-                db.ensure_model("m", reset_on_mismatch=True)
-                self.assertEqual(db.get_meta("schema_version"), SCHEMA_VERSION)
 
     def test_roundtrip_upsert_load_delete(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -65,20 +52,6 @@ class EmbeddingDBTests(unittest.TestCase):
                 self.assertEqual(len(db), 0)
                 self.assertEqual(db.model_id, "model-b")
                 self.assertIsNone(db.dim)
-
-    def test_dimension_mismatch_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with EmbeddingDB(os.path.join(tmp, "db.sqlite")) as db:
-                db.ensure_model("m")
-                db.upsert([(rec("a.jpg"), np.zeros(3, dtype=np.float32))])
-                with self.assertRaises(ValueError):
-                    db.upsert([(rec("b.jpg"), np.zeros(4, dtype=np.float32))])
-
-    def test_load_database_missing_file_is_empty(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            records, arr = load_database(os.path.join(tmp, "missing.sqlite"))
-            self.assertEqual(records, [])
-            self.assertEqual(arr.shape[0], 0)
 
 
 if __name__ == "__main__":

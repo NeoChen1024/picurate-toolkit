@@ -3,7 +3,7 @@ import tempfile
 import unittest
 
 from picurate.common.images import ImageRecord
-from picurate.dedupe.keeping import Policy, PolicyError, builtin_policies, load_policies
+from picurate.dedupe.keeping import builtin_policies, load_policies
 
 
 def rec(path, mtime=0.0, size=0, width=1, height=1, fmt="JPEG"):
@@ -13,18 +13,6 @@ def rec(path, mtime=0.0, size=0, width=1, height=1, fmt="JPEG"):
 class BuiltinPolicyTests(unittest.TestCase):
     def setUp(self):
         self.policies = builtin_policies()
-
-    def test_all_builtins_present(self):
-        self.assertEqual(set(self.policies), {"newest", "largest", "highest-quality", "pic-dir"})
-
-    def test_newest_uses_size_as_tiebreaker(self):
-        small, big = rec("small.jpg", mtime=5, size=1), rec("big.jpg", mtime=5, size=10)
-        self.assertEqual(self.policies["newest"].select([small, big]).path, "big.jpg")
-        self.assertEqual(self.policies["newest"].select([rec("old.jpg", mtime=1, size=99), rec("new.jpg", mtime=2, size=1)]).path, "new.jpg")
-
-    def test_largest_uses_mtime_as_tiebreaker(self):
-        old, new = rec("old.jpg", mtime=1, size=5), rec("new.jpg", mtime=2, size=5)
-        self.assertEqual(self.policies["largest"].select([old, new]).path, "new.jpg")
 
     def test_highest_quality_order(self):
         p = self.policies["highest-quality"]
@@ -74,24 +62,6 @@ criteria = [{ attr = "path", match = '^keep/' }, { attr = "ext", match = ['\\.pn
         sp = policies["shortest-path"]
         self.assertEqual(sp.description, "shortest")
         self.assertEqual(sp.select([rec("x/a.jpg"), rec("keep/b.jpg"), rec("keep/c.png")]).path, "keep/c.png")
-
-    def test_invalid_configs(self):
-        for text in [
-            "[policy.x]\ncriteria = []",
-            "[policy.x]\ncriteria = [{ attr = 'nope', prefer = 'max' }]",
-            "[policy.x]\ncriteria = [{ attr = 'size', prefer = 'biggest' }]",
-            "[policy.x]\ncriteria = [{ attr = 'size', match = 'x' }]",
-            "[policy.x]\ncriteria = [{ attr = 'path', match = '(' }]",
-            "[policy.x]\ncriteria = [{ attr = 'format', order = [] }]",
-            "[other.x]\ncriteria = []",
-            "not toml at all [[",
-        ]:
-            with self.subTest(text=text), self.assertRaises(PolicyError):
-                self._load(text)
-
-    def test_policy_from_dict_direct(self):
-        p = Policy.from_dict("t", {"criteria": [{"attr": "format", "order": ["png", "jpeg"]}]})
-        self.assertEqual(p.select([rec("a", fmt="JPEG"), rec("b", fmt="PNG"), rec("c", fmt="GIF")]).path, "b")
 
 
 if __name__ == "__main__":

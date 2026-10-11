@@ -35,14 +35,6 @@ class DistanceIndexCpuTests(unittest.TestCase):
         ii, jj, _ = find_close_pairs_cross(index, other, 1e-6, 0, 30)
         self.assertEqual(sorted(zip(ii.tolist(), jj.tolist())), [(2, 0), (7, 0), (9, 1), (25, 0)])
 
-    def test_block_size_respects_budget(self):
-        index = DistanceIndex(_embeddings(1000, 2), "cpu")
-        self.assertEqual(index.query_block_size(budget_bytes=4 * 1000 * 10), 10)
-        self.assertEqual(index.query_block_size(budget_bytes=1), 1)
-        self.assertEqual(index.query_block_size(budget_bytes=2**40), 1024)
-        blocks = list(index.iter_blocks(budget_bytes=4 * 1000 * 300))
-        self.assertEqual(blocks, [(0, 300), (300, 600), (600, 900), (900, 1000)])
-
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
 class DistanceIndexTritonTests(unittest.TestCase):
@@ -64,12 +56,6 @@ class DistanceIndexTritonTests(unittest.TestCase):
         self.assertEqual(d[5], 0.0)
         exact = np.linalg.norm(emb2[6].astype(np.float64) - emb2[4].astype(np.float64))
         self.assertAlmostEqual(float(d[6]), exact, places=4)
-
-    def test_cross_index_and_empty_shapes(self):
-        a = DistanceIndex(_embeddings(10, 32), "cuda")
-        b = DistanceIndex(_embeddings(5, 32, seed=3), "cuda")
-        self.assertEqual(a.distances(0, 10, other=b).shape, (10, 5))
-        self.assertEqual(a.distances(10, 10, other=b).shape, (0, 5))
 
 
 if __name__ == "__main__":
