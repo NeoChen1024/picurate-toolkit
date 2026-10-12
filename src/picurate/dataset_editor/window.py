@@ -37,10 +37,11 @@ from PySide6.QtWidgets import (
 )
 
 from ..common.qt import Job
+from ..project.project import Project, validate_source
 from .canvas import Canvas, ThumbnailDelegate, Thumbnails
 from .caption_editor import CaptionEditor
 from .mask_editor import MaskEditor
-from .project import Project, export_project, load_image, render, save_repair, validate_source
+from .render import export_project, load_image, render, save_repair
 from .repair import MODEL_DEFAULTS, InferenceEngine
 from .tags import TagIndex
 

@@ -1,22 +1,19 @@
 # Dataset editor (`picurate-dataset-editor`)
 
-A project-based editor for training datasets: captions with Danbooru/e621 tag completion, one crop per image,
-watermark fills (mean colour or LaMa repair) and a review status per image. Original images stay where they are and
-are never written to; captions and edits belong to the project, and **Export** renders the dataset into the
-project's `output/`. It needs the `gui` extra.
+The last stage of a [project](project.md): going through a training dataset by hand. Captions with Danbooru/e621
+tag completion, one crop per image, watermark fills (mean colour or LaMa repair) and a review status per image.
+Original images stay where they are and are never written to; **Export** renders the dataset into the project's
+`output/`. It needs the `gui` extra.
 
 ```shell
-picurate-dataset-editor              # then New Project (Ctrl+N) and Import Images
-picurate-dataset-editor my-project   # reopen a project directory (not the image directory)
+picurate-dataset-editor my-project   # a project directory, not the image directory
 ```
 
-1. **New Project** wants an empty directory.
-2. **Import Images** takes a folder (recursive, hidden files and directories skipped) or individual files: PNG, JPEG,
-   WebP and BMP. A same-stem UTF-8 `.txt` next to an image becomes its starting caption; the source caption file is
-   never changed, and later changes to it are not picked up. Importing an image the project already references
-   (same resolved path) skips it and keeps its edits. New files in a source folder only appear after another import.
-3. Edit and review. Changes are saved 500 ms after they are made, before moving to another image and on close.
-4. **Export** writes PNG or lossless WebP plus a same-stem `.txt` per image, for every image except skipped ones,
+1. Create and fill the project with `picurate-project`, or from the editor: **New Project** (Ctrl+N, an empty
+   directory) and **Import Images** (a folder or individual files), which follow the same
+   [import rules](project.md#importing).
+2. Edit and review. Changes are saved 500 ms after they are made, before moving to another image and on close.
+3. **Export** writes PNG or lossless WebP plus a same-stem `.txt` per image, for every image except skipped ones,
    approved ones only, or the current one.
 
 F1 lists the keys. The ones used most: Z / X previous / next image (or the wheel), A / S crop / fill mode, D
@@ -64,11 +61,7 @@ python -m picurate.dataset_editor.install_repair
 Mask and LaMa devices, the default backend, expansion, context and offline mode are project settings (**Settings**).
 An explicit `cuda:N` that is not available is an error; only Auto falls back to the CPU.
 
-## Sources and export
-
-**Relink Sources** points a source folder somewhere else after checking the SHA-256 of every image in it. An image
-that is missing or changed keeps its caption and review status editable, but cannot be edited or exported; its
-thumbnail is marked `[!]`.
+## Export
 
 Export replaces the managed contents of `output/` as a whole; it is not incremental. It is built in a staging
 directory from a snapshot taken when it starts and swapped in at the end, so a cancelled or failed export leaves the
@@ -76,17 +69,4 @@ previous output intact (an interrupted swap is recovered when the project is nex
 editor did not write are kept, and an export that would overwrite one is refused. Source images are verified against
 their SHA-256 first.
 
-## Project directory
-
-```
-project.json        schema version, source folders, export and completion settings
-items.jsonl         one line per image: stable ID, source folder and relative path, size/mtime/SHA-256,
-                    the caption it was imported with, output name (colliding names get an ID suffix)
-edits.jsonl         append-only: the complete edit state of an image (caption, crop, fills, review status) per save
-masks/, patches/    accepted LaMa repairs
-output/             the last export and its .manifest.json
-```
-
-The last saved state of an image wins. A torn last line of `edits.jsonl` (from a crash mid-write) is moved to an
-`edits-*.recovery` file when the project is opened. The project does not contain the images: backing it up alone is
-not a backup of the dataset.
+Moved or missing source images are covered under [sources](project.md#sources).

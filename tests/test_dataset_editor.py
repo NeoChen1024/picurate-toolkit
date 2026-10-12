@@ -8,15 +8,8 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from picurate.dataset_editor.project import (
-    Project,
-    export_one,
-    export_project,
-    load_image,
-    render,
-    save_repair,
-    validate_source,
-)
+from picurate.dataset_editor.render import export_one, export_project, load_image, render, save_repair
+from picurate.project.project import Project, validate_source
 
 
 class ProjectTests(unittest.TestCase):

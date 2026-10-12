@@ -12,6 +12,7 @@ now; how they should feed into each other is something the workflow has to show 
 | [picurate-dedupe](docs/dedupe.md)                 | Find duplicates by CLIP similarity, confirm them pixel by pixel, move the losers to a trash directory. |
 | [picurate-dedupe-review](docs/dedupe-review.md)   | GUI for the duplicate groups a single threshold should not decide.                                     |
 | [picurate-tag](docs/tagger.md)                    | Danbooru-tag captions for training datasets, in Anima or sd-scripts (SDXL) layout.                     |
+| [picurate-project](docs/project.md)               | Create a dataset project and import existing image/caption pairs into it.                              |
 | [picurate-dataset-editor](docs/dataset-editor.md) | GUI for going through a dataset by hand: captions with tag completion, crops, watermark removal.       |
 
 ## Installation
@@ -71,16 +72,22 @@ Uses [pixai-tagger-v1.0](https://huggingface.co/pixai-labs/pixai-tagger-v1.0), r
 `trust_remote_code` and works in fp16. `update` can be interrupted at any time and resumes where it stopped, which
 is the thing I missed most in kohya's tagging script. Details: [tagging](docs/tagger.md).
 
-## Dataset editor
+## Datasets
 
 ```shell
-picurate-dataset-editor my-project
+picurate-project init my-dataset
+picurate-project import my-dataset ~/pictures/set-a   # same-stem .txt files come along as captions
+picurate-dataset-editor my-dataset
 ```
 
-For the part no tagger gets right: fixing captions with Danbooru/e621 completion, cropping, and painting out
-watermarks and signatures (mean colour, or a Hi-SAM mask plus LaMa when the background is not flat). The images are
-only referenced, never touched; everything I do is recorded in the project and rendered into a fresh dataset on
-export. Details: [dataset editor](docs/dataset-editor.md).
+How I want dataset curation to go: import into a project, dedupe and cull what does not belong, batch-tag if there
+are no captions yet, then go through everything by hand in the editor. Every stage should still work on its own, and
+only import and the editor know about projects so far. The images are only referenced, never touched; captions and
+edits live in the project and are rendered into a fresh dataset on export.
+
+The editor is for the part no tagger gets right: fixing captions with Danbooru/e621 completion, adding the
+natural-language bits, cropping, and painting out watermarks and signatures (mean colour, or a Hi-SAM mask plus LaMa
+when the background is not flat). Details: [projects](docs/project.md), [dataset editor](docs/dataset-editor.md).
 
 ## License
 

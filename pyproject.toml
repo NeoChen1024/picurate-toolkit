@@ -43,6 +43,7 @@ training = [
 picurate-dedupe = "picurate.dedupe.cli:cli"
 picurate-dedupe-review = "picurate.dedupe.gui.app:main"
 picurate-tag = "picurate.tagger.cli:main"
+picurate-project = "picurate.project.cli:main"
 picurate-dataset-editor = "picurate.dataset_editor.app:main"
 clip-dataset-preprocess = "clip_training.dataset_preprocessing:main"
 
