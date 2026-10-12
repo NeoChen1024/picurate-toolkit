@@ -139,7 +139,10 @@ class InferenceEngine:
         with torch.inference_mode():
             tensor = torch.from_numpy(pixels).float().unsqueeze(0).to(device) / 255
             mask_tensor = torch.from_numpy(binary).float()[None, None].to(device)
-            output = self.lama_model(tensor, mask_tensor)[0].permute(1, 2, 0).cpu().numpy()
+            # No TorchScript fusion: fusing the graph (on its second call) from a Qt pool thread leaves that thread's
+            # Python state broken, and the next model built in the pool aborts the interpreter.
+            with torch.jit.fuser("none"):
+                output = self.lama_model(tensor, mask_tensor)[0].permute(1, 2, 0).cpu().numpy()
         output = np.clip(output[:h, :w] * 255, 0, 255).astype("uint8")
         # Explicit compositing keeps every pixel outside the binary mask identical.
         rgb[selection] = output[selection]
