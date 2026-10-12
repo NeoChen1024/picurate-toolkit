@@ -38,6 +38,17 @@ def walk_directory_relative(directory: str, *, include_hidden: bool = False) -> 
                 yield os.path.relpath(os.path.join(root, file), directory)
 
 
+def list_directory_relative(directory: str, *, recursive: bool, include_hidden: bool = False) -> Iterator[str]:
+    """The files directly in ``directory``, or with ``recursive`` everything below it (see
+    :func:`walk_directory_relative`), as paths relative to it. Hidden ones are skipped unless ``include_hidden``."""
+    if recursive:
+        yield from walk_directory_relative(directory, include_hidden=include_hidden)
+        return
+    for entry in os.scandir(directory):
+        if entry.is_file() and (include_hidden or not is_hidden(entry.name)):
+            yield entry.name
+
+
 def is_image_path(relative_path: str) -> bool:
     return os.path.splitext(relative_path)[1].lower() in IMAGE_EXTENSIONS
 

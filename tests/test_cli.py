@@ -6,9 +6,9 @@ from unittest import mock
 import numpy as np
 from click.testing import CliRunner
 
+from picurate.common.images import ImageRecord
 from picurate.dedupe import cli as cli_mod
 from picurate.dedupe.cli import cli
-from picurate.common.images import ImageRecord
 
 
 def _records(*names):
@@ -27,8 +27,12 @@ class CliTests(unittest.TestCase):
 
     def test_dedupe_dry_run_still_refreshes_database(self):
         trash = os.path.join(self.tmp.name, "trash")
-        with mock.patch.object(cli_mod, "CLIPImageEncoder"), mock.patch.object(cli_mod, "update_database") as upd, mock.patch.object(
-            cli_mod, "load_database", return_value=(_records("a.jpg", "b.jpg"), np.array([[0.0], [0.05]], dtype=np.float32))
+        with (
+            mock.patch.object(cli_mod, "CLIPImageEncoder"),
+            mock.patch.object(cli_mod, "update_database") as upd,
+            mock.patch.object(
+                cli_mod, "load_database", return_value=(_records("a.jpg", "b.jpg"), np.array([[0.0], [0.05]], dtype=np.float32))
+            ),
         ):
             result = self.runner.invoke(cli, ["dedupe", "-i", self.img, "-d", "db.sqlite", "-n", "--trash-dir", trash, "-c", "cpu"])
         self.assertEqual(result.exit_code, 0, result.output)
@@ -67,9 +71,10 @@ class PixelCheckCliTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_cli(self, *args, records=None, emb=None):
-        with mock.patch.object(cli_mod, "load_database", return_value=(records or self.records, self.emb if emb is None else emb)), mock.patch.object(
-            cli_mod, "EmbeddingDB"
-        ) as store:
+        with (
+            mock.patch.object(cli_mod, "load_database", return_value=(records or self.records, self.emb if emb is None else emb)),
+            mock.patch.object(cli_mod, "EmbeddingDB") as store,
+        ):
             store.return_value.__enter__.return_value.model_id = "m"
             return CliRunner().invoke(cli, [*args, "--skip-update", "-c", "cpu", "-j", "1"])
 
@@ -102,13 +107,30 @@ class PixelCheckCliTests(unittest.TestCase):
         base_rec = [ImageRecord("a.png", 0.0, 3, 640, 480, "PNG")]
         imports = [r for r in self.records if r.path != "a.png"]
         with mock.patch.object(
-            cli_mod, "load_database",
+            cli_mod,
+            "load_database",
             side_effect=[(base_rec, np.array([[0.0]], dtype=np.float32)), (imports, np.array([[0.03], [0.06]], dtype=np.float32))],
         ):
             res = CliRunner().invoke(
                 cli,
-                ["dedupe-import", "--base-image-dir", base, "--base-db", "b.sqlite", "--import-image-dir", self.img, "--import-db", "i.sqlite",
-                 "--trash-dir", self.trash, "--skip-update", "-c", "cpu", "-j", "1"],
+                [
+                    "dedupe-import",
+                    "--base-image-dir",
+                    base,
+                    "--base-db",
+                    "b.sqlite",
+                    "--import-image-dir",
+                    self.img,
+                    "--import-db",
+                    "i.sqlite",
+                    "--trash-dir",
+                    self.trash,
+                    "--skip-update",
+                    "-c",
+                    "cpu",
+                    "-j",
+                    "1",
+                ],
             )
         self.assertEqual(res.exit_code, 0, res.output)
         self.assertEqual(sorted(os.listdir(self.trash)), ["b.jpg"])

@@ -76,7 +76,7 @@ is the thing I missed most in kohya's tagging script. Details: [tagging](docs/ta
 
 ```shell
 picurate-project init my-dataset
-picurate-project import my-dataset ~/pictures/set-a   # same-stem .txt files come along as captions
+picurate-project import my-dataset -r ~/pictures/set-a   # same-stem .txt files come along as captions
 picurate-dataset-editor my-dataset
 ```
 

@@ -78,21 +78,28 @@ class GroupListModel(QAbstractListModel):
         g = self.groups[index.row()]
         if role == Qt.ItemDataRole.DisplayRole:
             mark = ("✕ " if g.discard else "∅ " if g.kept == 0 else "") + ("≈ " if g.pixel == "same" else "")
-            return f"{mark}{g.n} images · {g.min_distance:.2f}" + (f" – {g.max_distance:.2f}" if g.max_distance - g.min_distance > 0.005 else "")
+            return f"{mark}{g.n} images · {g.min_distance:.2f}" + (
+                f" – {g.max_distance:.2f}" if g.max_distance - g.min_distance > 0.005 else ""
+            )
         if role == STATUS_ROLE:
             return g.status
         if role == GROUP_ROLE:
             return g
         if role == Qt.ItemDataRole.ToolTipRole:
             label = STATUS_BADGES.get(g.status, STATUS_BADGES["pending"])[1]
-            pixel = {"same": "\nPixels: every pair differs by compression only", "different": "\nPixels: some pair differs by more than compression"}.get(g.pixel or "", "")
+            pixel = {
+                "same": "\nPixels: every pair differs by compression only",
+                "different": "\nPixels: some pair differs by more than compression",
+            }.get(g.pixel or "", "")
             if g.discard:
                 keeps = "\n✕ Discarded: Apply moves every member"
             elif g.kept == 0:
                 keeps = "\n∅ Keeps nothing: Apply skips this group until a member is kept or the group is discarded (R)"
             else:
                 keeps = ""
-            return f"Group {g.id}: {g.n} images, distances {g.min_distance:.3f} to {g.max_distance:.3f} — {label}{pixel}{keeps}" + (f"\n{g.note}" if g.note else "")
+            return f"Group {g.id}: {g.n} images, distances {g.min_distance:.3f} to {g.max_distance:.3f} — {label}{pixel}{keeps}" + (
+                f"\n{g.note}" if g.note else ""
+            )
         if role == Qt.ItemDataRole.SizeHintRole:
             return QSize(180, 26)
         return None

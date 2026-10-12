@@ -35,8 +35,10 @@ class BuiltinPolicyTests(unittest.TestCase):
         danbooru = rec("x/__hatsune_miku_vocaloid__0123456789abcdef0123456789abcdef.png", fmt="PNG")
         konachan = rec("x/Konachan.com - 123 tag.jpg")
         other = rec("x/other.jpg", width=5000, height=5000)
-        self.assertEqual([r.path for r in p.sort([other, konachan, danbooru, yande, pixiv])],
-                         [pixiv.path, yande.path, danbooru.path, konachan.path, other.path])
+        self.assertEqual(
+            [r.path for r in p.sort([other, konachan, danbooru, yande, pixiv])],
+            [pixiv.path, yande.path, danbooru.path, konachan.path, other.path],
+        )
         # no source matched at all: quality decides
         self.assertEqual(p.select([rec("x/a.jpg", width=1, height=1), rec("x/b.jpg", width=2, height=2)]).path, "x/b.jpg")
 

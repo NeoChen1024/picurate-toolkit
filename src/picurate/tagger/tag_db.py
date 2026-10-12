@@ -75,7 +75,12 @@ class Binding:
     score_floor: float
 
     def as_meta(self) -> dict[str, str]:
-        return {"schema_version": SCHEMA_VERSION, "model_id": self.model_id, "dtype": self.dtype, "score_floor": repr(self.score_floor)}
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "model_id": self.model_id,
+            "dtype": self.dtype,
+            "score_floor": repr(self.score_floor),
+        }
 
 
 class TagDB:
@@ -137,7 +142,9 @@ class TagDB:
             self.conn.execute("DELETE FROM tags")
             self.conn.execute("DELETE FROM meta")
             category = {i: cat for cat, sl in vocab.slices.items() for i in range(sl.start, sl.stop)}
-            self.conn.executemany("INSERT INTO tags (id, name, category) VALUES (?, ?, ?)", ((i, t, category[i]) for i, t in enumerate(vocab.tags)))
+            self.conn.executemany(
+                "INSERT INTO tags (id, name, category) VALUES (?, ?, ?)", ((i, t, category[i]) for i, t in enumerate(vocab.tags))
+            )
             self._set_meta({**wanted, "category_thresholds": json.dumps(vocab.thresholds)})
 
     def vocabulary(self) -> Vocabulary:

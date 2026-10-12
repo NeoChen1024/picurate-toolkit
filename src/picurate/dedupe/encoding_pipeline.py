@@ -58,7 +58,14 @@ def encode_images(
         db.upsert(zip(records, encoder.collect(pending)))
 
     return run_pipeline(
-        image_dir, candidates, encoder.get_preprocessor(), encoder.submit, store, batch_size=batch_size, workers=workers, progress=progress
+        image_dir,
+        candidates,
+        encoder.get_preprocessor(),
+        encoder.submit,
+        store,
+        batch_size=batch_size,
+        workers=workers,
+        progress=progress,
     )
 
 

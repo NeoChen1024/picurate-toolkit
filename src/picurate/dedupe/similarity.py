@@ -72,7 +72,9 @@ class DistanceIndex:
         n_cols = (self if other is None else other).n
         return max(1, min(1024, budget_bytes // (4 * max(n_cols, 1))))
 
-    def iter_blocks(self, other: DistanceIndex | None = None, budget_bytes: int = default_distance_block_bytes) -> Iterator[tuple[int, int]]:
+    def iter_blocks(
+        self, other: DistanceIndex | None = None, budget_bytes: int = default_distance_block_bytes
+    ) -> Iterator[tuple[int, int]]:
         block = self.query_block_size(other, budget_bytes)
         for start in range(0, self.n, block):
             yield start, min(start + block, self.n)
@@ -82,7 +84,9 @@ class DistanceIndex:
         self.dbT = None
 
 
-def find_close_pairs_self(index: DistanceIndex, threshold: float, start: int, end: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def find_close_pairs_self(
+    index: DistanceIndex, threshold: float, start: int, end: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Pairs ``(i, j, d)`` with ``start <= i < end``, ``j > i`` and ``d <= threshold`` within a single index.
 
     Only the strictly upper triangle is searched, so every unordered pair is reported exactly once over all blocks.

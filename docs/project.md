@@ -8,40 +8,57 @@ projects so far; see [TODO](TODO.md).
 
 ```shell
 picurate-project init my-dataset
-picurate-project import my-dataset ~/pictures/set-a ~/pictures/extra.png
+picurate-project import my-dataset -r ~/pictures/set-a ~/pictures/extra.png
 picurate-dataset-editor my-dataset
 ```
 
 ## Importing
 
-* A directory is imported recursively, skipping hidden (dot) files and directories unless `--include-hidden`; single
-  files can be given too. PNG, JPEG, WebP and BMP are imported; other files are ignored.
-* A same-stem UTF-8 `.txt` next to an image becomes its starting caption. The caption file is never changed, and
-  later changes to it are not picked up.
-* An image the project already references (same resolved path) is skipped and keeps its edits, so importing a
-  directory again only adds what is new; nothing appears without an explicit import.
-* Every new image is hashed (SHA-256), so an import reads each file once. Progress is written every 1000 images; an
-  interrupted import is resumed by running it again.
+* A directory contributes the images directly in it; with `-r` (the editor: *Include subfolders*) also those in its
+  subdirectories. Hidden (dot) files and directories are skipped unless `--include-hidden`; single files can be given
+  too. PNG, JPEG, WebP and BMP are imported; other files are ignored.
+* A same-stem UTF-8 `.txt` next to an image becomes its imported caption, unless `--no-captions`. The caption file
+  is never changed, and later changes to it are not picked up.
+* An image already in the project, through any source folder that contains it, is skipped and keeps its edits, so
+  importing a directory again only adds what is new; nothing appears without an explicit import.
+* Every new image is hashed (BLAKE3, read sequentially), so an import reads each file once. Progress is committed
+  every 1000 images; an interrupted import is resumed by running it again.
 * Each image gets an output name from its path relative to the imported directory; names that collide (two sources
   with an `a/1.png`) get a suffix from the image's ID.
 
-## Sources
+## Sources and identity
 
-Every imported directory, or the directory of an imported file, is a source folder. **Relink Sources** in the editor
-points one somewhere else after checking the SHA-256 of every image in it. An image that is missing or changed keeps
-its caption and review status editable, but cannot be edited or exported; its thumbnail is marked `[!]`.
+Every imported directory, or the directory of an imported file, is a source folder, recorded once an image is
+imported from it. It gets a random 256-bit ID; an image is identified by its source ID and its path relative to the
+source folder, and its item ID is derived from both (BLAKE3 in key-derivation mode, context `picurate item_id v1`,
+over the source ID, a NUL byte and the path). The databases key everything by the item ID.
+
+**Relink Sources** in the editor points a source folder somewhere else after checking the contents of every image in
+it; the IDs do not change. An image that is missing or changed keeps its caption and review status editable, but
+cannot be edited or exported; its thumbnail is marked `[!]`.
+
+## Decisions and history
+
+What a person decides about an image is stored per field: the caption, the crop, the fills, the review status and
+an exclusion (none, force keep or force exclude, with a reason). A field without a stored value has its default; for
+the caption that is the imported one, so an unedited caption keeps following it. Excluded images are not exported.
+
+Every change belongs to an operation (in the editor: one visit to an image), and the history keeps one entry per
+field and operation, so that an operation can later be rolled back as a unit. Only one editor can have a project
+open at a time.
 
 ## Project directory
 
 ```
-project.json        schema version, source folders, export and completion settings
-items.jsonl         one line per image: stable ID, source folder and relative path, size/mtime/SHA-256,
-                    the caption it was imported with, output name
-edits.jsonl         append-only: the complete state of an image (caption, crop, fills, review status) per save
+project.json        schema version, source folders (ID → path), export and completion settings
+project.sqlite      items     one row per image: ID, source ID and relative path, size, mtime, BLAKE3 of the file,
+                              the imported caption and where it came from, output name
+                    state     the current decisions, one row per image and changed field (JSON)
+                    history   every change: operation, image, field, value (NULL: back to the default)
+                    ops       when each operation happened and what it was
+project.lock        held by the editor that has the project open
 masks/, patches/    the editor's accepted LaMa repairs
 output/             the last export and its .manifest.json
 ```
 
-The last saved state of an image wins. A torn last line of `edits.jsonl` (from a crash mid-write) is moved to an
-`edits-*.recovery` file when the project is opened. The project does not contain the images: backing it up alone is
-not a backup of the dataset.
+The project does not contain the images: backing it up alone is not a backup of the dataset.

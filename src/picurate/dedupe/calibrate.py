@@ -166,7 +166,9 @@ def render_histogram(name: str, values: np.ndarray, edges: np.ndarray, width: in
     if values.size == 0:
         return [f"{name}: no samples"]
     p = np.percentile(values, [50, 95, 99])
-    lines.append(f"{name} ({values.size}): min {values.min():.3g}  p50 {p[0]:.3g}  p95 {p[1]:.3g}  p99 {p[2]:.3g}  max {values.max():.3g}")
+    lines.append(
+        f"{name} ({values.size}): min {values.min():.3g}  p50 {p[0]:.3g}  p95 {p[1]:.3g}  p99 {p[2]:.3g}  max {values.max():.3g}"
+    )
     zeros = int((values <= 0).sum())
     counts, _ = np.histogram(values[values > 0], bins=edges)
     peak = max(counts.max() if counts.size else 0, zeros, 1)
@@ -204,7 +206,9 @@ def report(result: Calibration, thresholds: Sequence[float] = (0.1,), width: int
     for t in thresholds:
         caught = float((variants <= t).mean()) * 100
         merged = int((background <= t).sum())
-        lines.append(f"At threshold {_fmt(t)}: {caught:.1f}% of variants caught, {merged} of {background.size} sampled images would merge with a different image.")
+        lines.append(
+            f"At threshold {_fmt(t)}: {caught:.1f}% of variants caught, {merged} of {background.size} sampled images would merge with a different image."
+        )
     need = float(variants.max())
     floor = float(background.min())
     if need < floor:

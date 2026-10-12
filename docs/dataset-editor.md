@@ -66,7 +66,7 @@ An explicit `cuda:N` that is not available is an error; only Auto falls back to 
 Export replaces the managed contents of `output/` as a whole; it is not incremental. It is built in a staging
 directory from a snapshot taken when it starts and swapped in at the end, so a cancelled or failed export leaves the
 previous output intact (an interrupted swap is recovered when the project is next opened). Files in `output/` the
-editor did not write are kept, and an export that would overwrite one is refused. Source images are verified against
-their SHA-256 first.
+editor did not write are kept, and an export that would overwrite one is refused. Source images are checked against
+the hash recorded at import first; excluded images are left out.
 
 Moved or missing source images are covered under [sources](project.md#sources).

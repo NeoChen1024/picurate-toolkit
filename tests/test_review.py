@@ -6,10 +6,10 @@ from unittest import mock
 import numpy as np
 from click.testing import CliRunner
 
+from picurate.common.images import ImageRecord
 from picurate.dedupe import cli as cli_mod
 from picurate.dedupe import review as rv
 from picurate.dedupe.cli import cli
-from picurate.common.images import ImageRecord
 from picurate.dedupe.keeping import builtin_policies
 from picurate.dedupe.pixel_check import PixelVerdict
 
@@ -35,7 +35,11 @@ class ReviewDBTests(unittest.TestCase):
         return [([self.recs[p] for p in members], edges) for members, edges in specs]
 
     def test_upsert_new_predecided_kept_stale(self):
-        stats = self.db.upsert_groups(self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.05)]), (["c.png", "d.png"], [("c.png", "d.png", 0.4)])), LARGEST, 0.1)
+        stats = self.db.upsert_groups(
+            self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.05)]), (["c.png", "d.png"], [("c.png", "d.png", 0.4)])),
+            LARGEST,
+            0.1,
+        )
         self.assertEqual((stats.new, stats.predecided, stats.kept, stats.stale), (2, 1, 0, 0))
         g1, g2 = self.db.groups()
         self.assertEqual((g1.status, g1.n, g1.min_distance), ("decided", 2, 0.05))
@@ -46,7 +50,12 @@ class ReviewDBTests(unittest.TestCase):
         # the reviewer changes group 2, then a re-match keeps group 2 as is and replaces group 1 by a bigger one
         self.db.keep_only(g2.id, "d.png")
         stats = self.db.upsert_groups(
-            self.groups((["a.png", "b.png", "e.png"], [("a.png", "b.png", 0.05), ("b.png", "e.png", 0.3)]), (["c.png", "d.png"], [("c.png", "d.png", 0.41)])), LARGEST, 0.1
+            self.groups(
+                (["a.png", "b.png", "e.png"], [("a.png", "b.png", 0.05), ("b.png", "e.png", 0.3)]),
+                (["c.png", "d.png"], [("c.png", "d.png", 0.41)]),
+            ),
+            LARGEST,
+            0.1,
         )
         self.assertEqual((stats.new, stats.kept, stats.stale), (1, 1, 1))
         self.assertEqual(self.db.counts()["stale"], 1)
@@ -79,7 +88,12 @@ class ReviewDBTests(unittest.TestCase):
         same, diff = PixelVerdict.measured(1.0, 0.5), PixelVerdict.measured(40.0, 0.5)
         pixel = {("a.png", "b.png"): same, ("c.png", "d.png"): diff}
         # a, b are far apart by embedding but identical by pixels; c, d are close by embedding but edited
-        stats = self.db.upsert_groups(self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.6)]), (["c.png", "d.png"], [("c.png", "d.png", 0.05)])), LARGEST, 0.1, pixel)
+        stats = self.db.upsert_groups(
+            self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.6)]), (["c.png", "d.png"], [("c.png", "d.png", 0.05)])),
+            LARGEST,
+            0.1,
+            pixel,
+        )
         self.assertEqual((stats.new, stats.predecided, stats.pixel_same), (2, 1, 1))
         by_first = {self.db.members(g.id)[0].path: g for g in self.db.groups()}
         self.assertEqual((by_first["a.png"].status, by_first["a.png"].pixel), ("decided", "same"))
@@ -99,12 +113,18 @@ class ReviewDBTests(unittest.TestCase):
         self.assertEqual(self.db.group(g_cd.id).status, "pending")  # the reviewer's group is left alone
         self.assertFalse(self.db.undo(g_ab.id))  # the history restarted from the new starting point
         # and an untouched decided group whose pixels now differ goes back to review
-        stats = self.db.upsert_groups(self.groups(*specs), LARGEST, 0.1, {("a.png", "b.png"): PixelVerdict.measured(50.0, 0.5), ("c.png", "d.png"): same})
+        stats = self.db.upsert_groups(
+            self.groups(*specs), LARGEST, 0.1, {("a.png", "b.png"): PixelVerdict.measured(50.0, 0.5), ("c.png", "d.png"): same}
+        )
         self.assertEqual((stats.redecided, stats.reopened), (0, 1))
         self.assertEqual(self.db.group(g_ab.id).status, "pending")
 
     def test_plan_apply_skips_groups_keeping_nothing(self):
-        self.db.upsert_groups(self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.05)]), (["c.png", "d.png"], [("c.png", "d.png", 0.05)])), LARGEST, 0.1)
+        self.db.upsert_groups(
+            self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.05)]), (["c.png", "d.png"], [("c.png", "d.png", 0.05)])),
+            LARGEST,
+            0.1,
+        )
         g1, g2 = self.db.groups()
         self.db.decide(g2.id, keeps={"c.png": False, "d.png": False})  # unticked after deciding: allowed, but flagged
         moves = self.db.plan_apply()
@@ -161,7 +181,12 @@ class ApplyTests(unittest.TestCase):
     def test_apply_moves_losers_refuses_changed_and_unapplies(self):
         r = {x.path: x for x in self.recs}
         self.db.upsert_groups(
-            [([r["a.png"], r["sub/b.png"]], [("a.png", "sub/b.png", 0.05)]), ([r["c.png"], r["d.png"]], [("c.png", "d.png", 0.05)])], LARGEST, 0.1
+            [
+                ([r["a.png"], r["sub/b.png"]], [("a.png", "sub/b.png", 0.05)]),
+                ([r["c.png"], r["d.png"]], [("c.png", "d.png", 0.05)]),
+            ],
+            LARGEST,
+            0.1,
         )
         g1, g2 = self.db.groups()
         with open(os.path.join(self.img, "d.png"), "ab") as f:
@@ -190,8 +215,7 @@ class MigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "old.review.sqlite")
             con = sqlite3.connect(path)
-            con.executescript(
-                """CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            con.executescript("""CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                    INSERT INTO meta VALUES ('schema_version', '1');
                    CREATE TABLE groups (id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, n INTEGER NOT NULL, min_distance REAL NOT NULL,
                        max_distance REAL NOT NULL, status TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', updated_at REAL NOT NULL);
@@ -209,15 +233,17 @@ class MigrationTests(unittest.TestCase):
                    INSERT INTO history VALUES (1, 1, 0, '{"a": true}', 'pending', ''), (2, 1, 1, '{"a": true}', 'pending', ''),
                        (3, 2, 0, '{"a": true}', 'pending', ''), (4, 2, 1, '{"a": true}', 'decided', ''),
                        (5, 3, 0, '{"a": true, "b": false}', 'pending', ''), (6, 3, 1, '{"a": false, "b": true}', 'pending', ''),
-                       (7, 4, 0, '{"a": false, "b": true}', 'pending', ''), (8, 4, 1, '{"a": true, "b": false}', 'pending', '');"""
-            )
+                       (7, 4, 0, '{"a": false, "b": true}', 'pending', ''), (8, 4, 1, '{"a": true, "b": false}', 'pending', '');""")
             con.commit()
             con.close()
             with rv.ReviewDB(path) as db:
                 self.assertEqual(db.get_meta("schema_version"), rv.SCHEMA_VERSION)
                 # 1: no-op snapshots; 2: decided by hand; 3: keeps moved to what "largest" picks (a bulk Policy
                 # pick); 4: keeps moved away from the policy's choice by hand
-                self.assertEqual([(g.id, g.touched, g.pixel) for g in db.groups()], [(1, False, None), (2, True, None), (3, False, None), (4, True, None)])
+                self.assertEqual(
+                    [(g.id, g.touched, g.pixel) for g in db.groups()],
+                    [(1, False, None), (2, True, None), (3, False, None), (4, True, None)],
+                )
                 self.assertFalse(any(g.discard for g in db.groups()))
                 self.assertTrue(db.undo(4))  # history rows from before the discard column restore as not discarded
                 self.assertFalse(db.group(4).discard)
@@ -236,7 +262,10 @@ class CliReviewTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_dedupe(self, *extra):
-        with mock.patch.object(cli_mod, "load_database", return_value=(self.records, self.emb)), mock.patch.object(cli_mod, "EmbeddingDB") as store:
+        with (
+            mock.patch.object(cli_mod, "load_database", return_value=(self.records, self.emb)),
+            mock.patch.object(cli_mod, "EmbeddingDB") as store,
+        ):
             store.return_value.__enter__.return_value.model_id = "m"
             return CliRunner().invoke(cli, ["dedupe", "-i", self.img, "-d", self.db, "--skip-update", "-c", "cpu", *extra])
 

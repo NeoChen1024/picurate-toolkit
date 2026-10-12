@@ -7,6 +7,7 @@ license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
+    "blake3",
     "click",
     "huggingface_hub",
     "humanize",
@@ -25,6 +26,8 @@ gui = ["PySide6>=6.7"]
 # Mask generation for the dataset editor's LaMa repair; Hi-SAM and SAM 2 themselves are installed from source by
 # `python -m picurate.dataset_editor.install_repair`.
 repair = ["einops", "hydra-core", "iopath", "setuptools"]
+# Formatting: Black and isort, configured below.
+dev = ["black", "isort"]
 # Dataset preprocessing and CLIP fine-tuning scripts (src/clip_training), not needed for deduplication.
 training = [
     "accelerate",
@@ -64,3 +67,4 @@ target-version = ['py311']
 
 [tool.isort]
 profile = "black"
+line_length = 132

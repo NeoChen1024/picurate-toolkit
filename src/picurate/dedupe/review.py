@@ -189,6 +189,7 @@ class ReviewDB:
         """Add the columns of schemas 2 and 3 to an older file. ``touched`` is derived from the history: a group was
         touched when its status or note ever left the first snapshot's, or when its keeps differ from both the first
         snapshot and the recorded policy's choice (a bulk Policy pick is not a review decision)."""
+
         def columns(table: str) -> set[str]:
             return {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
 
@@ -202,7 +203,11 @@ class ReviewDB:
         if "touched" not in group_cols:
             self.conn.execute("ALTER TABLE groups ADD COLUMN touched INTEGER NOT NULL DEFAULT 0")
             self._derive_touched()
-            logger.info("Review database %s upgraded: %d groups were changed by a reviewer", self.path, self.conn.execute("SELECT COUNT(*) FROM groups WHERE touched").fetchone()[0])
+            logger.info(
+                "Review database %s upgraded: %d groups were changed by a reviewer",
+                self.path,
+                self.conn.execute("SELECT COUNT(*) FROM groups WHERE touched").fetchone()[0],
+            )
         if "discard" not in group_cols:
             self.conn.execute("ALTER TABLE groups ADD COLUMN discard INTEGER NOT NULL DEFAULT 0")
         if "discard" not in columns("history"):
@@ -258,7 +263,9 @@ class ReviewDB:
         """Record what the groups were produced with. A later session with another model refuses to mix."""
         previous = self.get_meta("model_id")
         if previous is not None and previous != model_id:
-            raise ValueError(f"Review database {self.path} holds groups from model '{previous}', not '{model_id}'. Use another file.")
+            raise ValueError(
+                f"Review database {self.path} holds groups from model '{previous}', not '{model_id}'. Use another file."
+            )
         for k, v in (
             ("image_dir", os.path.abspath(image_dir)),
             ("model_id", model_id),
@@ -330,7 +337,17 @@ class ReviewDB:
                 self.conn.executemany(
                     "INSERT INTO members (group_id, path, keep, width, height, size, format, mtime, distance_to_winner) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
-                        (gid, r.path, int(r is winner), r.width, r.height, r.size, r.format, r.mtime, 0.0 if r is winner else by_pair.get((r.path, winner.path)))
+                        (
+                            gid,
+                            r.path,
+                            int(r is winner),
+                            r.width,
+                            r.height,
+                            r.size,
+                            r.format,
+                            r.mtime,
+                            0.0 if r is winner else by_pair.get((r.path, winner.path)),
+                        )
                         for r in records
                     ],
                 )
@@ -362,14 +379,29 @@ class ReviewDB:
                 for r in records:
                     self.conn.execute(
                         "UPDATE members SET width = ?, height = ?, size = ?, format = ?, mtime = ?, distance_to_winner = ? WHERE group_id = ? AND path = ?",
-                        (r.width, r.height, r.size, r.format, r.mtime, 0.0 if r is winner else by_pair.get((r.path, winner.path)), gid, r.path),
+                        (
+                            r.width,
+                            r.height,
+                            r.size,
+                            r.format,
+                            r.mtime,
+                            0.0 if r is winner else by_pair.get((r.path, winner.path)),
+                            gid,
+                            r.path,
+                        ),
                     )
                 self.conn.execute("DELETE FROM edges WHERE group_id = ?", (gid,))
                 stats.kept += 1
             self.conn.executemany(
                 "INSERT INTO edges (group_id, path_a, path_b, distance, pixel, pixel_peak, pixel_mean) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 [
-                    (gid, a, b, d, *((None, None, None) if verdicts is None else (verdicts[k].status, verdicts[k].peak, verdicts[k].mean)))
+                    (
+                        gid,
+                        a,
+                        b,
+                        d,
+                        *((None, None, None) if verdicts is None else (verdicts[k].status, verdicts[k].peak, verdicts[k].mean)),
+                    )
                     for k, (a, b, d) in enumerate(edges)
                 ],
             )
@@ -388,12 +420,27 @@ class ReviewDB:
     @staticmethod
     def _group(row: sqlite3.Row) -> GroupRow:
         return GroupRow(
-            row["id"], row["key"], row["n"], row["min_distance"], row["max_distance"], row["status"], row["note"], row["updated_at"],
-            row["pixel"], bool(row["touched"]), bool(row["discard"]), row["kept"],
+            row["id"],
+            row["key"],
+            row["n"],
+            row["min_distance"],
+            row["max_distance"],
+            row["status"],
+            row["note"],
+            row["updated_at"],
+            row["pixel"],
+            bool(row["touched"]),
+            bool(row["discard"]),
+            row["kept"],
         )
 
     def groups(
-        self, status: str | Sequence[str] | None = None, *, pixel: str | None = None, keeps_nothing: bool = False, discarded: bool = False
+        self,
+        status: str | Sequence[str] | None = None,
+        *,
+        pixel: str | None = None,
+        keeps_nothing: bool = False,
+        discarded: bool = False,
     ) -> list[GroupRow]:
         """Groups ordered by minimum distance (the surest first). ``status`` filters; ``None`` means every status
         except ``stale``. ``pixel`` ("same" / "different") filters on the pixel check. ``keeps_nothing`` lists only
@@ -432,18 +479,30 @@ class ReviewDB:
 
     def pixel_counts(self) -> dict[tuple[str, str | None], int]:
         """``{(status, pixel): count}`` over every group."""
-        return {(r["status"], r["pixel"]): r["c"] for r in self.conn.execute("SELECT status, pixel, COUNT(*) AS c FROM groups GROUP BY status, pixel")}
+        return {
+            (r["status"], r["pixel"]): r["c"]
+            for r in self.conn.execute("SELECT status, pixel, COUNT(*) AS c FROM groups GROUP BY status, pixel")
+        }
 
     def members(self, group_id: int) -> list[MemberRow]:
         rows = self.conn.execute("SELECT * FROM members WHERE group_id = ? ORDER BY path", (group_id,)).fetchall()
-        return [MemberRow(r["path"], bool(r["keep"]), r["width"], r["height"], r["size"], r["format"], r["mtime"], r["distance_to_winner"]) for r in rows]
+        return [
+            MemberRow(
+                r["path"], bool(r["keep"]), r["width"], r["height"], r["size"], r["format"], r["mtime"], r["distance_to_winner"]
+            )
+            for r in rows
+        ]
 
     def edges(self, group_id: int) -> list[tuple[str, str, float]]:
-        rows = self.conn.execute("SELECT path_a, path_b, distance FROM edges WHERE group_id = ? ORDER BY distance", (group_id,)).fetchall()
+        rows = self.conn.execute(
+            "SELECT path_a, path_b, distance FROM edges WHERE group_id = ? ORDER BY distance", (group_id,)
+        ).fetchall()
         return [(r["path_a"], r["path_b"], r["distance"]) for r in rows]
 
     def edge_pixels(self, group_id: int) -> dict[EdgeKey, PixelVerdict]:
-        rows = self.conn.execute("SELECT path_a, path_b, pixel, pixel_peak, pixel_mean FROM edges WHERE group_id = ? AND pixel IS NOT NULL", (group_id,))
+        rows = self.conn.execute(
+            "SELECT path_a, path_b, pixel, pixel_peak, pixel_mean FROM edges WHERE group_id = ? AND pixel IS NOT NULL", (group_id,)
+        )
         return {(r["path_a"], r["path_b"]): PixelVerdict(r["pixel"], r["pixel_peak"], r["pixel_mean"]) for r in rows}
 
     def pixel_cache(self) -> dict[EdgeKey, tuple[PixelVerdict, tuple[float, int, float, int]]]:
@@ -472,7 +531,9 @@ class ReviewDB:
     # -- deciding ----------------------------------------------------------------------------------------------------
 
     def _snapshot(self, group_id: int, now: float) -> None:
-        keeps = {r["path"]: bool(r["keep"]) for r in self.conn.execute("SELECT path, keep FROM members WHERE group_id = ?", (group_id,))}
+        keeps = {
+            r["path"]: bool(r["keep"]) for r in self.conn.execute("SELECT path, keep FROM members WHERE group_id = ?", (group_id,))
+        }
         g = self.conn.execute("SELECT status, note, discard FROM groups WHERE id = ?", (group_id,)).fetchone()
         self.conn.execute(
             "INSERT INTO history (group_id, at, keep_json, status, note, discard) VALUES (?, ?, ?, ?, ?, ?)",
@@ -513,12 +574,17 @@ class ReviewDB:
         if status == "decided" and not any(after.values()) and not discard:
             raise ValueError(f"Group {group_id} keeps nothing; tick a member to keep, or discard the whole group")
         changes = (
-            after != current or (status is not None and status != g.status) or (note is not None and note != g.note) or discard != g.discard
+            after != current
+            or (status is not None and status != g.status)
+            or (note is not None and note != g.note)
+            or discard != g.discard
         )
         if not changes:
             return  # nothing to record: no history step, and the group stays untouched
         if keeps:
-            self.conn.executemany("UPDATE members SET keep = ? WHERE group_id = ? AND path = ?", [(int(v), group_id, p) for p, v in keeps.items()])
+            self.conn.executemany(
+                "UPDATE members SET keep = ? WHERE group_id = ? AND path = ?", [(int(v), group_id, p) for p, v in keeps.items()]
+            )
         sets: list[str] = ["updated_at = ?", "discard = ?"] + (["touched = 1"] if touch else [])
         args: list[object] = [now, int(discard)]
         if status is not None:
@@ -557,7 +623,9 @@ class ReviewDB:
 
     def undo(self, group_id: int) -> bool:
         """Revert the last ``decide`` of a group. Returns False when there is nothing left to undo."""
-        rows = self.conn.execute("SELECT id, keep_json, status, note, discard FROM history WHERE group_id = ? ORDER BY id DESC LIMIT 2", (group_id,)).fetchall()
+        rows = self.conn.execute(
+            "SELECT id, keep_json, status, note, discard FROM history WHERE group_id = ? ORDER BY id DESC LIMIT 2", (group_id,)
+        ).fetchall()
         if len(rows) < 2:
             return False
         current, previous = rows
@@ -597,7 +665,8 @@ class ReviewDB:
     def mark_applied(self, group_id: int, moved: Iterable[tuple[str, str]]) -> None:
         now = time.time()
         self.conn.executemany(
-            "INSERT OR REPLACE INTO applied (path, trash_path, group_id, at) VALUES (?, ?, ?, ?)", [(p, t, group_id, now) for p, t in moved]
+            "INSERT OR REPLACE INTO applied (path, trash_path, group_id, at) VALUES (?, ?, ?, ?)",
+            [(p, t, group_id, now) for p, t in moved],
         )
         self.conn.execute("UPDATE groups SET status = 'applied', touched = 1, updated_at = ? WHERE id = ?", (now, group_id))
         self._snapshot(group_id, now)
@@ -605,7 +674,9 @@ class ReviewDB:
 
     def applied(self, group_id: int | None = None) -> list[tuple[str, str, int]]:
         sql = "SELECT path, trash_path, group_id FROM applied"
-        rows = self.conn.execute(sql + (" WHERE group_id = ?" if group_id is not None else ""), (group_id,) if group_id is not None else ()).fetchall()
+        rows = self.conn.execute(
+            sql + (" WHERE group_id = ?" if group_id is not None else ""), (group_id,) if group_id is not None else ()
+        ).fetchall()
         return [(r["path"], r["trash_path"], r["group_id"]) for r in rows]
 
     def mark_unapplied(self, group_id: int) -> None:
@@ -631,7 +702,13 @@ def changed_on_disk(image_dir: str, members: Sequence[MemberRow]) -> list[str]:
 
 
 def apply_decisions(
-    review: ReviewDB, image_dir: str, trash_dir: str, *, dry_run: bool, group_ids: Sequence[int] | None = None, progress: Callable[[int], object] | None = None
+    review: ReviewDB,
+    image_dir: str,
+    trash_dir: str,
+    *,
+    dry_run: bool,
+    group_ids: Sequence[int] | None = None,
+    progress: Callable[[int], object] | None = None,
 ) -> tuple[int, list[int]]:
     """Move the losers of every decided group to ``trash_dir``. Returns ``(files moved, group ids refused)``.
 
@@ -648,12 +725,20 @@ def apply_decisions(
         members = review.members(gid)
         changed = changed_on_disk(image_dir, members)
         if changed:
-            logger.warning("Group %d: %d file(s) changed on disk since matching, skipping: %s", gid, len(changed), ", ".join(changed[:5]))
+            logger.warning(
+                "Group %d: %d file(s) changed on disk since matching, skipping: %s", gid, len(changed), ", ".join(changed[:5])
+            )
             refused.append(gid)
             continue
         done: list[tuple[str, str]] = []
         for mv in group_moves:
-            if move_to_trash(image_dir, mv.path, trash_dir, dry_run=dry_run, reason=f"keeping {', '.join(mv.keep)}" if mv.keep else "whole group discarded"):
+            if move_to_trash(
+                image_dir,
+                mv.path,
+                trash_dir,
+                dry_run=dry_run,
+                reason=f"keeping {', '.join(mv.keep)}" if mv.keep else "whole group discarded",
+            ):
                 done.append((mv.path, os.path.join(trash_dir, mv.path)))
         moved_total += len(done)
         if not dry_run:

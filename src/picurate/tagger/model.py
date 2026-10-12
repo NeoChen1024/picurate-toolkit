@@ -153,9 +153,21 @@ class TaggerConfig:
     def from_json(cls, cfg: dict) -> TaggerConfig:
         # Fail loudly on any switch this rewrite does not implement instead of computing something else.
         expected = {
-            "use_rope": True, "use_interp_rope": True, "use_abs_pos": True, "tile_abs_pos": True, "pretrain_use_cls_token": True,
-            "retain_cls_token": False, "rel_pos_blocks": [], "init_values": None, "ln_pre": True, "ln_post": False,
-            "bias_patch_embed": False, "qkv_bias": True, "act_layer": "GELU", "norm_layer": "LayerNorm", "in_chans": 3,
+            "use_rope": True,
+            "use_interp_rope": True,
+            "use_abs_pos": True,
+            "tile_abs_pos": True,
+            "pretrain_use_cls_token": True,
+            "retain_cls_token": False,
+            "rel_pos_blocks": [],
+            "init_values": None,
+            "ln_pre": True,
+            "ln_post": False,
+            "bias_patch_embed": False,
+            "qkv_bias": True,
+            "act_layer": "GELU",
+            "norm_layer": "LayerNorm",
+            "in_chans": 3,
         }
         wrong = {k: cfg.get(k) for k, v in expected.items() if cfg.get(k) != v}
         if wrong:
@@ -277,7 +289,9 @@ def _resolve_files(model: str, revision: str | None) -> tuple[str, str]:
     )
 
 
-def load_model(model: str = default_repo_id, *, revision: str | None = None, device: str = "cpu", dtype: torch.dtype = torch.float32) -> LoadedTagger:
+def load_model(
+    model: str = default_repo_id, *, revision: str | None = None, device: str = "cpu", dtype: torch.dtype = torch.float32
+) -> LoadedTagger:
     config_path, weights_path = _resolve_files(model, revision)
     with open(config_path, encoding="utf-8") as f:
         config = json.load(f)

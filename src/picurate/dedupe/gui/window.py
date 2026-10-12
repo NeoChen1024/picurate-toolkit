@@ -45,7 +45,18 @@ from .models import GROUP_ROLE, STATUS_BADGES, BadgeDelegate, GroupListModel
 logger = logging.getLogger(__name__)
 
 THUMB = (96, 96)
-FILTERS = ("all", "pending", "decided", "skipped", "applied", "stale", "compression only", "pixel differences", "keeps nothing", "discarded")
+FILTERS = (
+    "all",
+    "pending",
+    "decided",
+    "skipped",
+    "applied",
+    "stale",
+    "compression only",
+    "pixel differences",
+    "keeps nothing",
+    "discarded",
+)
 PIXEL_FILTERS = {"compression only": "same", "pixel differences": "different"}  # any status but stale
 KEEP_FILTERS = {"keeps nothing": {"keeps_nothing": True}, "discarded": {"discarded": True}}  # any status but stale
 
@@ -53,7 +64,15 @@ KEEP_FILTERS = {"keeps nothing": {"keeps_nothing": True}, "discarded": {"discard
 class ReviewWindow(QMainWindow):
     """One review database, one image directory."""
 
-    def __init__(self, review_path: str, image_dir: str | None = None, trash_dir: str | None = None, *, policies: dict[str, Policy] | None = None, prefetch: int = 3):
+    def __init__(
+        self,
+        review_path: str,
+        image_dir: str | None = None,
+        trash_dir: str | None = None,
+        *,
+        policies: dict[str, Policy] | None = None,
+        prefetch: int = 3,
+    ):
         super().__init__()
         self.review = ReviewDB(review_path)
         self.image_dir = image_dir or self.review.get_meta("image_dir") or "."
@@ -564,7 +583,9 @@ class ReviewWindow(QMainWindow):
         def compute(signals):
             return diff_images(a_im, b_im)
 
-        pool.start(Job(compute).connect(lambda images: self._diff_ready(pair, images), lambda error: self._diff_failed(pair, error)))
+        pool.start(
+            Job(compute).connect(lambda images: self._diff_ready(pair, images), lambda error: self._diff_failed(pair, error))
+        )
 
     def _diff_ready(self, pair: tuple[str, str], images) -> None:
         self.diffing.discard(pair)
@@ -747,11 +768,17 @@ class ReviewWindow(QMainWindow):
         dialog.setWindowTitle("Apply decisions")
         dialog.resize(800, 600)
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel(f"{n} files will be moved to the trash directory{': ' + self.trash_dir if self.trash_dir else ''}. Nothing is deleted."))
+        layout.addWidget(
+            QLabel(
+                f"{n} files will be moved to the trash directory{': ' + self.trash_dir if self.trash_dir else ''}. Nothing is deleted."
+            )
+        )
         keepless = self.review.groups("decided", keeps_nothing=True)
         if keepless:
             layout.addWidget(
-                QLabel(f"{len(keepless)} decided group(s) keep nothing and are skipped. Show → keeps nothing lists them; R discards a whole group.")
+                QLabel(
+                    f"{len(keepless)} decided group(s) keep nothing and are skipped. Show → keeps nothing lists them; R discards a whole group."
+                )
             )
         view = QPlainTextEdit()
         view.setReadOnly(True)
@@ -786,7 +813,10 @@ class ReviewWindow(QMainWindow):
         progress.close()
         self.images.clear()
         self.reload_groups()
-        self.message(f"{moved} files moved to {self.trash_dir}" + (f"; {len(refused)} groups refused because files changed on disk" if refused else ""))
+        self.message(
+            f"{moved} files moved to {self.trash_dir}"
+            + (f"; {len(refused)} groups refused because files changed on disk" if refused else "")
+        )
         return moved, refused
 
     def undo_apply(self) -> None:
@@ -888,8 +918,15 @@ class ReviewWindow(QMainWindow):
 
 
 _SHIFTED_DIGITS = {
-    Qt.Key.Key_Exclam: 1, Qt.Key.Key_At: 2, Qt.Key.Key_NumberSign: 3, Qt.Key.Key_Dollar: 4, Qt.Key.Key_Percent: 5,
-    Qt.Key.Key_AsciiCircum: 6, Qt.Key.Key_Ampersand: 7, Qt.Key.Key_Asterisk: 8, Qt.Key.Key_ParenLeft: 9,
+    Qt.Key.Key_Exclam: 1,
+    Qt.Key.Key_At: 2,
+    Qt.Key.Key_NumberSign: 3,
+    Qt.Key.Key_Dollar: 4,
+    Qt.Key.Key_Percent: 5,
+    Qt.Key.Key_AsciiCircum: 6,
+    Qt.Key.Key_Ampersand: 7,
+    Qt.Key.Key_Asterisk: 8,
+    Qt.Key.Key_ParenLeft: 9,
 }
 
 HELP_HTML = """

@@ -56,6 +56,7 @@ class Window(QMainWindow):
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(4)
         self.project = None
+        self.op = None
         self.inference_engine = InferenceEngine()
         self.state = None
         self.im = None
@@ -382,7 +383,16 @@ class Window(QMainWindow):
         except Exception as error:
             self.error(error)
             return
+        try:
+            project.lock()
+        except ValueError as error:
+            project.close()
+            self.error(error)
+            return
+        if self.project:
+            self.project.close()
         self.project = project
+        self.op = None
         self.state = None
         self.dirty = False
         self.setWindowTitle(f"{project.directory.name} — Dataset Editor")
@@ -413,8 +423,8 @@ class Window(QMainWindow):
         self.paths = [self.project.source_path(key) for key in self.item_ids]
         self.image_position.setText(f"Image 0 / {len(self.paths):,}")
         self.model = Thumbnails(self.paths, self.pool)
-        for i, key in enumerate(self.item_ids):
-            self.model.status[i] = self.project.state(key)["review_status"]
+        for i, state in enumerate(self.project.states()):
+            self.model.status[i] = state["review_status"]
             if not self.paths[i].is_file():
                 self.model.issues[i] = "Missing source — use Relink Sources"
         self.thumbs.setModel(self.model)
@@ -453,7 +463,9 @@ class Window(QMainWindow):
         choice = QMessageBox(self)
         choice.setWindowTitle("Import Images")
         choice.setText("Import external images and copy their current captions into this project.")
-        folder = choice.addButton("Folder (recursive)…", QMessageBox.ButtonRole.AcceptRole)
+        subfolders = QCheckBox("Include subfolders")
+        choice.setCheckBox(subfolders)
+        folder = choice.addButton("Folder…", QMessageBox.ButtonRole.AcceptRole)
         files = choice.addButton("Image files…", QMessageBox.ButtonRole.AcceptRole)
         choice.addButton(QMessageBox.StandardButton.Cancel)
         choice.exec()
@@ -468,9 +480,10 @@ class Window(QMainWindow):
             return
         if paths:
             project = self.project
+            recursive = subfolders.isChecked()
 
             def run():
-                imported, skipped = project.import_images(paths)
+                imported, skipped = project.import_images(paths, recursive=recursive)
                 return f"Imported {imported} images; skipped {skipped} existing references"
 
             self.project_job("Importing images and captions…", run)
@@ -478,8 +491,8 @@ class Window(QMainWindow):
     def relink_sources(self):
         if not self.project or not self.save():
             return
-        sources = self.project.settings["sources"]
-        labels = [f"{key[:8]} — {path}" for key, path in sources.items()]
+        sources = self.project.sources
+        labels = [f"{key.hex()[:8]} — {path}" for key, path in sources.items()]
         if not labels:
             self.error("No imported sources to relink")
             return
@@ -512,6 +525,7 @@ class Window(QMainWindow):
         self.generation += 1
         generation = self.generation
         self.state = None
+        self.op = None  # each visit to an image is one operation in the history
         self.im = None
         self.caption.setEnabled(False)
         self.canvas.setEnabled(False)
@@ -571,7 +585,9 @@ class Window(QMainWindow):
         self.saving.stop()
         if self.project and self.state and getattr(self, "dirty", False):
             try:
-                self.project.save(self.state)
+                if self.op is None:
+                    self.op = self.project.begin_op("edit", self.state["image"])
+                self.project.save(self.state, self.op)
                 self.dirty = False
                 self.status_message.setText("Edits saved")
             except Exception as error:
@@ -756,7 +772,7 @@ class Window(QMainWindow):
         form.addRow(buttons)
         if not dialog.exec():
             return
-        states = [self.project.state(key) for key in self.item_ids]
+        states = [state for state in self.project.states() if not state["excluded"]]
         if scope.currentIndex() == 2:
             states = [state for state in states if self.state and state["item_id"] == self.state["item_id"]]
         elif scope.currentIndex() == 1:
@@ -804,4 +820,6 @@ class Window(QMainWindow):
         QApplication.instance().removeEventFilter(self)
         self.caption.dismiss()
         self.pool.waitForDone()
+        if self.project:
+            self.project.close()
         event.accept()

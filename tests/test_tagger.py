@@ -1,7 +1,7 @@
 import json
 import os
-import tempfile
 import sqlite3
+import tempfile
 import unittest
 from unittest import mock
 
@@ -11,16 +11,16 @@ import torch
 from click.testing import CliRunner
 from safetensors.torch import save_file
 
+from picurate.tagger import cli as cli_mod
 from picurate.tagger.captions import (
-    CaptionOptions,
     Captioner,
+    CaptionOptions,
     Vocabulary,
     expand_character,
     parse_replacements,
     prompt_form,
     resolution_tags,
 )
-from picurate.tagger import cli as cli_mod
 from picurate.tagger.cli import cli
 from picurate.tagger.model import TaggerConfig, TaggerPreprocess, ViTDetTagger, load_model
 from picurate.tagger.tag_db import Binding, TagDB, TagDBMismatchError
@@ -52,10 +52,17 @@ def _probs(**scores: float) -> np.ndarray:
 
 # general sorted by confidence: smile > solo > 1girl; 2boys counts as a count tag
 SCENE = _probs(
-    smile=0.95, solo=0.9, **{"1girl": 0.8, "2boys": 0.4, "^_^": 0.5}, long_hair=0.1,
+    smile=0.95,
+    solo=0.9,
+    **{"1girl": 0.8, "2boys": 0.4, "^_^": 0.5},
+    long_hair=0.1,
     **{"artoria_pendragon_(fate)": 0.7, "fate_(series)": 0.6, "some_artist": 0.7},
-    md5_mismatch=0.9, official_art=0.5, **{"watercolor_(medium)": 0.4}, highres=0.9,
-    rating__s=0.3, rating__g=0.6,
+    md5_mismatch=0.9,
+    official_art=0.5,
+    **{"watercolor_(medium)": 0.4},
+    highres=0.9,
+    rating__s=0.3,
+    rating__g=0.6,
 )
 
 
@@ -253,7 +260,7 @@ class TagDBTests(unittest.TestCase):
                 self.assertEqual(list(again.tags), TAGS)
                 self.assertEqual(again.slices, vocab.slices)
                 self.assertEqual(again.thresholds, vocab.thresholds)
-                (got_rec, probs), = db.iter_scores(len(TAGS))
+                ((got_rec, probs),) = db.iter_scores(len(TAGS))
                 self.assertEqual(got_rec, rec)
                 self.assertTrue(np.allclose(probs, np.where((SCENE >= 0.3) | (np.arange(len(TAGS)) >= 15), SCENE, 0)))
                 # same binding: fine; any difference: refused, or reset when asked

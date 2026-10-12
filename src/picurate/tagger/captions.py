@@ -83,7 +83,9 @@ def parse_replacements(text: str | None) -> dict[str, str]:
             continue
         parts = pair.split(",")
         if len(parts) != 2:
-            raise ValueError(f"Tag replacement must be 'source,target': {pair.replace(chr(0) + 'c', ',').replace(chr(0) + 's', ';')!r}")
+            raise ValueError(
+                f"Tag replacement must be 'source,target': {pair.replace(chr(0) + 'c', ',').replace(chr(0) + 's', ';')!r}"
+            )
         src, dst = (normalize(p.replace("\0c", ",").replace("\0s", ";")) for p in parts)
         out[src] = dst
     return out

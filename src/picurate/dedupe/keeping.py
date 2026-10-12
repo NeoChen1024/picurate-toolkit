@@ -99,7 +99,11 @@ class Policy:
         criteria = raw.get("criteria")
         if not isinstance(criteria, list) or not criteria:
             raise PolicyError(f"{where}: 'criteria' must be a non-empty list")
-        return cls(name, tuple(Criterion.from_dict(c, f"{where}.criteria[{i}]") for i, c in enumerate(criteria)), str(raw.get("description", "")))
+        return cls(
+            name,
+            tuple(Criterion.from_dict(c, f"{where}.criteria[{i}]") for i, c in enumerate(criteria)),
+            str(raw.get("description", "")),
+        )
 
     def sort(self, candidates: Sequence[ImageRecord]) -> list[ImageRecord]:
         """Candidates ordered best-first. Ties keep input order (sorted is stable)."""

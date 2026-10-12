@@ -125,8 +125,15 @@ class CLIPImageEncoder:
             # Embeddings depend on the patch budget, so it is part of the identity a database is bound to.
             self.model_id = f"{model_id}@{seq_len}"
             transform = timm.data.create_transform(
-                input_size=cfg["input_size"], interpolation=cfg["interpolation"], mean=cfg["mean"], std=cfg["std"],
-                is_training=False, naflex=True, patch_size=self.patch_size, max_seq_len=seq_len, patchify=True,
+                input_size=cfg["input_size"],
+                interpolation=cfg["interpolation"],
+                mean=cfg["mean"],
+                std=cfg["std"],
+                is_training=False,
+                naflex=True,
+                patch_size=self.patch_size,
+                max_seq_len=seq_len,
+                patchify=True,
             )
             self.preprocess: Callable[[PIL.Image.Image], Preprocessed] = _NaFlexPreprocess(transform, self.array_dtype)
         else:

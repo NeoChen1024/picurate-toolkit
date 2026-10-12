@@ -7,28 +7,15 @@ natural-language passages for Anima-style captions). Tagging runs once: before c
 drive tag matching, otherwise after it, so that excluded images are not tagged. Every stage stays usable on its own,
 without a project.
 
-* [ ] **Identity.** An image is `(source_id, relative path)`. `source_id` is 256 random bits (never all zero)
-  created when a source folder is first imported, kept in `project.json` (as hex, the only place IDs are text) and
-  unchanged by relinking; outside a project the single image directory has the all-zero `source_id`, so there is
-  one code path. The item ID is BLAKE3 in key-derivation mode with context `picurate item_id v1` over the 32 bytes
-  of `source_id`, `"\0"` and the relative path (UTF-8 with surrogateescape), all 256 bits. IDs are stored as BLOBs;
-  hex is only for display. Rows in every database keep `(id, source_id, path)`. IDs are only unique within one
-  database: `dedupe-import` keeps the two sides apart.
-* [ ] **Hashing.** BLAKE3 for every hash the project makes (content fingerprints, repair inputs and artifacts,
-  review group keys); downloads are still checked with whatever their publisher uses (Big-LaMa: SHA-256).
-* [ ] **Project storage.** `project.json` keeps the settings and the source folders; `project.sqlite` replaces
-  `items.jsonl` and `edits.jsonl`:
-  * `items`, written by import, committed per batch.
-  * Human decisions, stored per field (caption, crop, fills, review status, exclusion: none / force keep / force
-    exclude, with a reason): a current-state table and an append-only history table. History rows carry an
-    operation ID, so one edit session, one culling apply or one batch replacement can be rolled back as a unit;
-    fields changed again since are skipped and listed. A rollback is itself a new history entry. Auto-save while
-    typing updates the current state; history is written when leaving an image or closing.
-  * An unchanged caption is stored as NULL, meaning "use the derived one".
-  * `picurate-project gc --keep-revisions N | --older-than AGE` prunes history and the LaMa artifacts nothing kept
-    refers to, with `-n` to list first. Never automatic.
-  * The editor holds an `flock` on the project so two editors cannot overwrite each other.
-  * Schema version 3; older projects are refused, not converted.
+Project identity, storage and per-field decisions with history are in place ([projects](project.md)). Still open:
+
+* [ ] **Databases keyed by item ID.** Rows in the embedding, review and tag databases keep `(id, source_id, path)`;
+  a standalone image directory has the all-zero source ID, so there is one code path. IDs are only unique within one
+  database: `dedupe-import` keeps the two sides apart. Review group keys become BLAKE3 of the member IDs.
+* [ ] **Rollback and GC.** Roll back one operation (an editor visit, a culling apply, a batch replacement): restore
+  each field's previous value, skipping and listing fields changed again since; the rollback is itself a new
+  operation. `picurate-project gc --keep-revisions N | --older-than AGE` prunes history and the LaMa artifacts
+  nothing kept refers to, with `-n` to list first. Never automatic.
 * [ ] **Stages write only their own files; reading combines them** (one implementation in `picurate.project`, used by
   the editor, the tagger and export):
   * Excluded = (losers of decided groups in `review.sqlite`) overridden by the human exclusion decision.
@@ -50,7 +37,6 @@ without a project.
   * Applying writes human exclusion decisions with the query as the reason, as one operation.
   * Text similarity needs SigLIP2's text tower from transformers (`google/siglip2-so400m-patch16-naflex`). First
     check that its image tower gives the same embeddings as timm's, and that text queries rank real images sensibly.
-* [ ] **Import:** `--no-captions` imports images only.
 * [ ] **Existing standalone databases** (embeddings, review, tags) keyed by path are refused with a hint; an explicit
   migration command adds the IDs in one transaction (cheap: the ID is a hash of the path, nothing is re-encoded).
 * [ ] Later: reuse embeddings across projects and collections by content hash and model.

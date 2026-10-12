@@ -31,11 +31,16 @@ def init(project_dir: str) -> None:
 @click.option(
     "--include-hidden", is_flag=True, help="Also import hidden (dot) files and directories, which are skipped by default."
 )
+@click.option("--recursive", "-r", is_flag=True, help="Also import images in subdirectories.")
+@click.option("--no-captions", is_flag=True, help="Import the images only, ignoring caption files next to them.")
 @click.option("--verbose", "-v", is_flag=True, help="Debug logging.")
-def import_(project_dir: str, sources: tuple[str, ...], include_hidden: bool, verbose: bool) -> None:
-    """Import images from SOURCES (directories, recursively, or single files) into the project at PROJECT_DIR.
+def import_(
+    project_dir: str, sources: tuple[str, ...], recursive: bool, include_hidden: bool, no_captions: bool, verbose: bool
+) -> None:
+    """Import images from SOURCES (directories, with -r also their subdirectories, or single files) into the project at
+    PROJECT_DIR.
 
-    A same-stem UTF-8 .txt next to an image becomes its starting caption. Images already in the project are skipped
+    A same-stem UTF-8 .txt next to an image becomes its imported caption, unless --no-captions. Images already in the project are skipped
     with their edits kept, so an interrupted import can simply be run again.
     """
     setup_logging(verbose)
@@ -50,7 +55,9 @@ def import_(project_dir: str, sources: tuple[str, ...], include_hidden: bool, ve
             bar.update(done - bar.n)
 
         try:
-            imported, skipped = project.import_images(sources, include_hidden=include_hidden, progress=progress)
+            imported, skipped = project.import_images(
+                sources, captions=not no_captions, recursive=recursive, include_hidden=include_hidden, progress=progress
+            )
         except ValueError as e:
             raise click.ClickException(str(e)) from e
     click.echo(f"Imported {imported} images, skipped {skipped} already in the project; {len(project.items)} in total.", err=True)

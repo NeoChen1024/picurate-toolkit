@@ -19,7 +19,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 # Fixed launch configuration, picked by autotuning on an RTX 4080 Super (D=1152, N=100k): 64x64 tiles, 2 warps,
 # 4x unrolled D loop. Not using @triton.autotune on purpose: the CLI is a fresh process every run and autotuning
 # ~40 configs on a 100k-row problem costs minutes, far more than the whole search.
@@ -62,7 +61,19 @@ def l2_distance_T(qT: torch.Tensor, xT: torch.Tensor) -> torch.Tensor:
         return out
     grid = (triton.cdiv(M, _BM), triton.cdiv(N, _BN))
     _l2_direct_kernel[grid](
-        qT, xT, out, M, N, D, qT.stride(0), xT.stride(0), out.stride(0),
-        BM=_BM, BN=_BN, UNROLL=_UNROLL, num_warps=_NUM_WARPS, num_stages=_NUM_STAGES,
+        qT,
+        xT,
+        out,
+        M,
+        N,
+        D,
+        qT.stride(0),
+        xT.stride(0),
+        out.stride(0),
+        BM=_BM,
+        BN=_BN,
+        UNROLL=_UNROLL,
+        num_warps=_NUM_WARPS,
+        num_stages=_NUM_STAGES,
     )
     return out

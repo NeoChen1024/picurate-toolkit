@@ -67,8 +67,9 @@ how they should feed each other.
 
 ## Local toolchain and verification
 
-- Use the repository-root `.venv`, managed by uv: `uv pip install --python .venv/bin/python -e '.[gui]'`. Never
-  fall back to the system Python or create other environments.
+- Use the repository-root `.venv`, managed by uv: `uv pip install --python .venv/bin/python -e '.[gui,dev]'`.
+  Never fall back to the system Python or create other environments.
+- Format with `.venv/bin/isort src tests && .venv/bin/black src tests`; the whole tree is kept formatted.
 - Do not add or expand automated tests unless the user asks for them. The suite covers only contracts whose breakage
   would go unnoticed: which files get moved, database binding, resume after interruption, numerical exactness, caption
   layouts that must match other tools, and project files and export transactions. Remove tests that only restate

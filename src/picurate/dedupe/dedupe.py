@@ -35,7 +35,9 @@ class _UnionFind:
             self.parent[rb] = ra
 
 
-def _log_matches(prefix: str, query_paths: Sequence[str], match_paths: Sequence[str], ii: np.ndarray, jj: np.ndarray, dd: np.ndarray) -> None:
+def _log_matches(
+    prefix: str, query_paths: Sequence[str], match_paths: Sequence[str], ii: np.ndarray, jj: np.ndarray, dd: np.ndarray
+) -> None:
     order = np.lexsort((jj, ii))
     ii, jj, dd = ii[order], jj[order], dd[order]
     for i in np.unique(ii):
@@ -65,7 +67,9 @@ class DuplicateGroup:
         return max(d for _, _, d in self.edges)
 
 
-def find_duplicate_edges(paths: Sequence[str], index: DistanceIndex, threshold: float, progress: Progress = None) -> list[tuple[int, int, float]]:
+def find_duplicate_edges(
+    paths: Sequence[str], index: DistanceIndex, threshold: float, progress: Progress = None
+) -> list[tuple[int, int, float]]:
     """Every pair ``(i, j, d)`` with ``i < j`` and ``d <= threshold``, searching the upper triangle in blocks."""
     edges: list[tuple[int, int, float]] = []
     for start, end in index.iter_blocks():
@@ -92,7 +96,9 @@ def group_edges(n: int, edges: Sequence[tuple[int, int, float]]) -> list[Duplica
     return sorted(by_root.values(), key=lambda g: g.members[0])
 
 
-def find_duplicate_groups(paths: Sequence[str], index: DistanceIndex, threshold: float, progress: Progress = None) -> list[list[int]]:
+def find_duplicate_groups(
+    paths: Sequence[str], index: DistanceIndex, threshold: float, progress: Progress = None
+) -> list[list[int]]:
     """Connected components of the "distance <= threshold" relation, as lists of row indices.
 
     The relation is not transitive: A may match B and B match C while A and C fall just outside the threshold, so all
@@ -102,7 +108,12 @@ def find_duplicate_groups(paths: Sequence[str], index: DistanceIndex, threshold:
 
 
 def find_cross_pairs(
-    query_paths: Sequence[str], queries: DistanceIndex, base_paths: Sequence[str], base: DistanceIndex, threshold: float, progress: Progress = None
+    query_paths: Sequence[str],
+    queries: DistanceIndex,
+    base_paths: Sequence[str],
+    base: DistanceIndex,
+    threshold: float,
+    progress: Progress = None,
 ) -> list[tuple[int, int, float]]:
     """Every ``(query_row, base_row, distance)`` with ``distance <= threshold``."""
     pairs: list[tuple[int, int, float]] = []
@@ -117,7 +128,12 @@ def find_cross_pairs(
 
 
 def find_cross_duplicates(
-    query_paths: Sequence[str], queries: DistanceIndex, base_paths: Sequence[str], base: DistanceIndex, threshold: float, progress: Progress = None
+    query_paths: Sequence[str],
+    queries: DistanceIndex,
+    base_paths: Sequence[str],
+    base: DistanceIndex,
+    threshold: float,
+    progress: Progress = None,
 ) -> dict[int, int]:
     """For every query row that has a match in ``base``: ``{query_row: number_of_matches}``."""
     hits: dict[int, int] = {}

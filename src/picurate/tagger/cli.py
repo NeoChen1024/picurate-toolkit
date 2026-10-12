@@ -17,7 +17,7 @@ import click
 import torch
 import tqdm
 
-from ..common.images import ImageRecord, is_hidden, is_image_path, walk_directory_relative
+from ..common.images import ImageRecord, is_image_path, list_directory_relative
 from ..common.log import setup_logging
 from ..common.pipeline import run_pipeline
 from .captions import (
@@ -25,8 +25,8 @@ from .captions import (
     RESOLUTION_MODES,
     STYLES,
     Caption,
-    CaptionOptions,
     Captioner,
+    CaptionOptions,
     Vocabulary,
     normalize,
     parse_replacements,
@@ -46,10 +46,7 @@ _DEFAULT_ALWAYS_FIRST = {"anima": "", "sdxl": "1girl,1boy"}
 
 
 def _list_images(image_dir: str, recursive: bool, include_hidden: bool) -> list[str]:
-    if recursive:
-        rels = walk_directory_relative(image_dir, include_hidden=include_hidden)
-    else:
-        rels = (e.name for e in os.scandir(image_dir) if e.is_file() and (include_hidden or not is_hidden(e.name)))
+    rels = list_directory_relative(image_dir, recursive=recursive, include_hidden=include_hidden)
     return sorted(r for r in rels if is_image_path(r))
 
 
@@ -107,7 +104,13 @@ class CaptionWriter:
             with open(self.output_path, "w", encoding="utf-8") as f:
                 if self.output_path.endswith(".jsonl"):
                     for path, entry in self.results.items():
-                        f.write(json.dumps({"image_path": path, "caption": entry["tags"], "image_size": entry["image_size"]}, ensure_ascii=False) + "\n")
+                        f.write(
+                            json.dumps(
+                                {"image_path": path, "caption": entry["tags"], "image_size": entry["image_size"]},
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
                 else:
                     json.dump(self.results, f, ensure_ascii=False, indent=4)
             logger.info("Captions saved to %s", self.output_path)
@@ -140,7 +143,9 @@ def _threshold_help(category: str, default: str) -> str:
 
 image_dir_arg = click.argument("image_dir", type=click.Path(exists=True, file_okay=False))
 recursive_option = click.option("--recursive", "-r", is_flag=True, help="Also include images in subdirectories.")
-hidden_option = click.option("--include-hidden", is_flag=True, help="Also include hidden (dot) files and directories, which are skipped by default.")
+hidden_option = click.option(
+    "--include-hidden", is_flag=True, help="Also include hidden (dot) files and directories, which are skipped by default."
+)
 
 caption_options = _options(
     click.option("--style", type=click.Choice(STYLES), default="anima", show_default=True,
@@ -228,15 +233,23 @@ def _caption_setup(image_dir: str, kw: dict) -> tuple[CaptionOptions, CaptionWri
     except ValueError as e:
         raise click.UsageError(str(e)) from e
     writer = CaptionWriter(
-        image_dir, existing=kw.pop("existing"), extension=kw.pop("caption_extension"), separator=separator,
-        output_path=output_path, debug=kw.pop("debug"),
+        image_dir,
+        existing=kw.pop("existing"),
+        extension=kw.pop("caption_extension"),
+        separator=separator,
+        output_path=output_path,
+        debug=kw.pop("debug"),
     )
     return options, writer, kw.pop("frequency")
 
 
 def _tagger(kw: dict) -> Tagger:
     return Tagger(
-        kw.pop("model"), revision=kw.pop("revision"), device=kw.pop("device"), dtype=kw.pop("dtype"), compile=kw.pop("compile_"),
+        kw.pop("model"),
+        revision=kw.pop("revision"),
+        device=kw.pop("device"),
+        dtype=kw.pop("dtype"),
+        compile=kw.pop("compile_"),
         batch_size=kw["batch_size"],
     )
 
@@ -297,16 +310,43 @@ def run(image_dir: str, recursive: bool, include_hidden: bool, verbose: bool, **
 
 @cli.command()
 @image_dir_arg
-@click.option("--db", "-d", type=click.Path(dir_okay=False), required=True, help="SQLite score database for IMAGE_DIR (created if missing).")
+@click.option(
+    "--db", "-d", type=click.Path(dir_okay=False), required=True, help="SQLite score database for IMAGE_DIR (created if missing)."
+)
 @recursive_option
 @hidden_option
-@click.option("--force-update", "-f", is_flag=True, help="Re-tag every image, ignoring modification times. Also rebinds the database to the requested model/dtype/floor.")
-@click.option("--clean-orphans/--no-clean-orphans", default=True, show_default=True, help="Remove database entries whose image no longer exists.")
-@click.option("--score-floor", type=click.FloatRange(0, 1), default=default_score_floor, show_default=True,
-              help="Store every tag scoring at least this (ratings always). Exports cannot use a lower threshold; part of the database binding.")
+@click.option(
+    "--force-update",
+    "-f",
+    is_flag=True,
+    help="Re-tag every image, ignoring modification times. Also rebinds the database to the requested model/dtype/floor.",
+)
+@click.option(
+    "--clean-orphans/--no-clean-orphans",
+    default=True,
+    show_default=True,
+    help="Remove database entries whose image no longer exists.",
+)
+@click.option(
+    "--score-floor",
+    type=click.FloatRange(0, 1),
+    default=default_score_floor,
+    show_default=True,
+    help="Store every tag scoring at least this (ratings always). Exports cannot use a lower threshold; part of the database binding.",
+)
 @model_options
 @verbose_option
-def update(image_dir: str, db: str, recursive: bool, include_hidden: bool, force_update: bool, clean_orphans: bool, score_floor: float, verbose: bool, **kw) -> None:
+def update(
+    image_dir: str,
+    db: str,
+    recursive: bool,
+    include_hidden: bool,
+    force_update: bool,
+    clean_orphans: bool,
+    score_floor: float,
+    verbose: bool,
+    **kw,
+) -> None:
     """Tag new and changed images of IMAGE_DIR into a score database.
 
     Every batch is committed as it finishes, and images whose modification time matches their row are skipped, so an
@@ -346,7 +386,9 @@ def update(image_dir: str, db: str, recursive: bool, include_hidden: bool, force
             try:
                 run_pipeline(image_dir, candidates, tagger.get_preprocessor(), tagger.submit, finish, progress=bar.update, **kw)
             except KeyboardInterrupt:
-                raise _interrupted(f"{stored} images stored this run, {len(store)} in the database; run the same command again to resume.") from None
+                raise _interrupted(
+                    f"{stored} images stored this run, {len(store)} in the database; run the same command again to resume."
+                ) from None
             finally:
                 tagger.close()
         logger.info("Stored %d images; %d in the database", stored, len(store))
@@ -395,7 +437,8 @@ def export(image_dir: str, db: str, verbose: bool, **kw) -> None:
                 written += 1
     writer.close(frequency)
     logger.info(
-        "Wrote %d captions%s%s%s", written,
+        "Wrote %d captions%s%s%s",
+        written,
         f", skipped {skipped} with existing captions" if skipped else "",
         f", {stale} changed since tagging (run update)" if stale else "",
         f", {missing} no longer on disk" if missing else "",

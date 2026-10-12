@@ -1,5 +1,6 @@
-"""Dataset editor projects: import identity, caption ownership, log recovery, relinking, export transactions and
-rendering. These guard the user's captions and exported datasets; nothing here needs Qt."""
+"""Dataset projects and the editor's rendering: item identity, import, caption ownership, decisions and their
+history, relinking, export transactions and rendering. These guard the user's captions and exported datasets; nothing here needs Qt.
+"""
 
 import shutil
 import tempfile
@@ -9,7 +10,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 from picurate.dataset_editor.render import export_one, export_project, load_image, render, save_repair
-from picurate.project.project import Project, validate_source
+from picurate.project.project import STANDALONE_SOURCE, Project, item_id, validate_source
 
 
 class ProjectTests(unittest.TestCase):
@@ -28,6 +29,7 @@ class ProjectTests(unittest.TestCase):
         self.state = self.project.state(self.item_id)
 
     def tearDown(self):
+        self.project.close()
         self.temp.cleanup()
 
     def test_export_pixels(self):
@@ -44,16 +46,44 @@ class ProjectTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             render(self.im, self.state)
 
-    def test_log_recovery_and_reopen(self):
-        self.project.save(self.state)
-        with self.project.log.open("ab") as stream:
-            stream.write(b"{broken")
-        project = Project(self.base / "project")
-        self.state["caption"] = "new"
-        project.save(self.state)
-        project = Project(self.base / "project")
-        self.assertEqual(project.state(self.item_id)["caption"], "new")
-        self.assertTrue(list(project.directory.glob("*.recovery")))
+    def test_item_id_derivation(self):
+        """Every database is keyed by this; a change would silently orphan their rows."""
+        self.assertEqual(
+            item_id(STANDALONE_SOURCE, "a/b.png").hex(), "7df4921e2c1d3afbf9a3bb76701be3bbfe7afe7e081d5390b163f2b87f7492dc"
+        )
+        self.assertEqual(
+            item_id(bytes(range(32)), "dir/\udcff.png").hex(), "2dcc9f6f5c8b4f60ad87279e7f26fe0d6d1aa5e23b423eddc9a2fa7196ef3247"
+        )
+
+    def test_decisions_and_history(self):
+        db = self.project.db
+        op = self.project.begin_op("edit")
+        self.assertEqual(self.project.save(self.state, op), [])  # nothing differs from the defaults
+        self.state["caption"] = "first"
+        self.state["review_status"] = "approved"
+        self.assertEqual(self.project.save(self.state, op), ["caption", "review_status"])
+        self.state["caption"] = "second"
+        self.project.save(self.state, op)
+        self.assertEqual(db.execute("SELECT value FROM history WHERE field = 'caption'").fetchall(), [('"second"',)])
+        later = self.project.begin_op("edit")
+        self.state["caption"] = ""  # back to the derived (imported) caption: the row goes, the history keeps the step
+        self.project.save(self.state, later)
+        self.assertIsNone(db.execute("SELECT 1 FROM state WHERE field = 'caption'").fetchone())
+        self.assertEqual(
+            db.execute("SELECT op, value FROM history WHERE field = 'caption' ORDER BY seq").fetchall(),
+            [(op, '"second"'), (later, None)],
+        )
+        reopened = Project(self.project.directory)
+        self.assertEqual(reopened.state(self.item_id)["review_status"], "approved")
+        self.assertEqual(reopened.state(self.item_id)["caption"], "")
+
+    def test_one_editor_at_a_time(self):
+        self.project.lock()
+        other = Project(self.project.directory)
+        with self.assertRaises(ValueError):
+            other.lock()
+        self.project.close()
+        other.lock()
 
     def test_source_change(self):
         self.path.write_bytes(b"changed")
@@ -72,7 +102,7 @@ class ProjectTests(unittest.TestCase):
         state = self.project.state(second)
         self.assertEqual(state["caption"], "original caption")
         state["caption"] = "edited caption"
-        self.project.save(state)
+        self.project.save(state, self.project.begin_op("edit"))
         (other / "image.txt").write_text("externally changed", encoding="utf-8")
         self.assertEqual(self.project.import_images([other]), (0, 1))
         reopened = Project(self.project.directory)
@@ -80,6 +110,8 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual((other / "image.txt").read_text(), "externally changed")
         self.im.save(other / "new.png")
         self.assertEqual(len(Project(self.project.directory).items), 2)  # No implicit scan.
+        self.assertEqual(self.project.import_images([other], captions=False), (1, 1))
+        self.assertEqual(self.project.state(list(self.project.items)[2])["caption"], "")
 
     def test_relink_and_missing_source(self):
         source_id = self.project.items[self.item_id]["source_id"]
@@ -141,7 +173,7 @@ class ProjectTests(unittest.TestCase):
         patch = Image.new("RGB", (20, 20), (10, 20, 30))
         op = save_repair(self.project.directory, self.item_id, self.im, [20, 20, 20, 20], mask, patch, {"test": True})
         self.state["fills"] = [op]
-        self.project.save(self.state)
+        self.project.save(self.state, self.project.begin_op("edit"))
         reopened = Project(self.project.directory)
         result = render(self.im, reopened.state(self.item_id), project_dir=self.project.directory)
         self.assertEqual(result.getpixel((25, 25)), (10, 20, 30))

@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 import tempfile
 import uuid
 from pathlib import Path
 
+from blake3 import blake3
 from PIL import Image, ImageDraw, ImageOps, ImageStat
 
-from ..project.project import EXTENSIONS, atomic_json, digest, safe_relative, validate_source
+from ..project.project import EXTENSIONS, atomic_json, file_digest, safe_relative, validate_source
 
 
 def load_image(path) -> Image.Image:
@@ -22,7 +22,7 @@ def load_image(path) -> Image.Image:
 
 def image_digest(image: Image.Image) -> str:
     rgb = image.convert("RGB")
-    return hashlib.sha256(str(rgb.size).encode() + rgb.tobytes()).hexdigest()
+    return blake3(str(rgb.size).encode() + rgb.tobytes()).hexdigest()
 
 
 def artifact_path(directory, name) -> Path:
@@ -33,11 +33,11 @@ def artifact_path(directory, name) -> Path:
     return path
 
 
-def save_repair(directory, item_id: str, image: Image.Image, rect, mask: Image.Image, patch: Image.Image, metadata: dict) -> dict:
+def save_repair(directory, item_id: bytes, image: Image.Image, rect, mask: Image.Image, patch: Image.Image, metadata: dict) -> dict:
     """Store an accepted LaMa repair under the project and return its fill entry."""
     identifier = uuid.uuid4().hex
-    mask_name = f"masks/{item_id}-{identifier}.png"
-    patch_name = f"patches/{item_id}-{identifier}.png"
+    mask_name = f"masks/{item_id.hex()}-{identifier}.png"
+    patch_name = f"patches/{item_id.hex()}-{identifier}.png"
     for name, artifact in ((mask_name, mask.convert("L")), (patch_name, patch.convert("RGB"))):
         artifact.save(artifact_path(directory, name), format="PNG")
     return {
@@ -46,8 +46,8 @@ def save_repair(directory, item_id: str, image: Image.Image, rect, mask: Image.I
         "input_hash": image_digest(image),
         "mask": mask_name,
         "patch": patch_name,
-        "mask_sha256": digest(artifact_path(directory, mask_name)),
-        "patch_sha256": digest(artifact_path(directory, patch_name)),
+        "mask_blake3": file_digest(artifact_path(directory, mask_name)).hex(),
+        "patch_blake3": file_digest(artifact_path(directory, patch_name)).hex(),
         "metadata": metadata,
     }
 
@@ -71,7 +71,7 @@ def render(im: Image.Image, state: dict, crop: bool = True, project_dir=None) ->
                 )
             mask_path = artifact_path(project_dir, fill["mask"])
             patch_path = artifact_path(project_dir, fill["patch"])
-            if digest(mask_path) != fill["mask_sha256"] or digest(patch_path) != fill["patch_sha256"]:
+            if file_digest(mask_path).hex() != fill["mask_blake3"] or file_digest(patch_path).hex() != fill["patch_blake3"]:
                 raise ValueError("A saved repair artifact changed")
             with Image.open(mask_path) as file:
                 mask = file.convert("L")

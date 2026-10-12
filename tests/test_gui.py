@@ -34,7 +34,12 @@ class GuiTests(unittest.TestCase):
         self.img = os.path.join(self.tmp.name, "img")
         os.makedirs(os.path.join(self.img, "sub"))
         recs = {}
-        for path, colour, size in [("a.png", (255, 0, 0), (40, 30)), ("sub/b.png", (250, 0, 0), (20, 15)), ("c.png", (0, 255, 0), (40, 40)), ("d.png", (0, 250, 0), (40, 40))]:
+        for path, colour, size in [
+            ("a.png", (255, 0, 0), (40, 30)),
+            ("sub/b.png", (250, 0, 0), (20, 15)),
+            ("c.png", (0, 255, 0), (40, 40)),
+            ("d.png", (0, 250, 0), (40, 40)),
+        ]:
             full = os.path.join(self.img, path)
             PIL.Image.new("RGB", size, colour).save(full)
             st = os.stat(full)
@@ -43,7 +48,10 @@ class GuiTests(unittest.TestCase):
         with ReviewDB(self.review_path) as db:
             db.begin_session(image_dir=self.img, model_id="m", review_threshold=1.0, auto_threshold=0.1, policy="largest")
             db.upsert_groups(
-                [([recs["a.png"], recs["sub/b.png"]], [("a.png", "sub/b.png", 0.3)]), ([recs["c.png"], recs["d.png"]], [("c.png", "d.png", 0.05)])],
+                [
+                    ([recs["a.png"], recs["sub/b.png"]], [("a.png", "sub/b.png", 0.3)]),
+                    ([recs["c.png"], recs["d.png"]], [("c.png", "d.png", 0.05)]),
+                ],
                 builtin_policies()["largest"],
                 0.1,
             )

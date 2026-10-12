@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 A = TypeVar("A")  # a preprocessed image, whatever the model wants
 P = TypeVar("P")  # a submitted batch
 
+
 def _load_image(
     preprocessor: Callable[[PIL.Image.Image], A], image_dir: str, relative_path: str
 ) -> tuple[str, tuple[ImageRecord, A] | Exception]:
@@ -169,5 +170,3 @@ def run_pipeline(
     flush()
     finish_in_flight()
     return done_count
-
-

@@ -154,7 +154,9 @@ class EmbeddingDB:
     def load_all(self) -> tuple[list[ImageRecord], np.ndarray]:
         """Every row as ``(records, (N, D) float16 array)``, ordered by path, with one memory copy for the matrix."""
         dim = self.dim
-        rows = self.conn.execute("SELECT path, mtime, size, width, height, format, embedding FROM embeddings ORDER BY path").fetchall()
+        rows = self.conn.execute(
+            "SELECT path, mtime, size, width, height, format, embedding FROM embeddings ORDER BY path"
+        ).fetchall()
         if not rows:
             return [], np.empty((0, dim or 0), dtype=EMBEDDING_DTYPE)
         if dim is None:

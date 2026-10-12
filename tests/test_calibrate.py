@@ -5,8 +5,8 @@ import unittest
 import numpy as np
 import PIL.Image
 
-from picurate.dedupe import calibrate as cal
 from picurate.common.images import ImageRecord
+from picurate.dedupe import calibrate as cal
 from picurate.dedupe.similarity import DistanceIndex
 
 
@@ -56,9 +56,14 @@ class DistanceTests(unittest.TestCase):
             names.append("broken.png")
             records = _records(*names)
             enc = StubEncoder()
-            emb = np.stack([enc.encode_images([enc.preprocess(PIL.Image.open(os.path.join(tmp, n)).convert("RGB"))])[0] for n in names[:3]] + [np.zeros(3, np.float32)])
+            emb = np.stack(
+                [enc.encode_images([enc.preprocess(PIL.Image.open(os.path.join(tmp, n)).convert("RGB"))])[0] for n in names[:3]]
+                + [np.zeros(3, np.float32)]
+            )
             emb = emb.astype(np.float16)
-            result = cal.calibrate(enc, tmp, records, emb, DistanceIndex(emb, "cpu"), samples=4, seed=0, variants=("jpeg90", "half"), batch_size=3)
+            result = cal.calibrate(
+                enc, tmp, records, emb, DistanceIndex(emb, "cpu"), samples=4, seed=0, variants=("jpeg90", "half"), batch_size=3
+            )
             self.assertEqual(result.skipped, ["broken.png"])
             self.assertEqual(set(result.series), {"nearest-other", "jpeg90", "half"})
             self.assertEqual(len(result.series["jpeg90"]), 3)
@@ -68,11 +73,13 @@ class DistanceTests(unittest.TestCase):
 
 class ReportTests(unittest.TestCase):
     def test_histogram_lines_and_suggestion(self):
-        result = cal.Calibration(series={
-            "nearest-other": np.array([5.6, 7.0, 9.0], dtype=np.float32),
-            "jpeg90": np.array([0.3, 0.45, 0.52], dtype=np.float32),
-            "half": np.array([0.0, 0.2, 0.4], dtype=np.float32),
-        })
+        result = cal.Calibration(
+            series={
+                "nearest-other": np.array([5.6, 7.0, 9.0], dtype=np.float32),
+                "jpeg90": np.array([0.3, 0.45, 0.52], dtype=np.float32),
+                "half": np.array([0.0, 0.2, 0.4], dtype=np.float32),
+            }
+        )
         lines = cal.report(result, thresholds=(0.1, 1.0))
         text = "\n".join(lines)
         self.assertIn("jpeg90 (3)", text)
@@ -83,5 +90,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Suggested threshold for jpeg90, half: 0.52", text)
 
     def test_overlap_reports_no_clean_threshold(self):
-        result = cal.Calibration(series={"nearest-other": np.array([0.3], dtype=np.float32), "half": np.array([0.5], dtype=np.float32)})
+        result = cal.Calibration(
+            series={"nearest-other": np.array([0.3], dtype=np.float32), "half": np.array([0.5], dtype=np.float32)}
+        )
         self.assertIn("No clean threshold", "\n".join(cal.report(result)))
