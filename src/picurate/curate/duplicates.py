@@ -412,7 +412,9 @@ class DuplicatesTab(QWidget):
             state = self.project.state(m.item)
             human = (state["exclusion"] or {}).get("decision")
             by = state["excluded_by"]
-            if human == "exclude":
+            if state["trashed"]:
+                marks[m.item] = "\n🗑 in the project's trash"
+            elif human == "exclude":
                 marks[m.item] = f"\n✕ excluded by hand{': ' + by['reason'] if by and by.get('reason') else ''}"
             elif human == "keep":
                 marks[m.item] = "\n✓ kept by hand"
@@ -865,7 +867,7 @@ HELP_HTML = """
 The member panel shows each pair's result (≈ or ≠ and the largest local difference). The Show box can list only
 those groups, or only the ones with pixel differences.</p>
 <p>Nothing is moved from here. The images a decided group does not keep count as excluded: the editor marks them
-and does not export them. A person's decision in the
+and does not export them, and <code>picurate-project gc --trash-excluded</code> moves them out of the library. A person's decision in the
 editor (force keep, force exclude) overrides a group's; the member panel shows it.</p>
 <p>A group marked <b>∅</b> keeps nothing: every keep is unticked. It cannot be decided, since that is as often a slip
 as an intent. To exclude every member on purpose, discard it with <b>R</b>; it is then marked <b>✕</b>.

@@ -9,7 +9,7 @@ import click
 import tqdm
 
 from ..common.log import setup_logging
-from .project import Project
+from .project import MOVE_TYPES, Project
 
 AGE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
 
@@ -150,6 +150,8 @@ def sync(project_dir: str, verbose: bool) -> None:
         result = project.sync(progress)
     for root in result["unavailable"]:
         click.echo(f"Source folder not found, skipped (relink it in the editor): {root}", err=True)
+    for path in result["trash_gone"]:
+        click.echo(f"Gone from the trash; gc removes it from the project: {path}", err=True)
     click.echo(
         f"Added {result['added']}, changed {result['changed']}, newly missing {result['missing']}, back {result['back']}; "
         f"{len(project.items)} images, {sum(row['missing'] for row in project.items.values())} missing.",
@@ -178,35 +180,94 @@ def rollback(project_dir: str, op: int) -> None:
     rolled back too. Needs the project to be closed in the editor."""
     project = _open(project_dir, lock=True)
     try:
-        new, skipped, restored = project.rollback(op)
+        new, skipped, restored, moved = project.rollback(op)
     except ValueError as e:
         raise click.ClickException(str(e)) from e
     for item, field in skipped:
-        click.echo(f"Changed since, left alone: {project.items[item]['path']} {field}", err=True)
-    click.echo(f"Restored {restored} fields as operation {new}; {len(skipped)} left alone.", err=True)
+        if field == "trashed":
+            click.echo(f"Cannot move back (gone from the trash, or its place is taken): {project.trash_path(item)}", err=True)
+        else:
+            click.echo(f"Changed since, left alone: {project.items[item]['path']} {field}", err=True)
+    click.echo(
+        f"Restored {restored} fields as operation {new}; {len(skipped)} left alone"
+        + (f"; moved {moved} images out of or into the trash." if moved else "."),
+        err=True,
+    )
 
 
 @main.command()
 @click.argument("project_dir", type=click.Path(exists=True, file_okay=False))
+@click.option(
+    "--trash-excluded",
+    is_flag=True,
+    help="Move excluded images (with their imported caption files) into the project's trash/, as one operation that "
+    "rollback moves back.",
+)
+@click.option(
+    "--move-type",
+    type=click.Choice(MOVE_TYPES),
+    default="all",
+    show_default=True,
+    help="With --trash-excluded: images excluded as duplicates (dedupe), by a person (human), or both.",
+)
 @click.option("--keep-revisions", type=click.IntRange(0), default=None, help="Keep this many newest history entries per field.")
 @click.option("--older-than", default=None, help="Only prune entries of operations older than this (e.g. 12h, 30d, 2w).")
-@click.option("--dry-run", "-n", is_flag=True, help="Report what would be pruned without changing anything.")
-def gc(project_dir: str, keep_revisions: int | None, older_than: str | None, dry_run: bool) -> None:
-    """Prune old history in the project at PROJECT_DIR, and LaMa masks and patches nothing refers to afterwards.
+@click.option("--dry-run", "-n", is_flag=True, help="Report what would be moved or pruned without changing anything.")
+@click.option("--verbose", "-v", is_flag=True, help="Debug logging.")
+def gc(
+    project_dir: str,
+    trash_excluded: bool,
+    move_type: str,
+    keep_revisions: int | None,
+    older_than: str | None,
+    dry_run: bool,
+    verbose: bool,
+) -> None:
+    """Move excluded images into the trash, and prune old history in the project at PROJECT_DIR, with the LaMa masks
+    and patches nothing refers to afterwards.
 
-    With both options, an entry goes only when it is beyond the newest --keep-revisions of its field and older than
-    --older-than. Pruned operations can no longer be rolled back; current decisions are never touched. Needs the
-    project to be closed in the editor.
+    \b
+    --trash-excluded moves to PROJECT_DIR/trash/<source folder>-<id>/<path>; nothing is deleted. Images later
+    deleted from the trash by hand no longer exist: every gc run removes them from the project, with their decisions
+    and history.
+
+    With both --keep-revisions and --older-than, an entry goes only when it is beyond the newest --keep-revisions of
+    its field and older than --older-than. Pruned operations can no longer be rolled back; current decisions are
+    never touched. Needs the project to be closed in the editor.
     """
-    if keep_revisions is None and older_than is None:
-        raise click.UsageError("Give --keep-revisions, --older-than or both.")
+    setup_logging(verbose)
+    if not trash_excluded and keep_revisions is None and older_than is None:
+        raise click.UsageError("Give --trash-excluded, --keep-revisions, --older-than or a combination.")
     project = _open(project_dir, lock=True)
+    if trash_excluded:
+        if dry_run:
+            for state in project.trash_candidates(move_type):
+                item = state["item_id"]
+                click.echo(f"Would move {project.original_path(item)} -> {project.trash_path(item)}", err=True)
+        else:
+            with tqdm.tqdm(unit="img", desc="Moving to trash", dynamic_ncols=True) as bar:
+
+                def progress(done: int, total: int) -> None:
+                    bar.total = total
+                    bar.update(done - bar.n)
+
+                op = project.trash_excluded(move_type, progress)
+            if op:
+                moved = project.db.execute("SELECT COUNT(*) FROM history WHERE op = ?", (op,)).fetchone()[0]
+                click.echo(f"Moved {moved} images to {project.directory / 'trash'} as operation {op}.", err=True)
+            else:
+                click.echo("No excluded images to move.", err=True)
     result = project.gc(keep_revisions=keep_revisions, older_than=_age(older_than), dry_run=dry_run)
+    for path in result["removed"]:
+        click.echo(
+            f"{'Would remove' if dry_run else 'Removed'} from the project (gone from the trash): {path}",
+            err=True,
+        )
     for path in result["artifacts"]:
         click.echo(f"{'Would remove' if dry_run else 'Removed'} {path}", err=True)
     click.echo(
         f"{'Would prune' if dry_run else 'Pruned'} {result['entries']} history entries, {len(result['ops'])} operations and "
-        f"{len(result['artifacts'])} artifacts.",
+        f"{len(result['artifacts'])} artifacts; {len(result['removed'])} items gone from the trash.",
         err=True,
     )
 

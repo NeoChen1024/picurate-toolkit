@@ -47,8 +47,9 @@ The first run encodes every image into the project's `embeddings.sqlite`; later 
 
 Things I'd want to know before trusting it with my own pictures:
 
-* Nothing is moved or deleted. The extra copies of a duplicate group are only marked excluded in the project, so
-  they are left out of exports; force keep in the editor overrides that.
+* Nothing is ever deleted. The extra copies of a duplicate group are only marked excluded in the project (force keep
+  in the editor overrides that); `picurate-project gc --trash-excluded` moves them into the project's trash when
+  you are sure, and `rollback` moves them back.
 * The default threshold (0.1) is deliberately conservative: it catches re-encodes, not lossy copies or downscales.
   `picurate-dedupe calibrate` shows where those land on your collection if you want to go looser.
 * Every match is confirmed by a pixel check: a group is only decided automatically when its pixels differ by

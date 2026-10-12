@@ -10,7 +10,7 @@ picurate-curate library                                 # decide
 ```
 
 Nothing is moved from here. The images a decided group does not keep count as excluded: the editor marks them and
-does not export them. A person's decision in the [editor](dataset-editor.md) (force keep or force exclude) overrides
+does not export them, and [`picurate-project gc --trash-excluded`](project.md#trash) moves them out of the library. A person's decision in the [editor](dataset-editor.md) (force keep or force exclude) overrides
 a group's, and the member panel shows it, as it shows a member excluded by another group. The window holds the
 project's review database, so a `dedupe` run waits until it is closed; the editor can stay open alongside.
 

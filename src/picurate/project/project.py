@@ -11,12 +11,17 @@ encoded for deduplication, export and relink check them against the content hash
 Other stages write only their own files in the project directory (``embeddings.sqlite``, ``review.sqlite``); the
 project reads them and combines them with the human decisions (:meth:`Project.state`).
 
+``gc --trash-excluded`` moves excluded images into ``trash/`` in the project, as an operation whose ``trashed``
+field changes roll back like any other (the rollback moves the files back). The field is written before a file is
+moved; :meth:`Project.reconcile_trash` finishes moves an interruption left halfway.
+
 An item is identified by ``(source_id, relative path)`` (see :mod:`picurate.common.images`); a project's
 ``source_id`` is 256 random bits created when a source folder is first imported.
 """
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import logging
@@ -45,6 +50,9 @@ DEFAULTS = {"caption": None, "crop": None, "fills": [], "image_size": None, "rev
 COMMIT_EVERY = 1000
 ITEM_COLUMNS = ("id", "source_id", "path", "size", "mtime_ns", "caption", "caption_path", "output_stem", "missing")
 ARTIFACT_DIRS = ("masks", "patches")
+TRASH = "trash"
+TRASHED = "trashed"  # history field of gc --trash-excluded: "true" while the image is in the trash, else no row
+MOVE_TYPES = ("dedupe", "human", "all")
 EMBEDDINGS = "embeddings.sqlite"  # written by picurate-dedupe; only read here, for the content hashes
 REVIEW = "review.sqlite"  # written by picurate-dedupe and the curation GUI; only read here, for the exclusions
 LOCKS = {
@@ -157,6 +165,7 @@ class Project:
         self.items = {}
         for row in self.db.execute(f"SELECT {', '.join(ITEM_COLUMNS)} FROM items ORDER BY rowid"):
             self.items[row[0]] = self._item(row)
+        self.trashed = {row[0] for row in self.db.execute("SELECT item FROM state WHERE field = ?", (TRASHED,))}
         for name in ("masks", "patches", "output"):
             (self.directory / name).mkdir(parents=True, exist_ok=True)
         # Recover an interrupted directory swap without discarding the prior export.
@@ -205,8 +214,30 @@ class Project:
         atomic_json(self.directory / "project.json", self.settings)
 
     def source_path(self, item: bytes) -> Path:
+        """Where the image is now: in its source folder, or in the project's trash."""
+        return self.trash_path(item) if item in self.trashed else self.original_path(item)
+
+    def original_path(self, item: bytes) -> Path:
         row = self.items[item]
         return self.sources[row["source_id"]] / safe_relative(row["path"])
+
+    def trash_path(self, item: bytes) -> Path:
+        """``trash/<source folder name>-<first 8 hex digits of its ID>/<path>``."""
+        row = self.items[item]
+        source = row["source_id"]
+        return self.directory / TRASH / f"{self.sources[source].name}-{source.hex()[:8]}" / safe_relative(row["path"])
+
+    def _caption_paths(self, item: bytes) -> tuple[Path, Path] | None:
+        """The imported caption file in the source folder and its place in the trash, which it follows the image to."""
+        row = self.items[item]
+        if row["caption_path"] is None:
+            return None
+        relative = safe_relative(row["caption_path"])
+        source = row["source_id"]
+        return (
+            self.sources[source] / relative,
+            self.directory / TRASH / f"{self.sources[source].name}-{source.hex()[:8]}" / relative,
+        )
 
     def import_images(
         self,
@@ -315,14 +346,15 @@ class Project:
         """Bring the project up to date with its source folders: import new images of directory sources (as they
         were imported), record the size and mtime of changed images, and mark images that are gone as missing (or no
         longer missing). A source folder that is not there at all (unmounted, moved) is skipped and listed; relink it.
-        Imported captions and every decision are kept. Returns counts of ``added``, ``changed``, ``missing`` and
-        ``back``, and the unavailable source folders."""
+        Imported captions and every decision are kept. Images in the trash are not looked for in their source folders.
+        Returns counts of ``added``, ``changed``, ``missing`` and ``back``, the unavailable source folders, and the
+        trash files of trashed images that are gone (``trash_gone``; gc removes those items)."""
         counts = {"added": 0, "changed": 0, "missing": 0, "back": 0}
         unavailable = {key for key, root in self.sources.items() if not root.is_dir()}
         updates = []
         for done, (key, row) in enumerate(list(self.items.items())):
             progress(done, len(self.items))
-            if row["source_id"] in unavailable:
+            if row["source_id"] in unavailable or key in self.trashed:
                 continue
             try:
                 stat = (self.sources[row["source_id"]] / row["path"]).stat()
@@ -355,7 +387,11 @@ class Project:
                 )
                 counts["added"] += added
         progress(len(self.items), len(self.items))
-        return {**counts, "unavailable": [self.sources[key] for key in unavailable]}
+        return {
+            **counts,
+            "unavailable": [self.sources[key] for key in unavailable],
+            "trash_gone": [self.trash_path(item) for item in self.trashed if not self.trash_path(item).exists()],
+        }
 
     def _insert_items(self, rows: list[tuple]) -> None:
         with self._lock:
@@ -375,7 +411,7 @@ class Project:
         hashes = self.content_hashes()
         found = 0
         for item, row in self.items.items():
-            if row["source_id"] == source_id:
+            if row["source_id"] == source_id and item not in self.trashed:
                 path = root / row["path"]
                 if path.is_file() and path.stat().st_size == row["size"]:
                     if item in hashes and file_digest(path) != hashes[item][1]:
@@ -437,12 +473,15 @@ class Project:
         return (fields.get("exclusion") or {}).get("decision")
 
     def _combine_exclusion(self, state: dict, losers: dict, decisions: dict | None = None) -> None:
-        """Excluded: the human decision (force keep / force exclude) if any, else a loser of a decided duplicate
-        group, unless a person excluded every copy the group keeps. Sets ``excluded`` and ``excluded_by`` (None, or
+        """Excluded: in the trash; else the human decision (force keep / force exclude) if any, else a loser of a
+        decided duplicate group, unless a person excluded every copy the group keeps. Sets ``excluded`` and ``excluded_by`` (None, or
         what excluded it). ``decisions`` holds every item's decisions, or None to look up the kept copies."""
         human = self._human_exclusion(state)
         state["excluded_by"] = None
-        if human == "exclude":
+        state["trashed"] = state["item_id"] in self.trashed
+        if state["trashed"]:
+            state["excluded_by"] = {"by": "trash"}
+        elif human == "exclude":
             state["excluded_by"] = {"by": "human", "reason": state["exclusion"].get("reason", "")}
         elif human is None and state["item_id"] in losers:
             group, kept = losers[state["item_id"]]
@@ -515,6 +554,8 @@ class Project:
             self.db.execute("DELETE FROM state WHERE item = ? AND field = ?", (item, field))
         else:
             self.db.execute("INSERT OR REPLACE INTO state VALUES (?, ?, ?, ?)", (item, field, encoded, op))
+        if field == TRASHED:
+            (self.trashed.add if encoded is not None else self.trashed.discard)(item)
         last = self.db.execute(
             "SELECT seq, op, previous FROM history WHERE item = ? AND field = ? ORDER BY seq DESC LIMIT 1", (item, field)
         ).fetchone()
@@ -552,21 +593,130 @@ class Project:
             ).fetchall()
             if not changes:
                 raise ValueError(f"Operation {op} has no changes left in the history")
+            self.reconcile_trash()
             self.db.execute("BEGIN")
             try:
                 new = self.begin_op("rollback", f"rollback of {op} ({row[0]}{': ' + row[1] if row[1] else ''})")
                 skipped = []
                 restored = 0
                 for item, field, before, value in changes:
-                    if self._stored(item, field) != value:
+                    if self._stored(item, field) != value or (field == TRASHED and not self._can_untrash(item, before)):
                         skipped.append((item, field))
                     elif self._write(item, field, before, new):
                         restored += 1
                 self.db.execute("COMMIT")
             except BaseException:
                 self.db.execute("ROLLBACK")
+                self.trashed = {r[0] for r in self.db.execute("SELECT item FROM state WHERE field = ?", (TRASHED,))}
                 raise
-        return new, skipped, restored
+            moved = self.reconcile_trash()
+        return new, skipped, restored, moved
+
+    def _can_untrash(self, item: bytes, before: str | None) -> bool:
+        """Whether a rollback can set ``trashed`` back to ``before``: moving out of the trash needs the trash file
+        (one deleted by hand means the image is gone; gc removes it) and a free place in the source folder."""
+        if item not in self.items:
+            return False
+        if before is not None:  # rolling back a rollback: into the trash again
+            return self.original_path(item).exists() or self.trash_path(item).exists()
+        return self.trash_path(item).exists() and not self.original_path(item).exists()
+
+    # The trash.
+
+    def reconcile_trash(self) -> int:
+        """Move every image (and its imported caption file) to where its ``trashed`` field says it is, when it is
+        only at the other place: finishes the moves of an interrupted trash run or rollback. Returns the number
+        moved."""
+        moved = 0
+        candidates = set(self.trashed) | self._in_trash_directory()
+        for item in candidates:
+            if item not in self.items:
+                continue
+            inside = item in self.trashed
+            source, target = (self.original_path(item), self.trash_path(item))
+            if not inside:
+                source, target = target, source
+            if source.exists() and not target.exists():
+                move_file(source, target)
+                moved += 1
+            captions = self._caption_paths(item)
+            if captions is not None:
+                source, target = captions if inside else captions[::-1]
+                if source.exists() and not target.exists():
+                    move_file(source, target)
+        if moved:
+            logger.warning("Finished %d moves into or out of the trash that an interrupted run left undone", moved)
+        return moved
+
+    def _in_trash_directory(self) -> set[bytes]:
+        """Items with a file in the trash, found by walking the trash rather than statting every item."""
+        found = set()
+        for source, root in self.sources.items():
+            directory = self.directory / TRASH / f"{root.name}-{source.hex()[:8]}"
+            for parent, _, files in os.walk(directory):
+                for name in files:
+                    relative = (Path(parent) / name).relative_to(directory).as_posix()
+                    if (item := item_id(source, relative)) in self.items:
+                        found.add(item)
+        return found
+
+    def trash_candidates(self, move_type: str = "all") -> list[dict]:
+        """States of the excluded images ``gc --trash-excluded`` would move: excluded as duplicates (``dedupe``), by a
+        person (``human``) or either (``all``), present in their source folder and not in the trash yet."""
+        if move_type not in MOVE_TYPES:
+            raise ValueError(f"Unknown move type {move_type!r}")
+        wanted = {"dedupe", "human"} if move_type == "all" else {move_type}
+        return [
+            state
+            for state in self.states()
+            if state["excluded"] and state["excluded_by"]["by"] in wanted and self.original_path(state["item_id"]).is_file()
+        ]
+
+    def trash_excluded(self, move_type: str = "all", progress: Callable[[int, int], None] = lambda done, total: None) -> int:
+        """Move the :meth:`trash_candidates` into the project's trash as one operation (see :meth:`rollback`), with
+        their imported caption files. Returns the operation, or 0 when there was nothing to move."""
+        self.reconcile_trash()
+        candidates = self.trash_candidates(move_type)
+        if not candidates:
+            return 0
+        op = self.begin_op("trash", f"{len(candidates)} excluded images ({move_type})")
+        for done, state in enumerate(candidates):
+            progress(done, len(candidates))
+            item = state["item_id"]
+            with self._lock:
+                self.db.execute("BEGIN")
+                self._write(item, TRASHED, "true", op)
+                self.db.execute("COMMIT")
+            try:
+                move_file(self.original_path(item), self.trash_path(item))
+            except OSError as error:
+                logger.error("Cannot move %s to the trash: %s", self.original_path(item), error)
+                with self._lock:
+                    self.db.execute("BEGIN")
+                    self._write(item, TRASHED, None, op)  # back where the operation started: no history entry
+                    self.db.execute("COMMIT")
+                continue
+            captions = self._caption_paths(item)
+            if captions is not None and captions[0].exists() and not captions[1].exists():
+                move_file(*captions)
+        progress(len(candidates), len(candidates))
+        return op
+
+    def trash_gone(self) -> list[bytes]:
+        """Trashed items whose file was removed from the trash by hand (and is not back in the source folder)."""
+        return [item for item in self.trashed if not self.trash_path(item).exists() and not self.original_path(item).exists()]
+
+    def remove_items(self, items: Iterable[bytes]) -> None:
+        """Forget items with their decisions and history (the image no longer exists)."""
+        items = list(items)
+        with self._lock:
+            self.db.execute("BEGIN")
+            for table, column in (("state", "item"), ("history", "item"), ("items", "id")):
+                self.db.executemany(f"DELETE FROM {table} WHERE {column} = ?", [(item,) for item in items])
+            self.db.execute("COMMIT")
+        for item in items:
+            self.items.pop(item, None)
+            self.trashed.discard(item)
 
     def artifacts_in_use(self) -> set[str]:
         """Project-relative paths of the LaMa masks and patches that the current state or the history refers to."""
@@ -583,9 +733,12 @@ class Project:
     def gc(self, *, keep_revisions: int | None = None, older_than: float | None = None, dry_run: bool = False) -> dict:
         """Prune history entries that are beyond the newest ``keep_revisions`` of their field and/or belong to an
         operation older than ``older_than`` seconds (both rules must hold when both are given), the operations left
-        without entries, and the LaMa artifacts nothing refers to afterwards. Returns what was (or would be) removed."""
-        if keep_revisions is None and older_than is None:
-            raise ValueError("Give a number of revisions to keep, an age, or both")
+        without entries, and the LaMa artifacts nothing refers to afterwards. Items whose image was removed from the
+        trash by hand go first, with their decisions and history. Returns what was (or would be) removed."""
+        gone = self.trash_gone()
+        removed = [self.trash_path(item) for item in gone]
+        if gone and not dry_run:
+            self.remove_items(gone)
         conditions, args = [], []
         if keep_revisions is not None:
             conditions.append("(SELECT COUNT(*) FROM history n WHERE n.item = h.item AND n.field = h.field AND n.seq > h.seq) >= ?")
@@ -593,7 +746,7 @@ class Project:
         if older_than is not None:
             conditions.append("(SELECT at FROM ops WHERE id = h.op) < ?")
             args.append(time.time() - older_than)
-        prune = "SELECT seq FROM history h WHERE " + " AND ".join(conditions)
+        prune = "SELECT seq FROM history h WHERE " + (" AND ".join(conditions) if conditions else "0")
         empty_ops = "SELECT id FROM ops WHERE id NOT IN (SELECT op FROM history) AND id NOT IN (SELECT op FROM state)"
         with self._lock:
             self.db.execute("BEGIN")
@@ -617,7 +770,7 @@ class Project:
             for path in artifacts:
                 (self.directory / path).unlink()
             self.db.execute("VACUUM")
-        return {"entries": entries, "ops": ops, "artifacts": artifacts}
+        return {"entries": entries, "ops": ops, "artifacts": artifacts, "removed": removed}
 
     def content_hashes(self) -> dict[bytes, tuple[float, bytes]]:
         """``{item: (mtime, BLAKE3)}`` as of encoding, from the project's embedding database; empty without one."""
@@ -651,6 +804,28 @@ class Project:
                 for state in states
             ],
         }
+
+
+def move_file(source: Path, target: Path) -> None:
+    """Move a file, also across filesystems, without ever leaving neither copy complete: a cross-device move copies
+    to a temporary name next to the target, checks the size, renames it into place and only then removes the
+    source. Refuses to replace an existing target."""
+    if target.exists():
+        raise FileExistsError(errno.EEXIST, "Target exists", str(target))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.rename(source, target)
+        return
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+    temporary = target.with_name(f".{target.name}.picurate-partial")
+    shutil.copy2(source, temporary)
+    if temporary.stat().st_size != source.stat().st_size:
+        temporary.unlink()
+        raise OSError(f"Copy of {source} is incomplete")
+    os.replace(temporary, target)
+    source.unlink()
 
 
 def validate_source(path, state: dict) -> str | None:

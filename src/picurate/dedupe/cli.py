@@ -167,12 +167,12 @@ def _lock_review(project: Project, *, check_only: bool = False) -> None:
 
 
 def _scope(project: Project) -> tuple[Roots, list[Item]]:
-    """The project's roots, and the items taking part: present (not marked missing by the last sync) and not
-    excluded by a person. Losers of duplicate groups take part, so their groups stay stable."""
+    """The project's roots, and the items taking part: present (not marked missing by the last sync, not in the
+    trash) and not excluded by a person. Losers of duplicate groups take part, so their groups stay stable."""
     roots = {source: str(path) for source, path in project.sources.items()}
-    human = project.human_excluded()
+    out = project.human_excluded() | project.trashed
     items = [
-        Item(item, row["source_id"], row["path"]) for item, row in project.items.items() if not row["missing"] and item not in human
+        Item(item, row["source_id"], row["path"]) for item, row in project.items.items() if not row["missing"] and item not in out
     ]
     return roots, items
 

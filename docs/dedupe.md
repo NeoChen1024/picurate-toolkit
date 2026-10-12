@@ -3,8 +3,8 @@
 Finds duplicates among the images of a [project](project.md) by CLIP image-embedding distance and confirms them pixel
 by pixel. A library is cleaned as a project over the library folders. Embeddings live in the project's
 `embeddings.sqlite` and are updated incrementally, so a re-run only encodes what changed; duplicate groups go to its
-`review.sqlite`. Nothing is moved: the images a decided group does not keep count as excluded, and the editor does
-not export them. Everything is held in memory during matching: about 2.3 KiB per image in FP16 for the default
+`review.sqlite`. Nothing is moved: the images a decided group does not keep count as excluded, the editor does not
+export them, and `picurate-project gc --trash-excluded` moves them out of the library when you are sure. Everything is held in memory during matching: about 2.3 KiB per image in FP16 for the default
 1152-dimensional model, so a million images need about 2.3 GiB of RAM and VRAM.
 
 `picurate-dedupe <subcommand> --help` lists every option. Groups the pixel check does not settle are decided by a
@@ -44,8 +44,8 @@ picurate-dedupe calibrate library -s 200 --seed 0 --variants jpeg90,half,quarter
 
 ## What takes part
 
-Every image of the project that is present (not marked missing by the last sync) and not excluded by a person (force
-exclude in the editor). The losers of decided groups do take part, so their groups stay the same from run to run.
+Every image of the project that is present (not marked missing by the last sync, not in the project's
+[trash](project.md#trash)) and not excluded by a person (force exclude in the editor). The losers of decided groups do take part, so their groups stay the same from run to run.
 Rows of missing and excluded images stay in `embeddings.sqlite`, so they are not encoded again if they come back;
 rows of images no longer in the project are dropped. `dedupe` writes `review.sqlite`, so it refuses to start while
 picurate-curate has the project open; encoding does not hold that lock, but matching needs it.

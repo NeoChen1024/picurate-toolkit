@@ -76,6 +76,7 @@ Moved or missing source images are covered under [sources](project.md#sources-an
 ## Exclusion
 
 Thumbnails of excluded images are marked ✕, with what excluded them in the tooltip: a duplicate group (and the copy
-it keeps) or a person. The Exclusion box decides it by hand: *automatic* follows the duplicate groups
+it keeps), a person, or the [trash](project.md#trash) (images there can still be viewed, but their exclusion only
+changes with a rollback). The Exclusion box decides it by hand: *automatic* follows the duplicate groups
 ([curation](curate.md)), *force keep* and *force exclude* override them, with an optional reason. It is a decision
 like the others, saved with the image's history.

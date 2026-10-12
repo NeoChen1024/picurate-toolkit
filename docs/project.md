@@ -36,7 +36,8 @@ picurate-dataset-editor my-dataset
 directory are added (recursive, hidden and filtered as the last import of that directory was; a folder from which only single files were imported
 gets nothing new), changed ones get their new size and mtime recorded, and vanished ones are marked missing until they
 come back. A source folder that is not there at all is skipped and listed rather than marked missing. Captions and
-decisions are kept.
+decisions are kept. Images in the [trash](#trash) are not looked for in their source folders; one whose file was
+deleted from the trash is listed for the next GC.
 * Each image gets an output name from its path relative to the imported directory; names that collide (two sources
   with an `a/1.png`) get a suffix from the image's ID.
 
@@ -78,15 +79,34 @@ Only one editor can have a project open at a time, and the commands below refuse
 picurate-project history my-dataset            # recent operations: ID, time, kind, changes, image
 picurate-project rollback my-dataset 42        # undo operation 42
 picurate-project gc my-dataset --keep-revisions 3 --older-than 30d -n
+picurate-project gc my-dataset --trash-excluded --move-type dedupe -n
 ```
 
 **Rollback** gives every field the operation changed its earlier value back, as a new operation (so a rollback can be
-rolled back). A field changed again since is left alone and listed.
+rolled back). A field changed again since is left alone and listed. Rolling back a trash operation moves its images
+back into their source folders.
 
 **GC** prunes history entries beyond the newest `--keep-revisions` of their field and/or of operations older than
 `--older-than` (with both, an entry must match both), then the operations left without entries, then the LaMa masks
 and patches that neither the current decisions nor the remaining history refer to. Current decisions are never
 touched; pruned operations can no longer be rolled back. Nothing is pruned automatically; `-n` lists first.
+`--trash-excluded` alone is enough, and runs before any pruning.
+
+## Trash
+
+`gc --trash-excluded` moves the excluded images that are still in their source folders into the project's `trash/`,
+with their imported caption files: `--move-type dedupe` only the extra copies of decided duplicate groups, `human`
+only the images a person excluded, `all` (default) both. They land at
+`trash/<source folder name>-<first 8 hex digits of its ID>/<path>`, keeping their relative paths, and the run is one
+operation: `rollback` moves them back, skipping any whose place in the source folder has been taken since. Nothing is
+deleted; a move to another filesystem copies to a temporary name, checks the size and renames before removing the
+original.
+
+An image in the trash stays in the project and counts as excluded whatever the other decisions say; the editor
+still shows it, and deduplication leaves it out (its embedding is kept for a rollback). Deleting it from the trash by
+hand is how an image is really discarded: the next GC removes the item with its decisions and history, the stages
+drop their rows on their next update, and a rollback skips it. Each image's `trashed` field is written before its
+file moves; a run interrupted in between is finished by the next `gc --trash-excluded` or rollback.
 
 ## Project directory
 
@@ -98,6 +118,10 @@ project.sqlite      items     one row per image: ID, source ID and relative path
                     history   every change: operation, image, field, previous and new value (NULL: the default)
                     ops       when each operation happened and what it was
 project.lock        held by the editor that has the project open
+review.lock         held by picurate-curate and by a dedupe run while it writes review.sqlite
+embeddings.sqlite,  written by picurate-dedupe (deduplication)
+review.sqlite
+trash/              excluded images moved out of their source folders by gc --trash-excluded
 masks/, patches/    the editor's accepted LaMa repairs
 output/             the last export and its .manifest.json
 ```

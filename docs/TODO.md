@@ -14,18 +14,14 @@ moving a discarded image into the project's trash is allowed.
 
 Project identity, stat-only import and sync, storage, per-field decisions with history, rollback and GC, databases
 keyed by item ID, content hashes in the embedding database (reuse, source checks), deduplication on projects with
-the exclusion combined on read, `dedupe-import` against a project, and `picurate-curate` with its Duplicates tab are
-in place ([projects](project.md)). Still open:
+the exclusion combined on read, `dedupe-import` against a project, `picurate-curate` with its Duplicates tab, and the trash
+in GC are in place ([projects](project.md)). Still open:
 
 * [ ] **Captions combined on read** (one implementation in `picurate.project`, used by the editor, the tagger and
   export): the human caption if edited; otherwise the imported caption and the one rendered from `tags.sqlite`,
   combined by `skip` (default: keep an existing caption), `overwrite`, `append` or `merge` (union without
   duplicates, compared like the editor's duplicate highlighting). The caption options (style, thresholds, this mode)
   are the tagger's arguments, recorded in `tags.sqlite`.
-* [ ] **Trash in GC.** `picurate-project gc --trash-excluded` moves excluded images to `P/trash/<source>/<path>`
-  (`--only dedupe` limits it to review losers), as one operation that rollback moves back; `-n` lists first. A
-  trashed image whose file was later removed from the trash by hand no longer exists: GC removes the item with its
-  state and history, the stages drop its rows on their next update, and a rollback skips and lists it.
 * [ ] **Tagging on projects** (`update --project`): scores into the project's `tags.sqlite`, excluded items skipped.
   Captions are derived on read (above); `export --project` can still write `.txt` next to the source images, for
   training on a library folder directly.

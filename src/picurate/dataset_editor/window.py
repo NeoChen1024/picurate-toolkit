@@ -253,7 +253,7 @@ class Window(QMainWindow):
                         self.review.setCurrentIndex((self.review.currentIndex() + 1) % self.review.count())
                     return True
                 if event.key() == Qt.Key.Key_E:
-                    if self.state and not event.isAutoRepeat():
+                    if self.state and not self.state["trashed"] and not event.isAutoRepeat():
                         self.exclusion.setCurrentIndex((self.exclusion.currentIndex() + 1) % self.exclusion.count())
                     return True
         return super().eventFilter(obj, event)
@@ -672,6 +672,8 @@ class Window(QMainWindow):
 
     def exclusion_text(self, state):
         by = state["excluded_by"]
+        if state["trashed"]:
+            return "In the project's trash (picurate-project rollback brings it back)"
         if by is None:
             return "Kept by hand" if (state["exclusion"] or {}).get("decision") == "keep" else "Included"
         if by["by"] == "human":
@@ -689,7 +691,8 @@ class Window(QMainWindow):
         self.exclusion_reason.blockSignals(True)
         self.exclusion_reason.setText(exclusion.get("reason", ""))
         self.exclusion_reason.blockSignals(False)
-        self.exclusion_reason.setEnabled(bool(exclusion))
+        self.exclusion.setEnabled(not self.state["trashed"])
+        self.exclusion_reason.setEnabled(bool(exclusion) and not self.state["trashed"])
         self.exclusion_label.setText(self.exclusion_text(self.state))
 
     def exclusion_changed(self, value):
