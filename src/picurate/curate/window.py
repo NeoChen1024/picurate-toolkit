@@ -1,4 +1,4 @@
-"""The curation window: one project, a tab per kind of decision about its images."""
+"""The curation window: one project, a tab per kind of decision about its images: Duplicates and Culling."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from PySide6.QtWidgets import QLabel, QMainWindow, QTabWidget
 from ..dedupe.keeping import Policy
 from ..dedupe.review import ReviewDB
 from ..project.project import REVIEW, Project
+from .culling import CullingTab
 from .duplicates import DuplicatesTab
 
 
@@ -36,10 +37,14 @@ class CurateWindow(QMainWindow):
             label = QLabel(f"No duplicate groups yet: run  picurate-dedupe dedupe {self.project.directory}")
             label.setMargin(24)
             self.tabs.addTab(label, "Duplicates")
+        self.culling = CullingTab(self.project)
+        self.tabs.addTab(self.culling, "Culling")
+        self.tabs.currentChanged.connect(lambda _: self.tabs.currentWidget() is self.culling and self.culling.activate())
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self.duplicates is not None:
             self.duplicates.shutdown()
+        self.culling.shutdown()
         if self.review is not None:
             self.review.close()
         self.project.close()

@@ -270,6 +270,12 @@ class TagDB:
         if current is not None and (items is None or records[current].id in items):
             yield records[current], probs
 
+    def tag_scores(self, tag_id: int) -> list[tuple[bytes, float]]:
+        """``(item, probability)`` of the images whose score for one tag reached the floor (the others scored less)."""
+        return self.conn.execute(
+            "SELECT i.item, s.prob FROM scores s JOIN images i ON i.id = s.image_id WHERE s.tag_id = ?", (tag_id,)
+        ).fetchall()
+
     def sidecars(self) -> dict[bytes, bytes]:
         """``{item: BLAKE3 of the caption export last wrote next to it}``."""
         return dict(self.conn.execute("SELECT item, digest FROM sidecars"))

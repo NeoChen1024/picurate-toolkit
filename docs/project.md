@@ -4,8 +4,7 @@ A project is a directory that references images where they already are and owns 
 captions, review status, edits and the exported dataset. Source images and their caption files are only ever read,
 except that [`picurate-tag export`](tagger.md#tagging-a-project) writes caption files next to them when asked.
 For curating a training dataset the stages are meant to run in order on one project: import, deduplication and
-culling, optional batch tagging, then the [dataset editor](dataset-editor.md). Culling is not there yet; see
-[TODO](TODO.md).
+[culling](curate.md#culling), optional batch tagging, then the [dataset editor](dataset-editor.md).
 
 ```shell
 picurate-project init my-dataset

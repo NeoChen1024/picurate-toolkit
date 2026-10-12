@@ -7,13 +7,13 @@ directories). It started as a CLIP-based deduplicator (`clip-image-deduper`) and
 Batch processing on the command line first, a GUI only where a human has to look. The parts are separate commands for
 now; how they should feed into each other is something the workflow has to show first.
 
-| Command                                           | What it does                                                                                           |
-| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| [picurate-dedupe](docs/dedupe.md)                 | Find duplicates in a project by CLIP similarity, confirm them pixel by pixel, exclude extra copies.    |
-| [picurate-curate](docs/curate.md)                 | GUI for what a human decides about a project's images; so far the duplicate groups a threshold cannot. |
-| [picurate-tag](docs/tagger.md)                    | Danbooru-tag captions for training datasets, in Anima or sd-scripts (SDXL) layout.                     |
-| [picurate-project](docs/project.md)               | Create a dataset project, import existing image/caption pairs, roll back or prune its edit history.    |
-| [picurate-dataset-editor](docs/dataset-editor.md) | GUI for going through a dataset by hand: captions with tag completion, crops, watermark removal.       |
+| Command                                           | What it does                                                                                                  |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| [picurate-dedupe](docs/dedupe.md)                 | Find duplicates in a project by CLIP similarity, confirm them pixel by pixel, exclude extra copies.           |
+| [picurate-curate](docs/curate.md)                 | GUI for what a human decides about a project's images: duplicate groups, and culling by text, tag or example. |
+| [picurate-tag](docs/tagger.md)                    | Danbooru-tag captions for training datasets, in Anima or sd-scripts (SDXL) layout.                            |
+| [picurate-project](docs/project.md)               | Create a dataset project, import existing image/caption pairs, roll back or prune its edit history.           |
+| [picurate-dataset-editor](docs/dataset-editor.md) | GUI for going through a dataset by hand: captions with tag completion, crops, watermark removal.              |
 
 ## Installation
 

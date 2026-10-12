@@ -24,6 +24,7 @@ from torch import nn
 
 DEFAULT_REPO = "google/siglip2-so400m-patch16-naflex"
 DEFAULT_REVISION = "cc24074f717b612951c2dead130904ab9b65a81e"
+IMAGE_TOWER = "naflexvit_so400m_patch16_siglip.v2_webli"  # the timm image tower this text tower matches
 
 
 @dataclass(frozen=True, slots=True)

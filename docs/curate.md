@@ -1,8 +1,9 @@
 # Curation (`picurate-curate`)
 
 A single threshold cannot tell a lossy copy from an artist revision or the next page of a pixiv set. `picurate-curate`
-is where a human decides about a [project](project.md)'s images; so far it has one tab, **Duplicates**, for the groups
-[`picurate-dedupe dedupe`](dedupe.md) found. It needs the `gui` extra (`uv pip install -e '.[gui]'`).
+is where a human decides about a [project](project.md)'s images, in two tabs: **Duplicates**, for the groups
+[`picurate-dedupe dedupe`](dedupe.md) found, and **Culling**, for removing whole kinds of images by text query, tag or
+example. It needs the `gui` extra (`uv pip install -e '.[gui]'`).
 
 ```shell
 picurate-dedupe dedupe library --review-threshold 1.5   # stores groups, moves nothing
@@ -41,6 +42,40 @@ disk.
 Every decision is committed to the review database as it is made, with a per-group history for undo. A group can only
 be decided while it keeps a member: excluding every member takes R on purpose, and a group whose keeps were all
 unticked is flagged and excludes nothing.
+
+## Culling
+
+Finds the images to drop from a project by what they show, and excludes them as human decisions. It works on what
+the other stages stored, loaded when the tab is first opened: the embeddings of
+[`picurate-dedupe update-db`](dedupe.md) (or `dedupe`) and the tag scores of
+[`picurate-tag update`](tagger.md#tagging-a-project). Without one of them its criteria are not offered.
+
+Criteria, any number, each with its own threshold:
+
+* **Text query**: cosine similarity between SigLIP2's text embedding of the query (lowercased) and each image's
+  stored embedding. Matching images score about 0.10-0.18 and the rest 0.02-0.06; the threshold starts at 0.12.
+  Needs embeddings of the default model, `naflexvit_so400m_patch16_siglip.v2_webli`; the text tower
+  (`google/siglip2-so400m-patch16-naflex`, the same checkpoint) is downloaded on first use.
+* **Tag condition**: `tag` or `tag >= probability`, the tag's score in `tags.sqlite`; without a probability, the
+  tagger's threshold for the tag's category. Images not tagged yet never match.
+* **Example image**: cosine similarity to the current image's stored embedding (E), or to image files from anywhere,
+  encoded with the image model. Two unrelated images already score about 0.7 (99.9th percentile 0.91), so the
+  threshold starts at 0.90.
+
+The selection is the images matching any (or all) of the ticked criteria, plus those put in by hand and minus those
+left out (Space on the selected cells). The grid shows the selection or every image, sorted by the score of the
+criterion selected in the list; T moves its threshold to the current image's score. Badges mark what already
+excludes an image: **T** trash, **H** a person, **D** a duplicate group; **K** marks one a person kept.
+
+**Exclude** writes a force exclude decision for every selected image no person decided about yet, as one operation
+of the project's history: the reason is the query (`culling: any of text "monochrome manga page" >= 0.120; tag comic
+>= 0.50`), or `culling: picked by hand`. Images a person kept or excluded stay as they are. **Undo** rolls the
+operation back, as `picurate-project rollback` does. It needs the project's decisions to itself for that moment, so
+it refuses while the [editor](dataset-editor.md) has the project open. Criteria and choices by hand are not saved.
+
+Scores are computed on the CPU from the embeddings held in memory as FP16 (2.3 KiB per image): about 0.1-0.2 s per
+criterion for a million images on an 8-core desktop CPU. Thresholds apply instantly. The GPU, when there is one,
+only encodes query texts and example files.
 
 ## Review database
 

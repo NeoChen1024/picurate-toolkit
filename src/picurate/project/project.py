@@ -579,6 +579,24 @@ class Project:
                 raise
         return changed
 
+    def exclude(self, reasons: dict[bytes, str], kind: str, description: str) -> tuple[int, int]:
+        """Force exclude each item of ``reasons`` with its reason, as one operation. Items a person already decided
+        about (force keep or force exclude) are left alone. Returns ``(operation, items excluded)``."""
+        with self._lock:
+            self.db.execute("BEGIN")
+            try:
+                op = self.begin_op(kind, description)
+                count = 0
+                for item, reason in reasons.items():
+                    if item in self.items and self._stored(item, "exclusion") is None:
+                        encoded = json.dumps({"decision": "exclude", "reason": reason}, ensure_ascii=False)
+                        count += self._write(item, "exclusion", encoded, op)
+                self.db.execute("COMMIT")
+            except BaseException:
+                self.db.execute("ROLLBACK")
+                raise
+        return op, count
+
     def _stored(self, item: bytes, field: str) -> str | None:
         row = self.db.execute("SELECT value FROM state WHERE item = ? AND field = ?", (item, field)).fetchone()
         return None if row is None else row[0]

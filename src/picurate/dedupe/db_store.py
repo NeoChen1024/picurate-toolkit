@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from pathlib import Path
 
 import numpy as np
 
@@ -221,3 +222,30 @@ def load_database(db_path: str) -> tuple[list[ImageRecord], np.ndarray]:
         return [], np.empty((0, 0), dtype=EMBEDDING_DTYPE)
     with EmbeddingDB(db_path) as db:
         return db.load_all()
+
+
+def load_rows(db_path: str, items: Sequence[bytes]) -> tuple[str, np.ndarray, np.ndarray]:
+    """``(model id, (len(items), D) float16 matrix, bool mask of the rows found)``: the stored embeddings of ``items``
+    in their order, read without writing the database and without a second copy of the matrix. Rows of other items are
+    skipped; an item without a row gets zeros."""
+    conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM meta"))
+        if meta.get("schema_version") != SCHEMA_VERSION:
+            raise ModelMismatchError(f"Database {db_path} uses schema version {meta.get('schema_version')}, not {SCHEMA_VERSION}")
+        if "model_id" not in meta or "dim" not in meta:
+            raise ModelMismatchError(f"Database {db_path} holds no embeddings yet")
+        dim = int(meta["dim"])
+        position = {item: i for i, item in enumerate(items)}
+        matrix = np.zeros((len(items), dim), dtype=EMBEDDING_DTYPE)
+        found = np.zeros(len(items), dtype=bool)
+        cursor = conn.execute("SELECT id, embedding FROM embeddings")
+        while rows := cursor.fetchmany(4096):
+            for item, blob in rows:
+                i = position.get(item)
+                if i is not None:
+                    matrix[i] = np.frombuffer(blob, dtype=EMBEDDING_DTYPE)
+                    found[i] = True
+        return meta["model_id"], matrix, found
+    finally:
+        conn.close()

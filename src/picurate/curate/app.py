@@ -28,7 +28,8 @@ from ..dedupe.keeping import PolicyError, load_policies
 @click.option("--verbose", "-v", is_flag=True, help="Debug logging.")
 def main(project_dir: str, keeping_config: str | None, prefetch: int, verbose: bool) -> None:
     """Decide about the images of the project at PROJECT_DIR: which copies of duplicate groups (found by
-    `picurate-dedupe dedupe`) to keep. Needs no other picurate-curate or dedupe run on the project."""
+    `picurate-dedupe dedupe`) to keep, and which images to cull by text query, tag condition or example image. Needs no
+    other picurate-curate or dedupe run on the project."""
     setup_logging(verbose)
     try:
         policies = load_policies(keeping_config)
