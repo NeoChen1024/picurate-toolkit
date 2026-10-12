@@ -12,6 +12,11 @@ Layout:
   format). The integer ``id`` keeps the score rows small.
 * ``scores``: ``(image_id, tag_id, prob)`` for every tag scoring at least the floor, plus all rating tags (the rating is
   an argmax). Small rows, so ``WITHOUT ROWID``; ``(tag_id, prob)`` is indexed for "which images have tag X" queries.
+* ``sidecars``: the BLAKE3 of the caption ``export`` last wrote next to each image, so the next export knows the file
+  is its own and may replace it.
+
+The caption options (``picurate-tag captions``) are kept in ``meta`` as ``caption_options``; they are not part of the
+binding and survive a rebind. The project reads the database (:mod:`picurate.project.captions`) without writing it.
 
 Each batch is written in one transaction (image rows and their scores together), so an interrupted update leaves only
 complete images behind and the next update, comparing mtimes, carries on where it stopped. A file of another schema
@@ -23,15 +28,16 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
 from ..common.images import ImageRecord
 from .captions import Vocabulary
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 default_score_floor = 0.05
 
 _META = """
@@ -64,10 +70,15 @@ CREATE TABLE IF NOT EXISTS scores (
     PRIMARY KEY (image_id, tag_id)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS scores_tag ON scores (tag_id, prob);
+CREATE TABLE IF NOT EXISTS sidecars (
+    item   BLOB PRIMARY KEY,
+    digest BLOB NOT NULL
+) WITHOUT ROWID;
 """
 
 # Keys that must match for scores to be comparable.
 _BINDING_KEYS = ("schema_version", "model_id", "dtype", "score_floor")
+CAPTION_OPTIONS = "caption_options"
 
 
 class TagDBMismatchError(RuntimeError):
@@ -90,12 +101,19 @@ class Binding:
 
 
 class TagDB:
-    def __init__(self, path: str, *, create: bool = True, rebuild: bool = False):
-        """Open ``path`` (created unless ``create`` is false). A file of another schema version raises
-        :class:`TagDBMismatchError`, or with ``rebuild`` is emptied."""
-        if not create and not os.path.exists(path):
+    def __init__(self, path: str, *, create: bool = True, rebuild: bool = False, readonly: bool = False):
+        """Open ``path`` (created unless ``create`` or ``readonly``). A file of another schema version raises
+        :class:`TagDBMismatchError`, or with ``rebuild`` is emptied (the caption options are kept)."""
+        if (readonly or not create) and not os.path.exists(path):
             raise FileNotFoundError(f"Tag database {path} does not exist")
         self.path = path
+        if readonly:
+            self.conn = sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True)
+            version = self.get_meta("schema_version")
+            if version not in (None, SCHEMA_VERSION):
+                self.conn.close()
+                raise TagDBMismatchError(f"Tag database {path} uses schema version {version}, not {SCHEMA_VERSION}")
+            return
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self.conn = sqlite3.connect(path)
         self.conn.execute("PRAGMA journal_mode = WAL")
@@ -110,9 +128,9 @@ class TagDB:
                     f"Tag database {path} uses schema version {version}, but this version of the tool needs {SCHEMA_VERSION}. "
                     "Pass --force-update to re-tag everything, or use a different database file."
                 )
-            for table in ("scores", "images", "tags"):
+            for table in ("scores", "images", "tags", "sidecars"):
                 self.conn.execute(f"DROP TABLE IF EXISTS {table}")
-            self.conn.execute("DELETE FROM meta")
+            self.conn.execute("DELETE FROM meta WHERE key != ?", (CAPTION_OPTIONS,))
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
 
@@ -160,12 +178,24 @@ class TagDB:
             self.conn.execute("DELETE FROM scores")
             self.conn.execute("DELETE FROM images")
             self.conn.execute("DELETE FROM tags")
-            self.conn.execute("DELETE FROM meta")
+            self.conn.execute("DELETE FROM meta WHERE key != ?", (CAPTION_OPTIONS,))
             category = {i: cat for cat, sl in vocab.slices.items() for i in range(sl.start, sl.stop)}
             self.conn.executemany(
                 "INSERT INTO tags (id, name, category) VALUES (?, ?, ?)", ((i, t, category[i]) for i, t in enumerate(vocab.tags))
             )
             self._set_meta({**wanted, "category_thresholds": json.dumps(vocab.thresholds)})
+
+    def caption_options(self) -> dict | None:
+        """What ``picurate-tag captions`` recorded: ``{"options": CaptionOptions JSON, "combine": mode}``."""
+        value = self.get_meta(CAPTION_OPTIONS)
+        return None if value is None else json.loads(value)
+
+    def set_caption_options(self, value: dict) -> None:
+        with self.conn:
+            self._set_meta({CAPTION_OPTIONS: json.dumps(value, ensure_ascii=False)})
+
+    def binding_key(self) -> tuple:
+        return tuple(self.get_meta(k) for k in _BINDING_KEYS)
 
     def vocabulary(self) -> Vocabulary:
         """The stored vocabulary in the checkpoint-config shape ``Vocabulary`` reads."""
@@ -192,10 +222,6 @@ class TagDB:
         """``{item_id: mtime}`` of every tagged image."""
         return dict(self.conn.execute("SELECT item, mtime FROM images"))
 
-    def records(self) -> list[ImageRecord]:
-        rows = self.conn.execute("SELECT path, mtime, size, width, height, format, source_id, item FROM images").fetchall()
-        return [ImageRecord(*row) for row in rows]
-
     def store(self, rows: Iterable[tuple[ImageRecord, np.ndarray]], vocab: Vocabulary) -> None:
         """Replace the scores of these images with ``probs`` (one full output vector each), in one transaction."""
         floor = self.score_floor
@@ -219,16 +245,35 @@ class TagDB:
     def delete(self, ids: Sequence[bytes]) -> None:
         with self.conn:
             self.conn.executemany("DELETE FROM images WHERE item = ?", ((i,) for i in ids))
+            self.conn.executemany("DELETE FROM sidecars WHERE item = ?", ((i,) for i in ids))
 
-    def iter_scores(self, num_tags: int) -> Iterator[tuple[ImageRecord, np.ndarray]]:
-        """Every image ordered by source and path with its scores as a dense vector (0 below the floor)."""
-        images = self.conn.execute(
-            "SELECT id, path, mtime, size, width, height, format, source_id, item FROM images ORDER BY source_id, path"
-        ).fetchall()
-        for image_id, *meta in images:
-            probs = np.zeros(num_tags, dtype=np.float32)
-            rows = self.conn.execute("SELECT tag_id, prob FROM scores WHERE image_id = ?", (image_id,)).fetchall()
-            if rows:
-                ids, values = zip(*rows)
-                probs[list(ids)] = values
-            yield ImageRecord(*meta), probs
+    def scores(self, items: Collection[bytes] | None, num_tags: int) -> Iterator[tuple[ImageRecord, np.ndarray]]:
+        """The scores of ``items`` (None: every image) as dense vectors; many items in one pass over the scores."""
+        columns = "id, path, mtime, size, width, height, format, source_id, item"
+        if items is not None and len(items) <= 1000:
+            for item in items:
+                row = self.conn.execute(f"SELECT {columns} FROM images WHERE item = ?", (item,)).fetchone()
+                if row is not None:
+                    probs = np.zeros(num_tags, dtype=np.float32)
+                    for tag_id, prob in self.conn.execute("SELECT tag_id, prob FROM scores WHERE image_id = ?", (row[0],)):
+                        probs[tag_id] = prob
+                    yield ImageRecord(*row[1:]), probs
+            return
+        records = {row[0]: ImageRecord(*row[1:]) for row in self.conn.execute(f"SELECT {columns} FROM images")}
+        current, probs = None, None
+        for image_id, tag_id, prob in self.conn.execute("SELECT image_id, tag_id, prob FROM scores ORDER BY image_id"):
+            if image_id != current:
+                if current is not None and (items is None or records[current].id in items):
+                    yield records[current], probs
+                current, probs = image_id, np.zeros(num_tags, dtype=np.float32)
+            probs[tag_id] = prob
+        if current is not None and (items is None or records[current].id in items):
+            yield records[current], probs
+
+    def sidecars(self) -> dict[bytes, bytes]:
+        """``{item: BLAKE3 of the caption export last wrote next to it}``."""
+        return dict(self.conn.execute("SELECT item, digest FROM sidecars"))
+
+    def record_sidecars(self, rows: Iterable[tuple[bytes, bytes]]) -> None:
+        with self.conn:
+            self.conn.executemany("INSERT OR REPLACE INTO sidecars (item, digest) VALUES (?, ?)", rows)

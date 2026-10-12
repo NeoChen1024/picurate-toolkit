@@ -7,24 +7,16 @@ natural-language passages for Anima-style captions). Tagging runs once: before c
 drive tag matching, otherwise after it, so that excluded images are not tagged.
 
 A project is also how a library is cleaned: a library is a project over the library folders, and deduplicating it
-is deduplicating that project. The standalone directory modes of `dedupe`, `update-db`, `calibrate`, the review
-GUI and the tagger's `update`/`export` go away; `encode-test`, the tagger's `run` and the import side of
-`dedupe-import` stay plain directories. Sources stay read-only in the sense that image contents are never modified;
+is deduplicating that project. Only `encode-test`, the tagger's `run` and the import side of `dedupe-import` work
+on plain directories. Sources stay read-only in the sense that image contents are never modified;
 moving a discarded image into the project's trash is allowed.
 
 Project identity, stat-only import and sync, storage, per-field decisions with history, rollback and GC, databases
 keyed by item ID, content hashes in the embedding database (reuse, source checks), deduplication on projects with
-the exclusion combined on read, `dedupe-import` against a project, `picurate-curate` with its Duplicates tab, and the trash
-in GC are in place ([projects](project.md)). Still open:
+the exclusion combined on read, `dedupe-import` against a project, `picurate-curate` with its Duplicates tab, the trash
+in GC, and tagging on projects with captions combined on read are in place ([projects](project.md),
+[tagging](tagger.md#tagging-a-project)). Still open:
 
-* [ ] **Captions combined on read** (one implementation in `picurate.project`, used by the editor, the tagger and
-  export): the human caption if edited; otherwise the imported caption and the one rendered from `tags.sqlite`,
-  combined by `skip` (default: keep an existing caption), `overwrite`, `append` or `merge` (union without
-  duplicates, compared like the editor's duplicate highlighting). The caption options (style, thresholds, this mode)
-  are the tagger's arguments, recorded in `tags.sqlite`.
-* [ ] **Tagging on projects** (`update --project`): scores into the project's `tags.sqlite`, excluded items skipped.
-  Captions are derived on read (above); `export --project` can still write `.txt` next to the source images, for
-  training on a library folder directly.
 * [ ] **Culling tab** of `picurate-curate`, interactive, on the project's embeddings and tag scores, loaded only when
   the tab is first opened; it marks every image with what excluded it, like the Duplicates tab:
   * Manual selection; image similarity to example images (cosine); text similarity to typed queries; tag matching.

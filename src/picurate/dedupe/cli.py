@@ -489,7 +489,7 @@ def dedupe_import(
                 _update_project(encoder, project, force_update=force_update, batch_size=batch_size, workers=workers)
             _update_dir(encoder, import_image_dir, import_db, include_hidden=include_hidden, batch_size=batch_size, workers=workers)
         roots, items = _scope(project)
-        excluded = {state["item_id"] for state in project.states() if state["excluded"]}
+        excluded = {state["item_id"] for state in project.states(captions=False) if state["excluded"]}
         base_records, base_index = _load_index(
             _embeddings(project), device, "project database", only={item.id for item in items} - excluded
         )

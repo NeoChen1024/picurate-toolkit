@@ -8,7 +8,8 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QTextCursor
 from PySide6.QtWidgets import QListWidget, QListWidgetItem, QPlainTextEdit, QTextEdit
 
-from .tags import CATEGORIES, normalize
+from ..tagger.captions import duplicate_key
+from .tags import CATEGORIES
 
 
 class CaptionEditor(QPlainTextEdit):
@@ -48,7 +49,7 @@ class CaptionEditor(QPlainTextEdit):
             # Qt uses UTF-16 positions, including for astral characters.
             a = len(text[:start].encode("utf-16-le")) // 2
             b = len(text[:end].encode("utf-16-le")) // 2
-            key = " ".join(normalize(raw).split())
+            key = duplicate_key(raw)
             spans.append((a, b, key))
         active = next(
             (span for span in spans if (span[0] <= cursor.selectionStart() < span[1] and cursor.selectionEnd() <= span[1])), None

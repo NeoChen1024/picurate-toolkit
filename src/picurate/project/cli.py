@@ -200,7 +200,7 @@ def rollback(project_dir: str, op: int) -> None:
 @click.option(
     "--trash-excluded",
     is_flag=True,
-    help="Move excluded images (with their imported caption files) into the project's trash/, as one operation that "
+    help="Move excluded images (with their caption files) into the project's trash/, as one operation that "
     "rollback moves back.",
 )
 @click.option(

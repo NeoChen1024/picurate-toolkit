@@ -71,9 +71,10 @@ library --trash-dir trash` moves what the library already has. Details: [dedupli
 ## Tagging
 
 ```shell
-picurate-tag run dataset --style anima --prefix "masterpiece, best quality"   # tag + write captions in one go
-picurate-tag update dataset -r -d dataset.tags.sqlite                         # or: scores into a database...
-picurate-tag export dataset -d dataset.tags.sqlite --style sdxl              # ...and captions from it, no GPU
+picurate-tag run dataset --style anima --prefix "masterpiece, best quality"   # a plain directory, in one go
+picurate-tag update library                                                   # or a project: scores into it...
+picurate-tag captions library --style sdxl --combine merge                    # ...captions from them, no GPU
+picurate-tag export library                                                   # .txt next to the images, if wanted
 ```
 
 Uses [pixai-tagger-v1.0](https://huggingface.co/pixai-labs/pixai-tagger-v1.0), reimplemented so it needs no
@@ -89,9 +90,9 @@ picurate-dataset-editor my-dataset
 ```
 
 How I want dataset curation to go: import into a project, dedupe and cull what does not belong, batch-tag if there
-are no captions yet, then go through everything by hand in the editor. Import, deduplication, curation and the
-editor work on projects so far; tagging still works on plain directories. The images are only referenced, never touched; captions and
-edits live in the project and are rendered into a fresh dataset on export.
+are no captions yet, then go through everything by hand in the editor. Everything but culling works on projects
+now. The images are only referenced, never touched; captions and edits live in the project and are rendered into a
+fresh dataset on export.
 
 The editor is for the part no tagger gets right: fixing captions with Danbooru/e621 completion, adding the
 natural-language bits, cropping, and painting out watermarks and signatures (mean colour, or a Hi-SAM mask plus LaMa

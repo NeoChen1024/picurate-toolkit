@@ -16,7 +16,7 @@ spelling whatever the output style.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -66,6 +66,23 @@ def prompt_form(tag: str) -> str:
 
 def _visual_meta(tag: str) -> bool:
     return tag in VISUAL_META_TAGS or tag in RESOLUTION_TAGS or (tag.endswith("_(medium)") and tag not in SOFTWARE_MEDIUM_TAGS)
+
+
+def duplicate_key(entry: str) -> str:
+    """What two caption entries are compared by to count as the same tag: case, underscores, parenthesis escapes and
+    runs of whitespace ignored (the editor's duplicate highlighting, and the ``merge`` combine mode)."""
+    return " ".join(entry.lower().replace("\\(", "(").replace("\\)", ")").replace("_", " ").split())
+
+
+def append_tags(existing: str, entries: Sequence[str], separator: str, *, key: Callable[[str], str] = str.strip) -> str:
+    """``existing`` caption text as it is, then the ``entries`` it lacks, comparing comma- or newline-separated
+    entries by ``key`` (exact, like sd-scripts' ``--append_tags``; or :func:`duplicate_key`)."""
+    text = existing.rstrip()
+    have = {key(e) for e in re.split(r"[,\n]", text) if e.strip()}
+    new = [e for e in entries if key(e) not in have]
+    if not text:
+        return separator.join(entries)
+    return separator.join([text, *new]) if new else text
 
 
 def split_tag_list(text: str | None) -> list[str]:
@@ -158,6 +175,25 @@ class CaptionOptions:
             raise ValueError(f"Unknown meta mode {self.meta!r}; expected one of {META_MODES}")
         if self.resolution not in RESOLUTION_MODES:
             raise ValueError(f"Unknown resolution mode {self.resolution!r}; expected one of {RESOLUTION_MODES}")
+
+    def to_json(self) -> dict:
+        return {
+            "style": self.style,
+            "thresholds": self.thresholds,
+            "rating": self.rating,
+            "meta": self.meta,
+            "resolution": self.resolution,
+            "prefix": self.prefix,
+            "always_first": self.always_first,
+            "override_artists": self.override_artists,
+            "undesired": sorted(self.undesired),
+            "replacements": self.replacements,
+            "separator": self.separator,
+        }
+
+    @classmethod
+    def from_json(cls, value: dict) -> CaptionOptions:
+        return cls(**{**value, "undesired": frozenset(value.get("undesired", ()))})
 
 
 Scored = dict[str, list[tuple[str, float]]]

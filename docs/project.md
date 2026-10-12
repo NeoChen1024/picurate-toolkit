@@ -1,10 +1,11 @@
 # Projects (`picurate-project`)
 
 A project is a directory that references images where they already are and owns everything derived from them:
-captions, review status, edits and the exported dataset. Source images and their caption files are only ever read.
+captions, review status, edits and the exported dataset. Source images and their caption files are only ever read,
+except that [`picurate-tag export`](tagger.md#tagging-a-project) writes caption files next to them when asked.
 For curating a training dataset the stages are meant to run in order on one project: import, deduplication and
-culling, optional batch tagging, then the [dataset editor](dataset-editor.md). Only import and the editor work on
-projects so far; see [TODO](TODO.md).
+culling, optional batch tagging, then the [dataset editor](dataset-editor.md). Culling is not there yet; see
+[TODO](TODO.md).
 
 ```shell
 picurate-project init my-dataset
@@ -64,7 +65,9 @@ pixels they were computed from changed ([dataset editor](dataset-editor.md#image
 
 What a person decides about an image is stored per field: the caption, the crop, the fills, the review status and
 an exclusion (none, force keep or force exclude, with a reason). A field without a stored value has its default; for
-the caption that is the imported one, so an unedited caption keeps following it.
+the caption that is the derived one: the imported caption, combined with the one rendered from the tag scores as
+[`picurate-tag captions`](tagger.md#tagging-a-project) recorded. An unedited caption keeps following both, and saving
+a caption equal to the derived one stores nothing.
 
 The other stages write only their own files in the project directory, and reading the project combines them with
 these decisions. An image is **excluded** when a person forced it out, or, with no human exclusion decision, when a
@@ -95,7 +98,8 @@ touched; pruned operations can no longer be rolled back. Nothing is pruned autom
 ## Trash
 
 `gc --trash-excluded` moves the excluded images that are still in their source folders into the project's `trash/`,
-with their imported caption files: `--move-type dedupe` only the extra copies of decided duplicate groups, `human`
+with their caption files (the imported one, or the one [`picurate-tag export`](tagger.md#tagging-a-project)
+wrote, while it is unchanged since): `--move-type dedupe` only the extra copies of decided duplicate groups, `human`
 only the images a person excluded, `all` (default) both. They land at
 `trash/<source folder name>-<first 8 hex digits of its ID>/<path>`, keeping their relative paths, and the run is one
 operation: `rollback` moves them back, skipping any whose place in the source folder has been taken since. Nothing is
@@ -119,8 +123,10 @@ project.sqlite      items     one row per image: ID, source ID and relative path
                     ops       when each operation happened and what it was
 project.lock        held by the editor that has the project open
 review.lock         held by picurate-curate and by a dedupe run while it writes review.sqlite
+tags.lock           held by picurate-tag update, captions (when it records) and export
 embeddings.sqlite,  written by picurate-dedupe (deduplication)
 review.sqlite
+tags.sqlite         written by picurate-tag (scores, caption options, the caption files export wrote)
 trash/              excluded images moved out of their source folders by gc --trash-excluded
 masks/, patches/    the editor's accepted LaMa repairs
 output/             the last export and its .manifest.json

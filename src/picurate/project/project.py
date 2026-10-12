@@ -5,11 +5,12 @@ new, changed and vanished images. ``project.sqlite`` holds the items (one per im
 image) and the human decisions about them, stored per field: a current-state table, and a history in which every
 change belongs to an operation and records the value before and after it, so that one editing session or one batch
 decision can be rolled back as a unit, and old history can be pruned without breaking that. A field without a row has its default (for the caption: the derived one). Source images and their caption
-files are only ever read. The project keeps no content hash: an import only stats the files. Once the images are
+files are only ever read here (``picurate-tag export`` writes caption files when asked). The project keeps no content hash: an import only stats the files. Once the images are
 encoded for deduplication, export and relink check them against the content hashes in ``embeddings.sqlite``.
 
-Other stages write only their own files in the project directory (``embeddings.sqlite``, ``review.sqlite``); the
-project reads them and combines them with the human decisions (:meth:`Project.state`).
+Other stages write only their own files in the project directory (``embeddings.sqlite``, ``review.sqlite``,
+``tags.sqlite``); the project reads them and combines them with the human decisions (:meth:`Project.state`, and
+:mod:`picurate.project.captions` for the captions).
 
 ``gc --trash-excluded`` moves excluded images into ``trash/`` in the project, as an operation whose ``trashed``
 field changes roll back like any other (the rollback moves the files back). The field is written before a file is
@@ -30,13 +31,14 @@ import shutil
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from pathlib import Path
 
 from ..common.images import STANDALONE_SOURCE, PathFilter, file_digest, item_id, list_directory_relative
 from ..dedupe.db_store import SCHEMA_VERSION as EMBEDDING_SCHEMA
 from ..dedupe.review import SCHEMA_VERSION as REVIEW_SCHEMA
 from ..dedupe.review import losers
+from . import captions as tag_captions
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,7 @@ REVIEW = "review.sqlite"  # written by picurate-dedupe and the curation GUI; onl
 LOCKS = {
     "project": "The project is open in another editor",
     "review": "The review database is in use (picurate-curate or a dedupe run)",
+    "tags": "The tag database is in use by another picurate-tag command",
 }
 
 SCHEMA = """
@@ -227,17 +230,34 @@ class Project:
         source = row["source_id"]
         return self.directory / TRASH / f"{self.sources[source].name}-{source.hex()[:8]}" / safe_relative(row["path"])
 
-    def _caption_paths(self, item: bytes) -> tuple[Path, Path] | None:
-        """The imported caption file in the source folder and its place in the trash, which it follows the image to."""
+    def _caption_paths(self, item: bytes, sidecars: dict[bytes, bytes]) -> tuple[Path, Path] | None:
+        """The image's caption file in the source folder and its place in the trash, which it follows the image to:
+        the imported one, or else the same-stem .txt ``picurate-tag export`` wrote (``sidecars``: their digests)."""
         row = self.items[item]
-        if row["caption_path"] is None:
+        if row["caption_path"] is not None:
+            relative = safe_relative(row["caption_path"])
+        elif item in sidecars:
+            relative = safe_relative(row["path"]).with_suffix(".txt")
+        else:
             return None
-        relative = safe_relative(row["caption_path"])
         source = row["source_id"]
         return (
             self.sources[source] / relative,
             self.directory / TRASH / f"{self.sources[source].name}-{source.hex()[:8]}" / relative,
         )
+
+    def _move_caption(self, item: bytes, inside: bool, sidecars: dict[bytes, bytes]) -> None:
+        """Move the image's caption file into the trash (``inside``) or out of it, if it is only at the other place.
+        A caption file export wrote moves only while it is unchanged since."""
+        captions = self._caption_paths(item, sidecars)
+        if captions is None:
+            return
+        source, target = captions if inside else captions[::-1]
+        if not source.exists() or target.exists():
+            return
+        if self.items[item]["caption_path"] is None and file_digest(source) != sidecars[item]:
+            return
+        move_file(source, target)
 
     def import_images(
         self,
@@ -427,7 +447,10 @@ class Project:
     # Human decisions.
 
     def derived_caption(self, item: bytes) -> str:
-        return self.items[item]["caption"] or ""
+        """The caption of an item no person edited: imported and tag captions combined (see
+        :mod:`picurate.project.captions`)."""
+        generated, options, combine = tag_captions.generated_captions(self.directory / tag_captions.TAGS, [item])
+        return tag_captions.combine(self.items[item]["caption"], generated.get(item), combine, options.separator)[0]
 
     def _decisions(self, item: bytes | None = None) -> dict[bytes, dict]:
         query = "SELECT item, field, value FROM state" + (" WHERE item = ?" if item is not None else "")
@@ -455,7 +478,9 @@ class Project:
         """Items a person excluded (force exclude); they take no part in matching."""
         return {item for item, fields in self._decisions().items() if (fields.get("exclusion") or {}).get("decision") == "exclude"}
 
-    def _state(self, item: bytes, decisions: dict) -> dict:
+    def _state(self, item: bytes, decisions: dict, captions: tuple | None) -> dict:
+        """``captions`` is what :func:`~picurate.project.captions.generated_captions` returned, or None to leave the
+        caption out (``caption`` is then missing, so such a state cannot be saved)."""
         row = self.items[item]
         state = {
             "item_id": item,
@@ -464,8 +489,15 @@ class Project:
             **{field: json.loads(json.dumps(default)) for field, default in DEFAULTS.items()},
             **decisions,
         }
+        if captions is None:
+            del state["caption"]
+            return state
+        generated, options, combine = captions
+        state["caption_source"], state["tags_stale"] = "human", False
         if state["caption"] is None:
-            state["caption"] = self.derived_caption(item)
+            tags = generated.get(item)
+            state["caption"], state["caption_source"] = tag_captions.combine(row["caption"], tags, combine, options.separator)
+            state["tags_stale"] = state["caption_source"] in ("tags", "combined") and tag_captions.stale(tags, row["mtime_ns"])
         return state
 
     @staticmethod
@@ -495,17 +527,24 @@ class Project:
         """Recompute ``excluded`` and ``excluded_by`` after ``state["exclusion"]`` changed."""
         self._combine_exclusion(state, self._review_losers(state["item_id"]))
 
+    def _captions(self, items: Collection[bytes] | None = None) -> tuple:
+        return tag_captions.generated_captions(self.directory / tag_captions.TAGS, items)
+
     def state(self, item: bytes) -> dict:
-        """The effective state of an item: its decisions over the defaults, with the derived caption if unedited, and
-        whether it is excluded (``excluded``, with ``excluded_by``)."""
-        state = self._state(item, self._decisions(item).get(item, {}))
+        """The effective state of an item: its decisions over the defaults, with the derived caption if unedited
+        (``caption_source``: human, imported, tags, combined or None; ``tags_stale``: rendered from scores of another
+        version of the file), and whether it is excluded (``excluded``, with ``excluded_by``)."""
+        state = self._state(item, self._decisions(item).get(item, {}), self._captions([item]))
         self._combine_exclusion(state, self._review_losers(item))
         return state
 
-    def states(self) -> list[dict]:
+    def states(self, captions: bool = True) -> list[dict]:
+        """Every item's :meth:`state`; without ``captions``, leaving out the caption, which needs every image's tag
+        scores rendered."""
         decisions = self._decisions()
         losers = self._review_losers()
-        states = [self._state(item, decisions.get(item, {})) for item in self.items]
+        generated = self._captions() if captions else None
+        states = [self._state(item, decisions.get(item, {}), generated) for item in self.items]
         for state in states:
             self._combine_exclusion(state, losers, decisions)
         return states
@@ -624,10 +663,11 @@ class Project:
     # The trash.
 
     def reconcile_trash(self) -> int:
-        """Move every image (and its imported caption file) to where its ``trashed`` field says it is, when it is
-        only at the other place: finishes the moves of an interrupted trash run or rollback. Returns the number
-        moved."""
+        """Move every image (and its caption file, see :meth:`_caption_paths`) to where its ``trashed`` field says it
+        is, when it is only at the other place: finishes the moves of an interrupted trash run or rollback. Returns
+        the number of images moved."""
         moved = 0
+        sidecars = tag_captions.sidecar_digests(self.directory / tag_captions.TAGS)
         candidates = set(self.trashed) | self._in_trash_directory()
         for item in candidates:
             if item not in self.items:
@@ -639,11 +679,7 @@ class Project:
             if source.exists() and not target.exists():
                 move_file(source, target)
                 moved += 1
-            captions = self._caption_paths(item)
-            if captions is not None:
-                source, target = captions if inside else captions[::-1]
-                if source.exists() and not target.exists():
-                    move_file(source, target)
+            self._move_caption(item, inside, sidecars)
         if moved:
             logger.warning("Finished %d moves into or out of the trash that an interrupted run left undone", moved)
         return moved
@@ -668,17 +704,18 @@ class Project:
         wanted = {"dedupe", "human"} if move_type == "all" else {move_type}
         return [
             state
-            for state in self.states()
+            for state in self.states(captions=False)
             if state["excluded"] and state["excluded_by"]["by"] in wanted and self.original_path(state["item_id"]).is_file()
         ]
 
     def trash_excluded(self, move_type: str = "all", progress: Callable[[int, int], None] = lambda done, total: None) -> int:
         """Move the :meth:`trash_candidates` into the project's trash as one operation (see :meth:`rollback`), with
-        their imported caption files. Returns the operation, or 0 when there was nothing to move."""
+        their caption files. Returns the operation, or 0 when there was nothing to move."""
         self.reconcile_trash()
         candidates = self.trash_candidates(move_type)
         if not candidates:
             return 0
+        sidecars = tag_captions.sidecar_digests(self.directory / tag_captions.TAGS)
         op = self.begin_op("trash", f"{len(candidates)} excluded images ({move_type})")
         for done, state in enumerate(candidates):
             progress(done, len(candidates))
@@ -696,9 +733,7 @@ class Project:
                     self._write(item, TRASHED, None, op)  # back where the operation started: no history entry
                     self.db.execute("COMMIT")
                 continue
-            captions = self._caption_paths(item)
-            if captions is not None and captions[0].exists() and not captions[1].exists():
-                move_file(*captions)
+            self._move_caption(item, True, sidecars)
         progress(len(candidates), len(candidates))
         return op
 

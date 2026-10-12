@@ -16,6 +16,10 @@ picurate-dataset-editor my-project   # a project directory, not the image direct
 3. **Export** writes PNG or lossless WebP plus a same-stem `.txt` per image, for every image except skipped ones,
    approved ones only, or the current one.
 
+An image's caption starts as its imported caption, combined with the tagger's when the project has been
+[tagged](tagger.md#tagging-a-project); editing it makes it the person's. The status bar says when a caption was
+rendered from the tag scores of an earlier version of the image, and Export counts such captions.
+
 F1 lists the keys. The ones used most: Z / X previous / next image (or the wheel), A / S crop / fill mode, D
 preview, C cycle Unreviewed → Approved → Skipped, E cycle the exclusion (automatic → force keep → force exclude),
 F focus the caption. In the caption box Tab accepts a completion,

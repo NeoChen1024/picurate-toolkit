@@ -48,6 +48,7 @@ from .tags import TagIndex
 
 # Automatic: excluded when a decided duplicate group does not keep the image.
 EXCLUSION_CHOICES = ("automatic", "force keep", "force exclude")
+STALE_TAGS = "Caption rendered from tag scores of an earlier version of this image — run picurate-tag update"
 
 
 class Window(QMainWindow):
@@ -450,7 +451,7 @@ class Window(QMainWindow):
         self.paths = [self.project.source_path(key) for key in self.item_ids]
         self.image_position.setText(f"Image 0 / {len(self.paths):,}")
         self.model = Thumbnails(self.paths, self.pool)
-        for i, state in enumerate(self.project.states()):
+        for i, state in enumerate(self.project.states(captions=False)):
             self.model.status[i] = state["review_status"]
             if state["excluded"]:
                 self.model.excluded[i] = self.exclusion_text(state)
@@ -627,6 +628,10 @@ class Window(QMainWindow):
         self.review.setCurrentText(self.state["review_status"])
         self.review.blockSignals(False)
         self.show_exclusion()
+        if self.state["tags_stale"]:
+            self.status_message.setText(STALE_TAGS)
+        elif self.status_message.text() == STALE_TAGS:
+            self.status_message.setText("")
         self.filename.setText(self.state["image"])
         self.set_ratio(self.ratio.currentText())
         self.refresh(True)
@@ -882,6 +887,7 @@ class Window(QMainWindow):
             return
         self.project.settings["format"] = fmt.currentText()
         self.project.save_settings()
+        stale = sum(state["tags_stale"] for state in states)
         snapshot = self.project.export_snapshot(states, fmt.currentText())
         directory = self.project.directory
         progress = QProgressDialog("Building output snapshot…", "Cancel", 0, len(states), self)
@@ -902,7 +908,16 @@ class Window(QMainWindow):
             QMessageBox.information(
                 self,
                 "Export Results",
-                "Cancelled — previous output preserved" if was_cancelled else f"Exported {count} images to {directory / 'output'}",
+                (
+                    "Cancelled — previous output preserved"
+                    if was_cancelled
+                    else f"Exported {count} images to {directory / 'output'}"
+                    + (
+                        f"\n{stale} captions come from tag scores of an earlier version of their image: run picurate-tag update."
+                        if stale
+                        else ""
+                    )
+                ),
             )
 
         def failed(error):

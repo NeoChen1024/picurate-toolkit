@@ -11,6 +11,8 @@ import torch
 from click.testing import CliRunner
 from safetensors.torch import save_file
 
+from picurate.project.captions import Generated, combine
+from picurate.project.project import Project
 from picurate.tagger import cli as cli_mod
 from picurate.tagger.captions import (
     Captioner,
@@ -260,7 +262,7 @@ class TagDBTests(unittest.TestCase):
                 self.assertEqual(list(again.tags), TAGS)
                 self.assertEqual(again.slices, vocab.slices)
                 self.assertEqual(again.thresholds, vocab.thresholds)
-                ((got_rec, probs),) = db.iter_scores(len(TAGS))
+                ((got_rec, probs),) = db.scores(None, len(TAGS))
                 self.assertEqual(got_rec, rec)
                 self.assertTrue(np.allclose(probs, np.where((SCENE >= 0.3) | (np.arange(len(TAGS)) >= 15), SCENE, 0)))
                 # same binding: fine; any difference: refused, or reset when asked
@@ -279,15 +281,19 @@ class TagDBTests(unittest.TestCase):
 class UpdateExportTests(unittest.TestCase):
     def test_interrupted_update_resumes_and_export_matches_run(self):
         with tempfile.TemporaryDirectory() as tmp:
-            model_dir, image_dir = os.path.join(tmp, "model"), os.path.join(tmp, "img")
+            tmp = os.path.realpath(tmp)
+            model_dir, image_dir, project_dir = (os.path.join(tmp, name) for name in ("model", "img", "project"))
             os.makedirs(model_dir)
             os.makedirs(image_dir)
             _write_tiny_checkpoint(model_dir)
             for i in range(5):
                 PIL.Image.new("RGB", (40 + i, 30), (40 * i, 0, 0)).save(os.path.join(image_dir, f"{i}.png"))
-            db = os.path.join(tmp, "tags.sqlite")
+            project = Project(project_dir, create=True)
+            project.import_images([image_dir])
+            project.close()
+            db = os.path.join(project_dir, "tags.sqlite")
             model = ["--model", model_dir, "--device", "cpu", "-b", "2", "-j", "1"]
-            update = ["update", image_dir, "-d", db, "--score-floor", "0"] + model
+            update = ["update", project_dir, "--score-floor", "0"] + model
             runner = CliRunner()
 
             real_store = TagDB.store
@@ -315,36 +321,74 @@ class UpdateExportTests(unittest.TestCase):
                 r = runner.invoke(cli, update, catch_exceptions=False)
             self.assertEqual(r.exit_code, 0, r.output)
 
-            # a different floor is a different binding
-            r = runner.invoke(cli, ["update", image_dir, "-d", db, "--score-floor", "0.5", "-f"] + model, catch_exceptions=False)
+            # a different floor is a different binding, and caption thresholds below it are refused
+            r = runner.invoke(cli, ["update", project_dir, "--score-floor", "0.5", "-f"] + model, catch_exceptions=False)
             self.assertEqual(r.exit_code, 0, r.output)
-            r = runner.invoke(cli, ["export", image_dir, "-d", db, "-t", "0.1"])
+            r = runner.invoke(cli, ["captions", project_dir, "-t", "0.1"])
             self.assertNotEqual(r.exit_code, 0)
             self.assertIn("0.5", r.output)
-            r = runner.invoke(cli, ["update", image_dir, "-d", db, "--score-floor", "0", "-f"] + model, catch_exceptions=False)
+            r = runner.invoke(cli, ["update", project_dir, "--score-floor", "0", "-f"] + model, catch_exceptions=False)
             self.assertEqual(r.exit_code, 0, r.output)
 
-            # export reproduces run's captions (fp32 on CPU, same batches)
+            # the project's captions reproduce run's (fp32 on CPU, same batches)
             for style in ("anima", "sdxl"):
                 run_out, exp_out = os.path.join(tmp, f"run_{style}.json"), os.path.join(tmp, f"exp_{style}.json")
                 caption = ["--style", style, "-t", "0.3", "--artist-threshold", "0.3"]
                 runner.invoke(cli, ["run", image_dir, "-o", run_out] + model + caption, catch_exceptions=False)
-                r = runner.invoke(cli, ["export", image_dir, "-d", db, "-o", exp_out] + caption, catch_exceptions=False)
+                r = runner.invoke(cli, ["captions", project_dir, "--preview", "0"] + caption, catch_exceptions=False)
+                self.assertEqual(r.exit_code, 0, r.output)
+                r = runner.invoke(cli, ["export", project_dir, "-o", exp_out], catch_exceptions=False)
                 self.assertEqual(r.exit_code, 0, r.output)
                 with open(run_out) as a, open(exp_out) as b:
-                    self.assertEqual(json.load(a), json.load(b))
+                    self.assertEqual(
+                        {k: v["tags"] for k, v in json.load(a).items()}, {k: v["tags"] for k, v in json.load(b).items()}
+                    )
 
-            # orphans and stale files
-            os.remove(os.path.join(image_dir, "0.png"))
+            # caption files: one made outside the project is left alone unless --force; the export's own are replaced
+            with open(os.path.join(image_dir, "0.txt"), "w") as f:
+                f.write("hand made\n")
+            r = runner.invoke(cli, ["export", project_dir], catch_exceptions=False)
+            self.assertIn("0.txt", r.output)
+            with open(os.path.join(image_dir, "0.txt")) as f:
+                self.assertEqual(f.read(), "hand made\n")
+            with open(os.path.join(image_dir, "1.txt")) as f:
+                sdxl = f.read()
+            runner.invoke(cli, ["captions", project_dir, "--style", "anima", "--preview", "0"], catch_exceptions=False)
+            runner.invoke(cli, ["export", project_dir], catch_exceptions=False)
+            with open(os.path.join(image_dir, "1.txt")) as f:
+                self.assertNotEqual(f.read(), sdxl)
+            with open(os.path.join(image_dir, "0.txt")) as f:
+                self.assertEqual(f.read(), "hand made\n")
+            runner.invoke(cli, ["export", project_dir, "--force"], catch_exceptions=False)
+            with open(os.path.join(image_dir, "0.txt")) as f:
+                self.assertNotEqual(f.read(), "hand made\n")
+            self.assertEqual([n for n in os.listdir(image_dir) if "partial" in n], [])
+
+            # a changed image keeps its old scores, with a warning, until update re-tags it alone
             os.utime(os.path.join(image_dir, "1.png"), (1_000, 1_000))
+            project = Project(project_dir)
+            project.sync()
+            project.close()
             with self.assertLogs("picurate.tagger.cli", level="WARNING") as logs:
-                r = runner.invoke(cli, ["export", image_dir, "-d", db], catch_exceptions=False)
+                runner.invoke(cli, ["export", project_dir], catch_exceptions=False)
             self.assertTrue(any("1.png" in m for m in logs.output))
-            self.assertFalse(os.path.exists(os.path.join(image_dir, "1.txt")))
-            self.assertTrue(os.path.exists(os.path.join(image_dir, "2.txt")))
-            r = runner.invoke(cli, update, catch_exceptions=False)
-            self.assertEqual(r.exit_code, 0, r.output)
-            self.assertEqual(sorted(r.path for r in TagDB(db).records()), ["1.png", "2.png", "3.png", "4.png"])
+            with mock.patch.object(cli_mod, "run_pipeline", wraps=cli_mod.run_pipeline) as pipe:
+                runner.invoke(cli, update, catch_exceptions=False)
+                self.assertEqual([i.path for i in pipe.call_args.args[1]], ["1.png"])
+
+
+class CombineTests(unittest.TestCase):
+    def test_modes(self):
+        tags = Generated(["1girl", "long hair", "smile"], 0.0)
+        self.assertEqual(combine("Long_Hair, red eyes\n", tags, "skip", ", "), ("Long_Hair, red eyes\n", "imported"))
+        self.assertEqual(combine("Long_Hair, red eyes\n", tags, "overwrite", ", "), ("1girl, long hair, smile", "tags"))
+        self.assertEqual(
+            combine("Long_Hair, red eyes\n", tags, "append", ", "), ("Long_Hair, red eyes, 1girl, long hair, smile", "combined")
+        )
+        self.assertEqual(combine("Long_Hair, red eyes\n", tags, "merge", ", "), ("Long_Hair, red eyes, 1girl, smile", "combined"))
+        self.assertEqual(combine(None, tags, "skip", ", "), ("1girl, long hair, smile", "tags"))
+        self.assertEqual(combine("keep", None, "overwrite", ", "), ("keep", "imported"))
+        self.assertEqual(combine("1girl, smile, long hair", tags, "append", ", "), ("1girl, smile, long hair", "imported"))
 
 
 if __name__ == "__main__":
