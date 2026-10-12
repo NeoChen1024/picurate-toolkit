@@ -18,7 +18,7 @@ from typing import TypeVar
 import PIL.Image
 import torch
 
-from .images import ImageRecord
+from .images import ImageRecord, Item, Roots
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ P = TypeVar("P")  # a submitted batch
 
 
 def _load_image(
-    preprocessor: Callable[[PIL.Image.Image], A], image_dir: str, relative_path: str
+    preprocessor: Callable[[PIL.Image.Image], A], image_path: str, item: Item
 ) -> tuple[str, tuple[ImageRecord, A] | Exception]:
     """Worker: decode one image and run the model's full preprocessing (resize, normalize, patchify, dtype cast).
 
@@ -39,17 +39,16 @@ def _load_image(
     Any failure here means "skip this file", so the catch is deliberately broad: a corrupt file must not take the
     whole run down, and Pillow raises a wide variety of exception types for broken inputs.
     """
-    image_path = os.path.join(image_dir, relative_path)
     try:
         st = os.stat(image_path)
         with PIL.Image.open(image_path) as img:
-            fmt = img.format or os.path.splitext(relative_path)[1].lstrip(".").upper()
+            fmt = img.format or os.path.splitext(item.path)[1].lstrip(".").upper()
             width, height = img.size
             arrays = preprocessor(img)
-        record = ImageRecord(relative_path, st.st_mtime, st.st_size, width, height, fmt)
-        return relative_path, (record, arrays)
+        record = ImageRecord(item.path, st.st_mtime, st.st_size, width, height, fmt, item.source_id, item.id)
+        return image_path, (record, arrays)
     except Exception as e:  # noqa: BLE001 - see docstring
-        return relative_path, e
+        return image_path, e
 
 
 @contextlib.contextmanager
@@ -80,8 +79,8 @@ def default_workers() -> int:
 
 
 def run_pipeline(
-    image_dir: str,
-    candidates: Sequence[str],
+    roots: Roots,
+    candidates: Sequence[Item],
     preprocessor: Callable[[PIL.Image.Image], A],
     submit: Callable[[list[A]], P],
     finish: Callable[[list[ImageRecord], P], object],
@@ -90,7 +89,7 @@ def run_pipeline(
     workers: int | None = None,
     progress: Callable[[int], object] | None = None,
 ) -> int:
-    """Decode ``candidates`` in ``workers`` processes and feed them to a model in batches. Returns #images finished.
+    """Decode ``candidates`` (found under ``roots``) in ``workers`` processes and feed them to a model in batches. Returns #images finished.
 
     Three stages overlap:
 
@@ -141,8 +140,8 @@ def run_pipeline(
         pending_jobs: set[Future] = set()
 
         def refill() -> None:
-            for rel in todo:
-                pending_jobs.add(pool.submit(_load_image, preprocessor, image_dir, rel))
+            for item in todo:
+                pending_jobs.add(pool.submit(_load_image, preprocessor, item.file(roots), item))
                 if len(pending_jobs) >= window:
                     break
 
@@ -152,9 +151,9 @@ def run_pipeline(
             while pending_jobs:
                 done, pending_jobs = wait(pending_jobs, return_when=FIRST_COMPLETED)
                 for future in done:
-                    rel, result = future.result()
+                    image_path, result = future.result()
                     if isinstance(result, Exception):
-                        logger.warning("Skipping %s: %s", os.path.join(image_dir, rel), result)
+                        logger.warning("Skipping %s: %s", image_path, result)
                     else:
                         batch.append(result)
                         if len(batch) >= batch_size:

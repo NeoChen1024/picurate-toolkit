@@ -6,7 +6,7 @@ from unittest import mock
 import numpy as np
 from click.testing import CliRunner
 
-from picurate.common.images import ImageRecord
+from picurate.common.images import ImageRecord, Item
 from picurate.dedupe import cli as cli_mod
 from picurate.dedupe import review as rv
 from picurate.dedupe.cli import cli
@@ -21,6 +21,10 @@ def rec(path, size=1, w=1, h=1, mtime=0.0):
 LARGEST = builtin_policies()["largest"]
 
 
+def I(path):
+    return Item.standalone(path).id
+
+
 class ReviewDBTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -32,7 +36,7 @@ class ReviewDBTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def groups(self, *specs):
-        return [([self.recs[p] for p in members], edges) for members, edges in specs]
+        return [([self.recs[p] for p in members], [(I(a), I(b), d) for a, b, d in edges]) for members, edges in specs]
 
     def test_upsert_new_predecided_kept_stale(self):
         stats = self.db.upsert_groups(
@@ -46,9 +50,9 @@ class ReviewDBTests(unittest.TestCase):
         self.assertEqual(g2.status, "pending")
         keeps = {m.path: m.keep for m in self.db.members(g1.id)}
         self.assertEqual(keeps, {"a.png": False, "b.png": True})  # largest wins
-        self.assertEqual(self.db.edges(g2.id), [("c.png", "d.png", 0.4)])
+        self.assertEqual(self.db.edges(g2.id), [(I("c.png"), I("d.png"), 0.4)])
         # the reviewer changes group 2, then a re-match keeps group 2 as is and replaces group 1 by a bigger one
-        self.db.keep_only(g2.id, "d.png")
+        self.db.keep_only(g2.id, I("d.png"))
         stats = self.db.upsert_groups(
             self.groups(
                 (["a.png", "b.png", "e.png"], [("a.png", "b.png", 0.05), ("b.png", "e.png", 0.3)]),
@@ -63,13 +67,13 @@ class ReviewDBTests(unittest.TestCase):
         self.assertEqual((g2b.status, g2b.min_distance), ("decided", 0.41))
         self.assertEqual({m.path: m.keep for m in self.db.members(g2.id)}, {"c.png": False, "d.png": True})
         self.assertNotIn(g1.id, [g.id for g in self.db.groups()])
-        self.assertEqual(self.db.groups_of("b.png"), [g1.id, [g.id for g in self.db.groups("pending")][0]])
+        self.assertEqual(self.db.groups_of(I("b.png")), [g1.id, [g.id for g in self.db.groups("pending")][0]])
 
     def test_decide_undo_and_status_checks(self):
         self.db.upsert_groups(self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.4)])), LARGEST, 0.1)
         gid = self.db.groups()[0].id
         self.assertFalse(self.db.undo(gid))  # only the initial snapshot
-        self.db.decide(gid, keeps={"a.png": True}, note="both are fine")
+        self.db.decide(gid, keeps={I("a.png"): True}, note="both are fine")
         self.db.decide(gid, status="skipped")
         self.assertEqual(self.db.group(gid).status, "skipped")
         self.assertTrue(self.db.undo(gid))
@@ -82,11 +86,11 @@ class ReviewDBTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.db.decide(gid, status="bogus")
         with self.assertRaises(KeyError):
-            self.db.decide(gid, keeps={"zzz": True})
+            self.db.decide(gid, keeps={I("zzz"): True})
 
     def test_pixel_results_decide_the_starting_status(self):
         same, diff = PixelVerdict.measured(1.0, 0.5), PixelVerdict.measured(40.0, 0.5)
-        pixel = {("a.png", "b.png"): same, ("c.png", "d.png"): diff}
+        pixel = {(I("a.png"), I("b.png")): same, (I("c.png"), I("d.png")): diff}
         # a, b are far apart by embedding but identical by pixels; c, d are close by embedding but edited
         stats = self.db.upsert_groups(
             self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.6)]), (["c.png", "d.png"], [("c.png", "d.png", 0.05)])),
@@ -98,7 +102,7 @@ class ReviewDBTests(unittest.TestCase):
         by_first = {self.db.members(g.id)[0].path: g for g in self.db.groups()}
         self.assertEqual((by_first["a.png"].status, by_first["a.png"].pixel), ("decided", "same"))
         self.assertEqual((by_first["c.png"].status, by_first["c.png"].pixel), ("pending", "different"))
-        self.assertEqual(self.db.edge_pixels(by_first["c.png"].id), {("c.png", "d.png"): diff})
+        self.assertEqual(self.db.edge_pixels(by_first["c.png"].id), {(I("c.png"), I("d.png")): diff})
         self.assertEqual(self.db.groups(pixel="same"), [self.db.group(by_first["a.png"].id)])
 
     def test_untouched_groups_are_rederived_touched_ones_are_not(self):
@@ -107,14 +111,19 @@ class ReviewDBTests(unittest.TestCase):
         g_ab, g_cd = self.db.groups()
         self.db.decide(g_cd.id, note="looked at it")
         same = PixelVerdict.measured(1.0, 0.5)
-        stats = self.db.upsert_groups(self.groups(*specs), LARGEST, 0.1, {("a.png", "b.png"): same, ("c.png", "d.png"): same})
+        stats = self.db.upsert_groups(
+            self.groups(*specs), LARGEST, 0.1, {(I("a.png"), I("b.png")): same, (I("c.png"), I("d.png")): same}
+        )
         self.assertEqual((stats.redecided, stats.reopened), (1, 0))
         self.assertEqual(self.db.group(g_ab.id).status, "decided")
         self.assertEqual(self.db.group(g_cd.id).status, "pending")  # the reviewer's group is left alone
         self.assertFalse(self.db.undo(g_ab.id))  # the history restarted from the new starting point
         # and an untouched decided group whose pixels now differ goes back to review
         stats = self.db.upsert_groups(
-            self.groups(*specs), LARGEST, 0.1, {("a.png", "b.png"): PixelVerdict.measured(50.0, 0.5), ("c.png", "d.png"): same}
+            self.groups(*specs),
+            LARGEST,
+            0.1,
+            {(I("a.png"), I("b.png")): PixelVerdict.measured(50.0, 0.5), (I("c.png"), I("d.png")): same},
         )
         self.assertEqual((stats.redecided, stats.reopened), (0, 1))
         self.assertEqual(self.db.group(g_ab.id).status, "pending")
@@ -126,9 +135,9 @@ class ReviewDBTests(unittest.TestCase):
             0.1,
         )
         g1, g2 = self.db.groups()
-        self.db.decide(g2.id, keeps={"c.png": False, "d.png": False})  # unticked after deciding: allowed, but flagged
+        self.db.decide(g2.id, keeps={I("c.png"): False, I("d.png"): False})  # unticked after deciding: allowed, but flagged
         moves = self.db.plan_apply()
-        self.assertEqual([(m.group_id, m.path, m.keep) for m in moves], [(g1.id, "a.png", ("b.png",))])
+        self.assertEqual([(m.group_id, m.member.path, m.keep) for m in moves], [(g1.id, "a.png", ("b.png",))])
         self.assertEqual([(g.id, g.kept) for g in self.db.groups("decided", keeps_nothing=True)], [(g2.id, 0)])
         with self.assertRaises(ValueError):
             self.db.decide(g2.id, status="decided")  # deciding it again needs a keep or the discard mark
@@ -137,13 +146,13 @@ class ReviewDBTests(unittest.TestCase):
         self.db.upsert_groups(self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.4)])), LARGEST, 0.1)
         gid = self.db.groups()[0].id
         with self.assertRaises(ValueError):
-            self.db.decide(gid, keeps={"b.png": False}, status="decided")
+            self.db.decide(gid, keeps={I("b.png"): False}, status="decided")
         self.db.discard(gid)
         g = self.db.group(gid)
         self.assertEqual((g.status, g.discard, g.kept, g.touched), ("decided", True, 0, True))
         self.assertEqual(self.db.groups(keeps_nothing=True), [])
         self.assertEqual(self.db.groups(discarded=True), [g])
-        self.assertEqual(sorted((m.path, m.keep) for m in self.db.plan_apply()), [("a.png", ()), ("b.png", ())])
+        self.assertEqual(sorted((m.member.path, m.keep) for m in self.db.plan_apply()), [("a.png", ()), ("b.png", ())])
         # a re-match leaves the reviewer's discard alone
         self.db.upsert_groups(self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.4)])), LARGEST, 0.1)
         g2 = self.db.group(gid)
@@ -152,7 +161,7 @@ class ReviewDBTests(unittest.TestCase):
         g = self.db.group(gid)
         self.assertEqual((g.status, g.discard, g.kept), ("pending", False, 1))
         self.db.discard(gid)
-        self.db.decide(gid, keeps={"a.png": True})  # ticking a keep takes the mark back
+        self.db.decide(gid, keeps={I("a.png"): True})  # ticking a keep takes the mark back
         g = self.db.group(gid)
         self.assertEqual((g.status, g.discard, g.kept), ("decided", False, 1))
         with self.assertRaises(ValueError):
@@ -206,47 +215,6 @@ class ApplyTests(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.img, "sub", "b.png")))
         self.assertEqual(self.db.group(g1.id).status, "decided")
         self.assertEqual(self.db.applied(), [])
-
-
-class MigrationTests(unittest.TestCase):
-    def test_schema_1_file_gains_columns_and_touched_from_history(self):
-        import sqlite3
-
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "old.review.sqlite")
-            con = sqlite3.connect(path)
-            con.executescript("""CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                   INSERT INTO meta VALUES ('schema_version', '1');
-                   CREATE TABLE groups (id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, n INTEGER NOT NULL, min_distance REAL NOT NULL,
-                       max_distance REAL NOT NULL, status TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', updated_at REAL NOT NULL);
-                   CREATE TABLE edges (group_id INTEGER NOT NULL, path_a TEXT NOT NULL, path_b TEXT NOT NULL, distance REAL NOT NULL);
-                   CREATE TABLE history (id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL, at REAL NOT NULL, keep_json TEXT NOT NULL,
-                       status TEXT NOT NULL, note TEXT NOT NULL);
-                   INSERT INTO meta VALUES ('policy', 'largest');
-                   CREATE TABLE members (group_id INTEGER NOT NULL, path TEXT NOT NULL, keep INTEGER NOT NULL, width INTEGER NOT NULL,
-                       height INTEGER NOT NULL, size INTEGER NOT NULL, format TEXT NOT NULL, mtime REAL NOT NULL, distance_to_winner REAL,
-                       PRIMARY KEY (group_id, path));
-                   INSERT INTO groups VALUES (1, 'k1', 2, 0.4, 0.4, 'pending', '', 0), (2, 'k2', 2, 0.4, 0.4, 'decided', '', 0),
-                       (3, 'k3', 2, 0.4, 0.4, 'pending', '', 0), (4, 'k4', 2, 0.4, 0.4, 'pending', '', 0);
-                   INSERT INTO members VALUES (3, 'a', 0, 1, 1, 1, 'PNG', 0, NULL), (3, 'b', 1, 1, 1, 9, 'PNG', 0, NULL),
-                       (4, 'a', 1, 1, 1, 1, 'PNG', 0, NULL), (4, 'b', 0, 1, 1, 9, 'PNG', 0, NULL);
-                   INSERT INTO history VALUES (1, 1, 0, '{"a": true}', 'pending', ''), (2, 1, 1, '{"a": true}', 'pending', ''),
-                       (3, 2, 0, '{"a": true}', 'pending', ''), (4, 2, 1, '{"a": true}', 'decided', ''),
-                       (5, 3, 0, '{"a": true, "b": false}', 'pending', ''), (6, 3, 1, '{"a": false, "b": true}', 'pending', ''),
-                       (7, 4, 0, '{"a": false, "b": true}', 'pending', ''), (8, 4, 1, '{"a": true, "b": false}', 'pending', '');""")
-            con.commit()
-            con.close()
-            with rv.ReviewDB(path) as db:
-                self.assertEqual(db.get_meta("schema_version"), rv.SCHEMA_VERSION)
-                # 1: no-op snapshots; 2: decided by hand; 3: keeps moved to what "largest" picks (a bulk Policy
-                # pick); 4: keeps moved away from the policy's choice by hand
-                self.assertEqual(
-                    [(g.id, g.touched, g.pixel) for g in db.groups()],
-                    [(1, False, None), (2, True, None), (3, False, None), (4, True, None)],
-                )
-                self.assertFalse(any(g.discard for g in db.groups()))
-                self.assertTrue(db.undo(4))  # history rows from before the discard column restore as not discarded
-                self.assertFalse(db.group(4).discard)
 
 
 class CliReviewTests(unittest.TestCase):

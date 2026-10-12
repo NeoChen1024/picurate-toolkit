@@ -17,7 +17,7 @@ import click
 import torch
 import tqdm
 
-from ..common.images import ImageRecord, is_image_path, list_directory_relative
+from ..common.images import ImageRecord, Item, Roots, standalone_items, standalone_roots
 from ..common.log import setup_logging
 from ..common.pipeline import run_pipeline
 from .captions import (
@@ -45,9 +45,11 @@ _DEFAULT_ALWAYS_FIRST = {"anima": "", "sdxl": "1girl,1boy"}
 # -- helpers ---------------------------------------------------------------------------------------------------------
 
 
-def _list_images(image_dir: str, recursive: bool, include_hidden: bool) -> list[str]:
-    rels = list_directory_relative(image_dir, recursive=recursive, include_hidden=include_hidden)
-    return sorted(r for r in rels if is_image_path(r))
+def _mtime(item: Item, roots: Roots) -> float | None:
+    try:
+        return os.path.getmtime(item.file(roots))
+    except OSError:
+        return None
 
 
 def _caption_path(image_dir: str, rel: str, extension: str) -> str:
@@ -281,9 +283,9 @@ def run(image_dir: str, recursive: bool, include_hidden: bool, verbose: bool, **
     """
     setup_logging(verbose)
     options, writer, frequency = _caption_setup(image_dir, kw)
-    images = _list_images(image_dir, recursive, include_hidden)
+    images = standalone_items(image_dir, recursive=recursive, include_hidden=include_hidden)
     if writer.existing == "skip":
-        images = [r for r in images if not writer.has_caption(r)]
+        images = [i for i in images if not writer.has_caption(i.path)]
     logger.info("%d images to tag", len(images))
     if not images:
         return
@@ -298,7 +300,9 @@ def run(image_dir: str, recursive: bool, include_hidden: bool, verbose: bool, **
 
     with tqdm.tqdm(total=len(images), desc="Tagging", unit="image") as bar:
         try:
-            done = run_pipeline(image_dir, images, tagger.get_preprocessor(), tagger.submit, finish, progress=bar.update, **kw)
+            done = run_pipeline(
+                standalone_roots(image_dir), images, tagger.get_preprocessor(), tagger.submit, finish, progress=bar.update, **kw
+            )
         except KeyboardInterrupt:
             hint = "The JSON output was not written." if writer.output_path else "Rerun with --existing skip to continue."
             raise _interrupted(hint) from None
@@ -353,16 +357,21 @@ def update(
     interrupted update (Ctrl-C, crash, power loss) resumes where it stopped when run again.
     """
     setup_logging(verbose)
-    images = _list_images(image_dir, recursive, include_hidden)
-    with TagDB(db) as store:
+    roots = standalone_roots(image_dir)
+    images = standalone_items(image_dir, recursive=recursive, include_hidden=include_hidden)
+    try:
+        store = TagDB(db, rebuild=force_update)
+    except TagDBMismatchError as e:
+        raise click.ClickException(str(e)) from e
+    with store:
         index = store.load_index()
         if clean_orphans:
-            listed = set(images)
-            orphans = [p for p in index if p not in listed and not os.path.exists(os.path.join(image_dir, p))]
-            if orphans:
-                logger.info("Removing %d database entries whose image is gone", len(orphans))
-                store.delete(orphans)
-        candidates = images if force_update else [r for r in images if index.get(r) != os.path.getmtime(os.path.join(image_dir, r))]
+            listed = {i.id for i in images}
+            gone = [r for r in store.records() if r.id not in listed and not os.path.exists(r.file(roots))]
+            if gone:
+                logger.info("Removing %d database entries whose image is gone", len(gone))
+                store.delete([r.id for r in gone])
+        candidates = images if force_update else [i for i in images if index.get(i.id) != _mtime(i, roots)]
         logger.info("%d images, %d already tagged, %d to tag", len(images), len(images) - len(candidates), len(candidates))
         if not candidates:
             return
@@ -384,7 +393,7 @@ def update(
 
         with tqdm.tqdm(total=len(candidates), desc="Tagging", unit="image") as bar:
             try:
-                run_pipeline(image_dir, candidates, tagger.get_preprocessor(), tagger.submit, finish, progress=bar.update, **kw)
+                run_pipeline(roots, candidates, tagger.get_preprocessor(), tagger.submit, finish, progress=bar.update, **kw)
             except KeyboardInterrupt:
                 raise _interrupted(
                     f"{stored} images stored this run, {len(store)} in the database; run the same command again to resume."
@@ -406,7 +415,11 @@ def export(image_dir: str, db: str, verbose: bool, **kw) -> None:
     """
     setup_logging(verbose)
     options, writer, frequency = _caption_setup(image_dir, kw)
-    with TagDB(db, create=False) as store:
+    try:
+        store = TagDB(db, create=False)
+    except TagDBMismatchError as e:
+        raise click.ClickException(str(e)) from e
+    with store:
         vocab = store.vocabulary()
         floor = store.score_floor or 0.0
         captioner = Captioner(vocab, options)

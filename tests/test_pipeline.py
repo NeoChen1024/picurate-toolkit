@@ -6,9 +6,14 @@ from unittest import mock
 import numpy as np
 import PIL.Image
 
+from picurate.common.images import standalone_items, standalone_roots
 from picurate.dedupe import encoding_pipeline
 from picurate.dedupe.db_store import load_database
-from picurate.dedupe.encoding_pipeline import update_database
+from picurate.dedupe.encoding_pipeline import update_database as _update_database
+
+
+def update_database(encoder, image_dir, db_path, **kw):
+    _update_database(encoder, standalone_roots(image_dir), standalone_items(image_dir), db_path, **kw)
 
 
 def _fake_preprocess(img):
@@ -67,7 +72,7 @@ class PipelineTests(unittest.TestCase):
             # second run: only the unreadable file is retried (it has no row), nothing else is re-encoded
             with mock.patch.object(encoding_pipeline, "encode_images", return_value=0) as enc:
                 update_database(StubEncoder(), image_dir, db_path)
-                self.assertEqual(list(enc.call_args.args[3]), ["broken.jpg"])
+                self.assertEqual([i.path for i in enc.call_args.args[3]], ["broken.jpg"])
             os.remove(os.path.join(image_dir, "broken.jpg"))
 
             # modify one, delete one -> one re-encode, one orphan removed
@@ -75,13 +80,13 @@ class PipelineTests(unittest.TestCase):
             os.remove(os.path.join(image_dir, "c.gif"))
             with mock.patch.object(encoding_pipeline, "encode_images", return_value=1) as enc:
                 update_database(StubEncoder(), image_dir, db_path)
-                self.assertEqual(list(enc.call_args.args[3]), ["a.png"])
+                self.assertEqual([i.path for i in enc.call_args.args[3]], ["a.png"])
             self.assertEqual([r.path for r in load_database(db_path)[0]], ["a.png", "d.webp", "sub/b.jpg"])
 
             # force update re-encodes everything
             with mock.patch.object(encoding_pipeline, "encode_images", return_value=3) as enc:
                 update_database(StubEncoder(), image_dir, db_path, force_update=True)
-                self.assertEqual(sorted(enc.call_args.args[3]), ["a.png", "d.webp", "sub/b.jpg"])
+                self.assertEqual(sorted(i.path for i in enc.call_args.args[3]), ["a.png", "d.webp", "sub/b.jpg"])
 
 
 if __name__ == "__main__":

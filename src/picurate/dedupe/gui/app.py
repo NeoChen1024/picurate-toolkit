@@ -74,7 +74,10 @@ def main(
     from .window import ReviewWindow
 
     app = QApplication.instance() or QApplication(sys.argv[:1])
-    window = ReviewWindow(path, image_dir=image_dir, trash_dir=trash_dir, policies=policies, prefetch=prefetch)
+    try:
+        window = ReviewWindow(path, image_dir=image_dir, trash_dir=trash_dir, policies=policies, prefetch=prefetch)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
     window.show()
     sys.exit(app.exec())
 

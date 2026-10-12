@@ -31,7 +31,8 @@ picurate-dataset-editor my-dataset
 Every imported directory, or the directory of an imported file, is a source folder, recorded once an image is
 imported from it. It gets a random 256-bit ID; an image is identified by its source ID and its path relative to the
 source folder, and its item ID is derived from both (BLAKE3 in key-derivation mode, context `picurate item_id v1`,
-over the source ID, a NUL byte and the path). The databases key everything by the item ID.
+over the source ID, a NUL byte and the path). The embedding, review and tag databases key everything by the item ID;
+a standalone image directory has the all-zero source ID, so its databases use the same IDs.
 
 **Relink Sources** in the editor points a source folder somewhere else after checking the contents of every image in
 it; the IDs do not change. An image that is missing or changed keeps its caption and review status editable, but

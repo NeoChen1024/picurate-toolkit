@@ -251,7 +251,7 @@ class TagDBTests(unittest.TestCase):
                 db.bind(Binding("m@1", "fp16", 0.3), vocab)
                 db.store([(rec, SCENE)], vocab)
                 db.store([(rec, SCENE)], vocab)  # replacing an image does not duplicate it
-                self.assertEqual(db.load_index(), {"x/a.png": 1.5})
+                self.assertEqual(db.load_index(), {rec.id: 1.5})
                 stored = {TAGS[i]: p for i, p in db.conn.execute("SELECT tag_id, prob FROM scores")}
                 # everything >= 0.3 plus all four ratings, even the zero ones
                 expected = {t for t in TAGS if SCENE[TAGS.index(t)] >= 0.3} | {"rating:s", "rating:g", "rating:q", "rating:e"}
@@ -272,7 +272,7 @@ class TagDBTests(unittest.TestCase):
                 self.assertEqual(len(db), 0)
                 self.assertEqual(db.conn.execute("SELECT COUNT(*) FROM scores").fetchone()[0], 0)
                 db.store([(rec, SCENE)], vocab)
-                db.delete(["x/a.png"])
+                db.delete([rec.id])
                 self.assertEqual(db.conn.execute("SELECT COUNT(*) FROM scores").fetchone()[0], 0)  # cascades
 
 
@@ -344,7 +344,7 @@ class UpdateExportTests(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(image_dir, "2.txt")))
             r = runner.invoke(cli, update, catch_exceptions=False)
             self.assertEqual(r.exit_code, 0, r.output)
-            self.assertEqual(sorted(TagDB(db).load_index()), ["1.png", "2.png", "3.png", "4.png"])
+            self.assertEqual(sorted(r.path for r in TagDB(db).records()), ["1.png", "2.png", "3.png", "4.png"])
 
 
 if __name__ == "__main__":

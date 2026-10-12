@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ...common.images import standalone_roots
 from ..keeping import Policy, load_policies
 from ..review import GroupRow, MemberRow, ReviewDB, apply_decisions, unapply_group
 from .canvas import CompareCanvas
@@ -76,6 +77,7 @@ class ReviewWindow(QMainWindow):
         super().__init__()
         self.review = ReviewDB(review_path)
         self.image_dir = image_dir or self.review.get_meta("image_dir") or "."
+        self.roots = standalone_roots(self.image_dir)
         self.trash_dir = trash_dir
         self.policies = policies or load_policies()
         self.policy = self.policies.get(self.review.get_meta("policy") or "largest") or next(iter(self.policies.values()))
@@ -309,10 +311,10 @@ class ReviewWindow(QMainWindow):
         self.note.setText(group.note)
         self.note.blockSignals(False)
         self._show_members()
-        names = {m.path: str(i + 1) for i, m in enumerate(self.members)}
+        names = {m.item: str(i + 1) for i, m in enumerate(self.members)}
         pixels = self.review.edge_pixels(group.id)
 
-        def edge_text(a: str, b: str, d: float) -> str:
+        def edge_text(a: bytes, b: bytes, d: float) -> str:
             text = f"{names.get(a, '?')}–{names.get(b, '?')}: {d:.3f}"
             v = pixels.get((a, b))
             if v is None:
@@ -332,7 +334,7 @@ class ReviewWindow(QMainWindow):
         self._prefetch()
 
     def _pair_of(self, group: GroupRow) -> tuple[str, str | None]:
-        """The A/B paths :meth:`show_group` would pick for ``group``, without touching the window state."""
+        """The A/B files :meth:`show_group` would pick for ``group``, without touching the window state."""
         members = self.review.members(group.id)
         if not members:
             return "", None
@@ -344,7 +346,7 @@ class ReviewWindow(QMainWindow):
             b = self._nearest(a, self.review.edges(group.id))
         finally:
             self.members = saved
-        return members[a].path, members[b].path if b != a else None
+        return members[a].file(self.roots), members[b].file(self.roots) if b != a else None
 
     def _prefetch(self) -> None:
         """Queue the full images of the next groups in the direction of travel, at low priority, and drop queued
@@ -355,7 +357,7 @@ class ReviewWindow(QMainWindow):
             rows = (r for r in rows if self.groups_model.groups[r].status == "pending")  # type: ignore[assignment]
         self.prefetch_pairs = [self._pair_of(self.groups_model.groups[r]) for r in itertools.islice(rows, self.prefetch_depth)]
         wanted = [p for pair in self.prefetch_pairs for p in pair if p]
-        current = {self.members[self.a].path, self.members[self.b].path} if self.members else set()
+        current = {self.members[self.a].file(self.roots), self.members[self.b].file(self.roots)} if self.members else set()
         for path, job in list(self.loading.items()):
             if path not in wanted and path not in current and job.cancel():
                 del self.loading[path]  # one that already started finishes and lands in the cache
@@ -366,20 +368,19 @@ class ReviewWindow(QMainWindow):
     def _load_image(self, path: str, pool: QThreadPool) -> None:
         if path in self.images or path in self.loading:
             return
-        full = os.path.join(self.image_dir, path)
 
         def read(signals):
-            im = load_image(full)
+            im = load_image(path)
             return path, im, qimage(im)
 
         job = Job(read).connect(self._image_loaded, lambda error: self._image_failed(path, error))
         self.loading[path] = job
         pool.start(job)
 
-    def _nearest(self, i: int, edges: list[tuple[str, str, float]]) -> int:
+    def _nearest(self, i: int, edges: list[tuple[bytes, bytes, float]]) -> int:
         """The member closest to member ``i`` by the stored edges (edges are sorted by distance), else another one."""
-        index = {m.path: k for k, m in enumerate(self.members)}
-        me = self.members[i].path
+        index = {m.item: k for k, m in enumerate(self.members)}
+        me = self.members[i].item
         for a, b, _ in edges:
             if a == me and b in index:
                 return index[b]
@@ -427,11 +428,11 @@ class ReviewWindow(QMainWindow):
             item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if m.keep else Qt.CheckState.Unchecked)
             item.setData(Qt.ItemDataRole.UserRole, i)
-            pix = self.thumbs.get(m.path)
+            pix = self.thumbs.get(m.file(self.roots))
             if pix is not None:
                 item.setIcon(QIcon(pix))
             else:
-                self._request_thumbnail(m.path)
+                self._request_thumbnail(m.file(self.roots))
             self.member_list.addItem(item)
         self.member_list.blockSignals(False)
         if 0 <= self.a < self.member_list.count():
@@ -444,7 +445,7 @@ class ReviewWindow(QMainWindow):
         keep = item.checkState() == Qt.CheckState.Checked
         if i is None or not (0 <= i < len(self.members)) or self.members[i].keep == keep:
             return  # itemChanged also fires for text/icon updates; only a real keep change is a decision
-        self._decide(keeps={self.members[i].path: keep})
+        self._decide(keeps={self.members[i].item: keep})
 
     def _member_clicked(self, item: QListWidgetItem | None) -> None:
         if item is None:
@@ -477,10 +478,9 @@ class ReviewWindow(QMainWindow):
         if path in self.pending_loads:
             return
         self.pending_loads.add(path)
-        full = os.path.join(self.image_dir, path)
 
         def read(signals):
-            return path, thumbnail(full, THUMB)
+            return path, thumbnail(path, THUMB)
 
         self.pool.start(Job(read).connect(self._thumbnail_ready, lambda error, p=path: self._thumbnail_failed(p, error)))
 
@@ -492,7 +492,7 @@ class ReviewWindow(QMainWindow):
         try:
             for row in range(self.member_list.count()):
                 item = self.member_list.item(row)
-                if self.members and self.members[item.data(Qt.ItemDataRole.UserRole)].path == path:
+                if self.members and self.members[item.data(Qt.ItemDataRole.UserRole)].file(self.roots) == path:
                     pix = self.thumbs.get(path)
                     if pix is not None:
                         item.setIcon(QIcon(pix))
@@ -510,7 +510,7 @@ class ReviewWindow(QMainWindow):
         if not self.members:
             self.canvas.clear()
             return
-        for path in (self.members[self.a].path, self.members[self.b].path if self.b != self.a else None):
+        for path in (self.members[self.a].file(self.roots), self.members[self.b].file(self.roots) if self.b != self.a else None):
             if path is not None:
                 self._load_image(path, self.pool)
         self._show_images()
@@ -532,8 +532,8 @@ class ReviewWindow(QMainWindow):
         """Show the current pair once both images are cached; a no-op until then and once it is on screen."""
         if not self.members:
             return
-        pa = self.members[self.a].path
-        pb = self.members[self.b].path if self.b != self.a else None
+        pa = self.members[self.a].file(self.roots)
+        pb = self.members[self.b].file(self.roots) if self.b != self.a else None
         if self.shown == (pa, pb):
             return
         ca = self.images.get(pa)
@@ -548,7 +548,7 @@ class ReviewWindow(QMainWindow):
     def _current_pair(self) -> tuple[str, str] | None:
         if not self.members or self.b == self.a:
             return None
-        return self.members[self.a].path, self.members[self.b].path
+        return self.members[self.a].file(self.roots), self.members[self.b].file(self.roots)
 
     def _request_diff(self) -> None:
         """Show the current pair's diff: from the cache, or computed in the main pool."""
@@ -644,11 +644,11 @@ class ReviewWindow(QMainWindow):
     def toggle_keep_a(self) -> None:
         if self.members:
             m = self.members[self.a]
-            self._decide(keeps={m.path: not m.keep})
+            self._decide(keeps={m.item: not m.keep})
 
     def keep_only_a(self) -> None:
         if self.members:
-            self._decide(keeps={m.path: i == self.a for i, m in enumerate(self.members)})
+            self._decide(keeps={m.item: i == self.a for i, m in enumerate(self.members)})
 
     def _policy_chosen(self, name: str) -> None:
         if name in self.policies:
@@ -747,7 +747,9 @@ class ReviewWindow(QMainWindow):
 
     def plan_text(self) -> tuple[str, int]:
         moves = self.review.plan_apply()
-        lines = [f"{m.path}  →  trash   ({'keeping ' + ', '.join(m.keep) if m.keep else 'whole group discarded'})" for m in moves]
+        lines = [
+            f"{m.member.path}  →  trash   ({'keeping ' + ', '.join(m.keep) if m.keep else 'whole group discarded'})" for m in moves
+        ]
         return "\n".join(lines), len(moves)
 
     def _ensure_trash_dir(self) -> bool:

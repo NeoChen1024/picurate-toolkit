@@ -13,10 +13,10 @@ import numpy as np
 import torch
 import tqdm
 
-from ..common.images import ImageRecord
+from ..common.images import ImageRecord, Roots, standalone_items, standalone_roots
 from ..common.log import setup_logging
 from .calibrate import VARIANTS, calibrate, default_variants, report
-from .db_store import EmbeddingDB, load_database
+from .db_store import EmbeddingDB, ModelMismatchError, load_database
 from .dedupe import find_cross_pairs, find_duplicate_edges, group_edges, move_to_trash, trash_duplicate_groups
 from .encoder import CLIPImageEncoder, default_model_id, default_seq_len, precision_choices
 from .encoding_pipeline import update_database
@@ -194,11 +194,11 @@ def _update(
     try:
         update_database(
             encoder,
-            image_dir,
+            standalone_roots(image_dir),
+            standalone_items(image_dir, include_hidden=include_hidden),
             db,
             force_update=force_update,
             clean_orphans=clean_orphans,
-            include_hidden=include_hidden,
             batch_size=batch_size,
             workers=workers,
             progress_factory=_progress_factory("Encoding", "image"),
@@ -207,8 +207,15 @@ def _update(
         raise click.ClickException(str(e)) from e
 
 
+def _load(db: str) -> tuple[list[ImageRecord], np.ndarray]:
+    try:
+        return load_database(db)
+    except ModelMismatchError as e:
+        raise click.ClickException(str(e)) from e
+
+
 def _load_index(db: str, device: str, what: str = "database") -> tuple[list[ImageRecord], DistanceIndex]:
-    records, embeddings = load_database(db)
+    records, embeddings = _load(db)
     if not records:
         raise click.ClickException(f"No entries in the {what} {db}. Run an update first.")
     index = DistanceIndex(embeddings, device)
@@ -222,6 +229,13 @@ def _load_index(db: str, device: str, what: str = "database") -> tuple[list[Imag
         index.backend_name(),
     )
     return records, index
+
+
+def _review(path: str) -> ReviewDB:
+    try:
+        return ReviewDB(path)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
 
 
 def _pixel_check(pairs: list[tuple[str, str]], workers: int | None, buffer_mib: int) -> list[PixelVerdict]:
@@ -331,7 +345,7 @@ def dedupe(
             edges = find_duplicate_edges(paths, index, review_threshold, progress)
         index.release()
         review_path = review_db or default_review_path(db)
-        with EmbeddingDB(db) as store, ReviewDB(review_path) as review:
+        with EmbeddingDB(db) as store, _review(review_path) as review:
             try:
                 review.begin_session(
                     image_dir=image_dir,
@@ -343,7 +357,8 @@ def dedupe(
             except ValueError as e:
                 raise click.ClickException(str(e)) from e
             review.set_meta("pixel_check", "on" if pixel_check else "off")
-            pixel = _review_pixel_check(review, edges, records, image_dir, workers, pixel_buffer) if pixel_check else None
+            roots = standalone_roots(image_dir)
+            pixel = _review_pixel_check(review, edges, records, roots, workers, pixel_buffer) if pixel_check else None
             stats = store_matches(review, group_edges(index.n, edges), records, policy, threshold, pixel)
             counts = review.counts()
         rule = "every pair differs by compression only" if pixel_check else f"within {threshold:g}"
@@ -369,9 +384,8 @@ def dedupe(
         edges = find_duplicate_edges(paths, index, threshold, progress)
     index.release()
     if pixel_check and edges:
-        verdicts = _pixel_check(
-            [(os.path.join(image_dir, paths[i]), os.path.join(image_dir, paths[j])) for i, j, _ in edges], workers, pixel_buffer
-        )
+        roots = standalone_roots(image_dir)
+        verdicts = _pixel_check([(records[i].file(roots), records[j].file(roots)) for i, j, _ in edges], workers, pixel_buffer)
         for (i, j, _), v in zip(edges, verdicts):
             if not v.same:
                 _log_blocked(paths[i], paths[j], v)
@@ -400,7 +414,7 @@ def _review_pixel_check(
     review: ReviewDB,
     edges: list[tuple[int, int, float]],
     records: list[ImageRecord],
-    image_dir: str,
+    roots: Roots,
     workers: int | None,
     buffer_mib: int,
 ) -> dict[tuple[int, int], PixelVerdict]:
@@ -410,18 +424,14 @@ def _review_pixel_check(
     todo: list[tuple[int, int]] = []
     for i, j, _ in edges:
         a, b = records[i], records[j]
-        hit = cached.get((a.path, b.path))
+        hit = cached.get((a.id, b.id))
         if hit is not None and hit[1] == (a.mtime, a.size, b.mtime, b.size):
             out[(i, j)] = hit[0]
         else:
             todo.append((i, j))
     logger.info("Pixel check: %d pairs to compare, %d unchanged since the last run", len(todo), len(edges) - len(todo))
     if todo:
-        verdicts = _pixel_check(
-            [(os.path.join(image_dir, records[i].path), os.path.join(image_dir, records[j].path)) for i, j in todo],
-            workers,
-            buffer_mib,
-        )
+        verdicts = _pixel_check([(records[i].file(roots), records[j].file(roots)) for i, j in todo], workers, buffer_mib)
         out.update(zip(todo, verdicts))
     same = sum(1 for v in out.values() if v.same)
     logger.info("Pixel check: %d of %d pairs differ by compression only", same, len(out))
@@ -563,7 +573,7 @@ def update_db(
                 batch_size=batch_size,
                 workers=workers,
             )
-    records, embeddings = load_database(db)
+    records, embeddings = _load(db)
     logger.info("%s holds %d embeddings of shape %s", db, len(records), embeddings.shape[1:])
 
 
@@ -610,7 +620,7 @@ def review_status(db: str, review_db: str | None) -> None:
     path = review_db or default_review_path(db)
     if not os.path.exists(path):
         raise click.ClickException(f"No review database at {path}. Run dedupe --review-threshold first.")
-    with ReviewDB(path) as review:
+    with _review(path) as review:
         counts = review.counts()
         click.echo(
             f"{path}: model {review.get_meta('model_id')}, review threshold {review.review_threshold}, auto threshold {review.auto_threshold}, policy {review.get_meta('policy')}"
@@ -650,7 +660,7 @@ def review_apply(image_dir: str, db: str, review_db: str | None, trash_dir: str,
     path = review_db or default_review_path(db)
     if not os.path.exists(path):
         raise click.ClickException(f"No review database at {path}. Run dedupe --review-threshold first.")
-    with ReviewDB(path) as review:
+    with _review(path) as review:
         decided = review.groups("decided")
         keepless = review.groups("decided", keeps_nothing=True)
         if keepless:
@@ -741,7 +751,7 @@ def calibrate_cmd(
                 raise click.ClickException(
                     f"Database {db} was encoded with model '{store.model_id}', but '{encoder.model_id}' is loaded."
                 )
-        records, embeddings = load_database(db)
+        records, embeddings = _load(db)
         if not records:
             raise click.ClickException(f"No entries in the database {db}. Run an update first.")
         index = DistanceIndex(embeddings, device)

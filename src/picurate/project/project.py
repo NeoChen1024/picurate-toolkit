@@ -6,8 +6,8 @@ which every change belongs to an operation, so that one editing session or one b
 unit. A field without a row has its default (for the caption: the derived one). Source images and their caption
 files are only ever read.
 
-An item is identified by ``(source_id, relative path)``: ``source_id`` is 256 random bits created when a source folder
-is first imported (all zero for a standalone image directory), and the item ID is derived from both with BLAKE3.
+An item is identified by ``(source_id, relative path)`` (see :mod:`picurate.common.images`); a project's
+``source_id`` is 256 random bits created when a source folder is first imported.
 """
 
 from __future__ import annotations
@@ -24,14 +24,11 @@ from pathlib import Path
 
 from blake3 import blake3
 
-from ..common.images import list_directory_relative
+from ..common.images import STANDALONE_SOURCE, item_id, list_directory_relative
 
 SCHEMA_VERSION = 3
 # What a project imports, and what an export refuses to overwrite: static formats a training pipeline reads.
 EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-# The source of a standalone image directory; never generated for a project source.
-STANDALONE_SOURCE = bytes(32)
-ITEM_ID_CONTEXT = "picurate item_id v1"
 REVIEW_STATUSES = ("unreviewed", "approved", "skip")
 # Human decision fields and their defaults. The caption's default is the derived caption, see Project.state.
 DEFAULTS = {"caption": None, "crop": None, "fills": [], "review_status": "unreviewed", "exclusion": None}
@@ -72,11 +69,6 @@ CREATE TABLE history (
 CREATE INDEX history_item ON history (item, field, seq);
 CREATE INDEX history_op ON history (op);
 """
-
-
-def item_id(source_id: bytes, relative_path: str) -> bytes:
-    data = source_id + b"\0" + relative_path.encode("utf-8", "surrogateescape")
-    return blake3(data, derive_key_context=ITEM_ID_CONTEXT).digest()
 
 
 def new_source_id() -> bytes:

@@ -6,7 +6,7 @@ from unittest import mock
 import numpy as np
 from click.testing import CliRunner
 
-from picurate.common.images import ImageRecord
+from picurate.common.images import ImageRecord, Item
 from picurate.dedupe import cli as cli_mod
 from picurate.dedupe.cli import cli
 
@@ -92,7 +92,7 @@ class PixelCheckCliTests(unittest.TestCase):
         with rv.ReviewDB(rv.default_review_path(self.db)) as review:
             g = review.groups()[0]
             self.assertEqual((g.status, g.pixel), ("pending", "different"))  # the edit keeps the group in review
-            self.assertEqual(review.edge_pixels(g.id)[("a.png", "b.jpg")].status, "same")
+            self.assertEqual(review.edge_pixels(g.id)[(Item.standalone("a.png").id, Item.standalone("b.jpg").id)].status, "same")
             self.assertEqual(review.get_meta("pixel_check"), "on")
         with mock.patch.object(cli_mod, "check_pairs", side_effect=AssertionError("nothing should be re-read")):
             res = self.run_cli("dedupe", "-i", self.img, "-d", self.db, "--review-threshold", "0.5")

@@ -25,7 +25,7 @@ merge".
 * With `--no-pixel-check`, groups entirely within `--threshold` start decided instead, as `dedupe` would have merged
   them on its own.
 
-Groups are keyed by their member paths. Re-running the match (after adding images, or with another threshold) keeps
+Groups are identified by their members. Re-running the match (after adding images, or with another threshold) keeps
 the decisions of groups whose membership did not change and marks the others stale. Groups nobody has touched get
 their starting status re-derived on every run, and pixel results are reused for files that did not change.
 
@@ -66,17 +66,18 @@ disk.
 ## Review database
 
 A separate SQLite file, so it survives `--force-update` rebuilding the embedding database and stays fast with tens
-of thousands of groups:
+of thousands of groups. Members are [item IDs](project.md#sources-and-identity), stored with the source ID and path they
+are derived from. A file of another schema version is refused: move it away and match again.
 
 ```
 meta      key, value                       schema_version, review_threshold, auto_threshold, policy, model_id, image_dir
 groups    id, key, n, min_distance, max_distance, status, note, updated_at, pixel, touched, discard
-                                           key = sha256 of the sorted member paths; pixel = same / different / NULL;
+                                           key = BLAKE3 of the sorted member IDs; pixel = same / different / NULL;
                                            touched = changed by the reviewer; discard = move every member
-members   group_id, path, keep, width, height, size, format, mtime, distance_to_winner
-edges     group_id, path_a, path_b, distance, pixel, pixel_peak, pixel_mean
+members   group_id, item, source_id, path, keep, width, height, size, format, mtime, distance_to_winner
+edges     group_id, item_a, item_b, distance, pixel, pixel_peak, pixel_mean
 history   id, group_id, at, keep_json, status, note, discard      append-only; undo pops a group's last row
-applied   path, trash_path, group_id, at                          one row per moved file, for undoing an apply
+applied   item, path, trash_path, group_id, at                    one row per moved file, for undoing an apply
 ```
 
 `status` is `pending`, `decided`, `skipped`, `applied` or `stale`. Cross-directory `dedupe-import` results are not

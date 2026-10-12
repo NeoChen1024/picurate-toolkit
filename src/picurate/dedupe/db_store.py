@@ -1,12 +1,12 @@
 """SQLite-backed embedding store.
 
-One database file holds every embedding of an image directory. Each row is keyed by the image's path relative to
-that directory and stores the file metadata observed at encoding time (mtime, size, width, height, format) plus the
-raw float16 embedding bytes. CLIP models run in fp16 on CUDA, so their outputs are exactly representable in fp16 and
+One database file holds every embedding of an image directory or project. Each row is keyed by the item ID (see
+:mod:`picurate.common.images`), keeps the source ID and relative path it was derived from, and stores the file metadata
+observed at encoding time (mtime, size, width, height, format) plus the raw float16 embedding bytes. CLIP models run in fp16 on CUDA, so their outputs are exactly representable in fp16 and
 storing them as fp32 would just double the size.
 
 A ``meta`` table records the model id, embedding dimension and schema version so a database is never silently reused
-with a different model or layout.
+with a different model or layout. A database of another schema version is refused; ``--force-update`` rebuilds it.
 """
 
 from __future__ import annotations
@@ -19,16 +19,20 @@ import numpy as np
 
 from ..common.images import ImageRecord
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 EMBEDDING_DTYPE = np.float16
 
-_SCHEMA = """
+_META = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+"""
+_SCHEMA = """
 CREATE TABLE IF NOT EXISTS embeddings (
-    path      TEXT PRIMARY KEY,
+    id        BLOB PRIMARY KEY,
+    source_id BLOB NOT NULL,
+    path      TEXT NOT NULL,
     mtime     REAL NOT NULL,
     size      INTEGER NOT NULL,
     width     INTEGER NOT NULL,
@@ -48,12 +52,25 @@ class ModelMismatchError(RuntimeError):
 class EmbeddingDB:
     """Thin wrapper around a SQLite connection holding fixed-dimension embeddings."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, rebuild: bool = False):
+        """Open or create ``path``. A database of another schema version raises :class:`ModelMismatchError`, or with
+        ``rebuild`` is emptied."""
         self.path = path
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self.conn = sqlite3.connect(path)
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA synchronous = NORMAL")
+        self.conn.executescript(_META)
+        version = self.get_meta("schema_version")
+        if version not in (None, SCHEMA_VERSION):
+            if not rebuild:
+                self.conn.close()
+                raise ModelMismatchError(
+                    f"Database {path} uses schema version {version}, but this version of the tool needs {SCHEMA_VERSION}. "
+                    "Pass --force-update to re-encode everything, or use a different database file."
+                )
+            self.conn.execute("DROP TABLE IF EXISTS embeddings")
+            self.conn.execute("DELETE FROM meta")
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
 
@@ -97,19 +114,16 @@ class EmbeddingDB:
         A fresh database adopts them. An existing database must match both, unless ``reset_on_mismatch`` is set, in
         which case all rows are dropped and the database is re-bound (used by ``--force-update``).
         """
-        current_model, current_schema = self.model_id, self.get_meta("schema_version")
+        current_model = self.model_id
         if current_model is None:
             self._bind(model_id)
             return
-        if current_model == model_id and current_schema == SCHEMA_VERSION:
+        if current_model == model_id:
             return
         if not reset_on_mismatch:
-            if current_model != model_id:
-                why = f"was encoded with model '{current_model}', but '{model_id}' was requested"
-            else:
-                why = f"uses schema version {current_schema}, but this version of the tool needs {SCHEMA_VERSION}"
             raise ModelMismatchError(
-                f"Database {self.path} {why}. Pass --force-update to re-encode everything, or use a different database file."
+                f"Database {self.path} was encoded with model '{current_model}', but '{model_id}' was requested. "
+                "Pass --force-update to re-encode everything, or use a different database file."
             )
         self.conn.execute("DELETE FROM embeddings")
         self.conn.execute("DELETE FROM meta")
@@ -120,9 +134,9 @@ class EmbeddingDB:
     def __len__(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
 
-    def load_index(self) -> dict[str, float]:
-        """``{relative_path: mtime}`` for every stored embedding; what the incremental update compares against."""
-        return dict(self.conn.execute("SELECT path, mtime FROM embeddings"))
+    def load_index(self) -> dict[bytes, float]:
+        """``{item_id: mtime}`` for every stored embedding; what the incremental update compares against."""
+        return dict(self.conn.execute("SELECT id, mtime FROM embeddings"))
 
     def upsert(self, rows: Iterable[tuple[ImageRecord, np.ndarray]]) -> None:
         """Insert or replace ``(record, embedding)`` pairs in a single transaction."""
@@ -134,36 +148,50 @@ class EmbeddingDB:
                 self.set_meta("dim", str(vec.shape[0]))
             elif vec.shape[0] != dim:
                 raise ValueError(f"Embedding for {rec.path} has dimension {vec.shape[0]}, database expects {dim}")
-            prepared.append((rec.path, float(rec.mtime), int(rec.size), int(rec.width), int(rec.height), rec.format, vec.tobytes()))
+            prepared.append(
+                (
+                    rec.id,
+                    rec.source_id,
+                    rec.path,
+                    float(rec.mtime),
+                    int(rec.size),
+                    int(rec.width),
+                    int(rec.height),
+                    rec.format,
+                    vec.tobytes(),
+                )
+            )
         if prepared:
             self.conn.executemany(
-                "INSERT OR REPLACE INTO embeddings (path, mtime, size, width, height, format, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO embeddings (id, source_id, path, mtime, size, width, height, format, embedding)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 prepared,
             )
         self.conn.commit()
 
-    def delete(self, paths: Iterable[str]) -> int:
-        """Delete rows by path; returns the number of rows removed."""
-        paths = list(paths)
-        if not paths:
+    def delete(self, ids: Iterable[bytes]) -> int:
+        """Delete rows by item ID; returns the number of rows removed."""
+        ids = list(ids)
+        if not ids:
             return 0
-        cur = self.conn.executemany("DELETE FROM embeddings WHERE path = ?", ((p,) for p in paths))
+        cur = self.conn.executemany("DELETE FROM embeddings WHERE id = ?", ((i,) for i in ids))
         self.conn.commit()
-        return cur.rowcount if cur.rowcount >= 0 else len(paths)
+        return cur.rowcount if cur.rowcount >= 0 else len(ids)
 
     def load_all(self) -> tuple[list[ImageRecord], np.ndarray]:
-        """Every row as ``(records, (N, D) float16 array)``, ordered by path, with one memory copy for the matrix."""
+        """Every row as ``(records, (N, D) float16 array)``, ordered by source and path, with one memory copy for the
+        matrix."""
         dim = self.dim
         rows = self.conn.execute(
-            "SELECT path, mtime, size, width, height, format, embedding FROM embeddings ORDER BY path"
+            "SELECT path, mtime, size, width, height, format, source_id, id, embedding FROM embeddings ORDER BY source_id, path"
         ).fetchall()
         if not rows:
             return [], np.empty((0, dim or 0), dtype=EMBEDDING_DTYPE)
         if dim is None:
             raise RuntimeError(f"Database {self.path} has rows but no recorded dimension; it is corrupt.")
-        records = [ImageRecord(*row[:6]) for row in rows]
+        records = [ImageRecord(*row[:8]) for row in rows]
         # bytearray.join yields a mutable buffer, so frombuffer below is a writable zero-copy view.
-        blob = bytearray().join(row[6] for row in rows)
+        blob = bytearray().join(row[8] for row in rows)
         expected = len(rows) * dim * np.dtype(EMBEDDING_DTYPE).itemsize
         if len(blob) != expected:
             raise RuntimeError(f"Database {self.path} embedding blobs total {len(blob)} bytes, expected {expected}; it is corrupt.")

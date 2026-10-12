@@ -53,10 +53,11 @@ results depend slightly on which images share a batch).
 
 ## Score database
 
-Tables `meta`, `tags(id, name, category)`, `images(id, path, mtime, size, width, height, format)` and
-`scores(image_id, tag_id, prob)`. Every tag scoring at least `--score-floor` (default 0.05) is kept, plus all
+Tables `meta`, `tags(id, name, category)`, `images(id, item, source_id, path, mtime, size, width, height, format)`
+and `scores(image_id, tag_id, prob)`; `item` is the [item ID](project.md#sources-and-identity), and the small integer
+`id` keeps the score rows short. Every tag scoring at least `--score-floor` (default 0.05) is kept, plus all
 ratings: about 60 rows per image. The database is bound to the model revision, dtype and floor, like the embedding
-database is to its model; a mismatch is refused unless `-f` rebuilds it.
+database is to its model; a mismatch, or a database of another schema version, is refused unless `-f` rebuilds it.
 
 ## Model
 

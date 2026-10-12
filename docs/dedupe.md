@@ -105,9 +105,10 @@ criteria = [
 
 ## How it works
 
-**Database.** Table `embeddings` has one row per image: `path` (relative to the image directory), `mtime`, `size`,
-`width`, `height`, `format` as observed at encoding time, and the raw little-endian float16 embedding. Table `meta`
-records `model_id`, `dim`, `dtype` and `schema_version`. FP16 storage is lossless: the model runs in FP16 on CUDA, so
+**Database.** Table `embeddings` has one row per image: the [item ID](project.md#sources-and-identity) with the source
+ID and path (relative to the image directory) it is derived from, `mtime`, `size`, `width`, `height`, `format` as
+observed at encoding time, and the raw little-endian float16 embedding. Table `meta` records `model_id`, `dim`, `dtype`
+and `schema_version`; a database of another model or schema version is refused unless `--force-update` rebuilds it. FP16 storage is lossless: the model runs in FP16 on CUDA, so
 every value it emits is already an FP16 number. On update, stored mtimes are compared with the files on disk; changed
 or new images are (re)encoded and rows without a file are deleted. Writes are committed per batch, so an interrupted
 run keeps its progress.

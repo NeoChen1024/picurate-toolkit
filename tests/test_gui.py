@@ -18,7 +18,7 @@ try:
 except ImportError:  # pragma: no cover
     QApplication = None  # type: ignore[assignment]
 
-from picurate.common.images import ImageRecord
+from picurate.common.images import ImageRecord, Item
 from picurate.dedupe.keeping import builtin_policies
 from picurate.dedupe.review import ReviewDB
 
@@ -138,7 +138,7 @@ class GuiTests(unittest.TestCase):
     def test_policy_pick_resets_all_pending_groups(self):
         pending = next(g for g in self.win.groups_model.groups if g.status == "pending")  # a.png (40x30) / sub/b.png (20x15)
         with ReviewDB(self.review_path) as db:
-            db.decide(pending.id, keeps={"a.png": False, "sub/b.png": True})
+            db.decide(pending.id, keeps={Item.standalone("a.png").id: False, Item.standalone("sub/b.png").id: True})
         self.win.reload_groups(select_id=pending.id)
         self.win.policy_box.setCurrentText("largest")
         self.win.reset_pending_to_policy(confirm=False)

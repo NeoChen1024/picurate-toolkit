@@ -22,11 +22,11 @@ class EmbeddingDBTests(unittest.TestCase):
                 db.upsert([(rec(f"{i}.jpg", 100.0 + i, 10 * i), vecs[i]) for i in range(3)])
                 self.assertEqual(db.dim, 4)
                 self.assertEqual(len(db), 3)
-                self.assertEqual(db.load_index(), {"0.jpg": 100.0, "1.jpg": 101.0, "2.jpg": 102.0})
+                self.assertEqual(db.load_index(), {rec(f"{i}.jpg").id: 100.0 + i for i in range(3)})
 
                 # replace one row, delete another
                 db.upsert([(rec("1.jpg", 999.0, 1), vecs[1] * 2)])
-                self.assertEqual(db.delete(["2.jpg"]), 1)
+                self.assertEqual(db.delete([rec("2.jpg").id]), 1)
 
             with EmbeddingDB(path) as db:
                 records, arr = db.load_all()
