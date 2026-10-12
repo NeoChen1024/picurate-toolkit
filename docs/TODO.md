@@ -25,10 +25,16 @@ in GC, and tagging on projects with captions combined on read are in place ([pro
     the CPU in blocks converted to FP32 small enough to stay in cache: about 150 ms per query vector for a million
     images. The GPU only encodes the query images and texts.
   * Applying writes human exclusion decisions with the query as the reason, as one operation.
-  * Text similarity needs SigLIP2's text tower from transformers (`google/siglip2-so400m-patch16-naflex`). First
-    check that its image tower gives the same embeddings as timm's, and that text queries rank real images sensibly.
+  * Text similarity uses SigLIP2's text tower, implemented in `picurate.common.siglip_text` (checked against
+    transformers: identical outputs for the same tokens) from `google/siglip2-so400m-patch16-naflex`, the checkpoint
+    of timm's image tower. Queries are lowercased; cosine against the stored embeddings, live threshold.
 
 ## Other
+
+* [ ] **CLIP training without transformers**: the timm image tower (its NaFlex data loader) with the text tower of
+  `picurate.common.siglip_text`, and SigLIP's sigmoid loss with the checkpoint's `logit_scale`/`logit_bias`, written
+  here. The position embedding stays resampled bicubically like timm does (the official code uses bilinear).
+  `src/clip_training/train.py` still uses transformers' `CLIPModel`.
 
 * [ ] Store a mean-centered copy or normalized embeddings to make thresholds model-independent? (`calibrate` measures
   the scale per model for now.)

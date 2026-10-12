@@ -22,7 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # The PySide6 GUIs (picurate-curate, picurate-dataset-editor). The CLIs never import Qt.
-gui = ["PySide6>=6.7"]
+gui = ["PySide6>=6.7", "tokenizers"]
 # Mask generation for the dataset editor's LaMa repair; Hi-SAM and SAM 2 themselves are installed from source by
 # `python -m picurate.dataset_editor.install_repair`.
 repair = ["einops", "hydra-core", "iopath", "setuptools"]
@@ -39,6 +39,7 @@ training = [
     "rich",
     "safetensors",
     "tensorboard",
+    "tokenizers",
     "transformers",
 ]
 

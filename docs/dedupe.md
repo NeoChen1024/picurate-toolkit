@@ -181,5 +181,8 @@ cropped. That is what keeps lossy copies close: distance to the original / to th
 5.6 for a JPEG q90 re-save, 0.4 / 5.6 for a 50% downscale and 2.4 / 5.6 for a 25% one, against 0.7 / 8.7, 1.4 / 8.7
 and 4.3 / 8.7 for the fixed 512px SigLIP tower. Fixed-resolution towers are fed the whole image squashed to their
 input size with bicubic resampling, as they were trained (timm's default eval transform crops 90% and shifts
-embeddings by several units). PE-Core towers are noticeably more sensitive to compression artifacts: a JPEG q90
+embeddings by several units). timm resamples the NaFlex position embedding to the patch grid bicubically, where the
+official SigLIP2 code (and transformers) does it bilinearly: the stored embeddings are about 0.9 apart from the
+official ones (cosine ~0.98). Kept on purpose: lossy copies land slightly closer this way, and text queries against
+the stored embeddings still rank images the same. PE-Core towers are noticeably more sensitive to compression artifacts: a JPEG q90
 re-save lands 5 to 15 away from the original, overlapping with different pictures.
