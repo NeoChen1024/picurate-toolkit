@@ -7,13 +7,9 @@ natural-language passages for Anima-style captions). Tagging runs once: before c
 drive tag matching, otherwise after it, so that excluded images are not tagged. Every stage stays usable on its own,
 without a project.
 
-Project identity, storage, per-field decisions with history and databases keyed by item ID are in place
-([projects](project.md)). Still open:
+Project identity, storage, per-field decisions with history, rollback and GC, and databases keyed by item ID are in
+place ([projects](project.md)). Still open:
 
-* [ ] **Rollback and GC.** Roll back one operation (an editor visit, a culling apply, a batch replacement): restore
-  each field's previous value, skipping and listing fields changed again since; the rollback is itself a new
-  operation. `picurate-project gc --keep-revisions N | --older-than AGE` prunes history and the LaMa artifacts
-  nothing kept refers to, with `-n` to list first. Never automatic.
 * [ ] **Stages write only their own files; reading combines them** (one implementation in `picurate.project`, used by
   the editor, the tagger and export):
   * Excluded = (losers of decided groups in `review.sqlite`) overridden by the human exclusion decision.

@@ -44,9 +44,23 @@ What a person decides about an image is stored per field: the caption, the crop,
 an exclusion (none, force keep or force exclude, with a reason). A field without a stored value has its default; for
 the caption that is the imported one, so an unedited caption keeps following it. Excluded images are not exported.
 
-Every change belongs to an operation (in the editor: one visit to an image), and the history keeps one entry per
-field and operation, so that an operation can later be rolled back as a unit. Only one editor can have a project
-open at a time.
+Every change belongs to an operation (in the editor: one visit to an image). The history keeps one entry per field
+and operation with the value before and after it; a field that ends an operation where it started gets no entry.
+Only one editor can have a project open at a time, and the commands below refuse to run while it is open.
+
+```shell
+picurate-project history my-dataset            # recent operations: ID, time, kind, changes, image
+picurate-project rollback my-dataset 42        # undo operation 42
+picurate-project gc my-dataset --keep-revisions 3 --older-than 30d -n
+```
+
+**Rollback** gives every field the operation changed its earlier value back, as a new operation (so a rollback can be
+rolled back). A field changed again since is left alone and listed.
+
+**GC** prunes history entries beyond the newest `--keep-revisions` of their field and/or of operations older than
+`--older-than` (with both, an entry must match both), then the operations left without entries, then the LaMa masks
+and patches that neither the current decisions nor the remaining history refer to. Current decisions are never
+touched; pruned operations can no longer be rolled back. Nothing is pruned automatically; `-n` lists first.
 
 ## Project directory
 
@@ -55,7 +69,7 @@ project.json        schema version, source folders (ID → path), export and com
 project.sqlite      items     one row per image: ID, source ID and relative path, size, mtime, BLAKE3 of the file,
                               the imported caption and where it came from, output name
                     state     the current decisions, one row per image and changed field (JSON)
-                    history   every change: operation, image, field, value (NULL: back to the default)
+                    history   every change: operation, image, field, previous and new value (NULL: the default)
                     ops       when each operation happened and what it was
 project.lock        held by the editor that has the project open
 masks/, patches/    the editor's accepted LaMa repairs

@@ -2,11 +2,35 @@
 
 from __future__ import annotations
 
+import datetime
+import re
+
 import click
 import tqdm
 
 from ..common.log import setup_logging
 from .project import Project
+
+AGE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+
+
+def _open(project_dir: str, *, lock: bool = False) -> Project:
+    try:
+        project = Project(project_dir)
+        if lock:
+            project.lock()
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    return project
+
+
+def _age(value: str | None) -> float | None:
+    if value is None:
+        return None
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([smhdw])", value.strip())
+    if match is None:
+        raise click.BadParameter("a number with a unit: s, m, h, d or w (e.g. 30d)", param_hint="--older-than")
+    return float(match[1]) * AGE_UNITS[match[2]]
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -61,6 +85,60 @@ def import_(
         except ValueError as e:
             raise click.ClickException(str(e)) from e
     click.echo(f"Imported {imported} images, skipped {skipped} already in the project; {len(project.items)} in total.", err=True)
+
+
+@main.command()
+@click.argument("project_dir", type=click.Path(exists=True, file_okay=False))
+@click.option("--limit", "-n", type=click.IntRange(1), default=30, show_default=True, help="How many operations to list.")
+def history(project_dir: str, limit: int) -> None:
+    """List the most recent operations of the project at PROJECT_DIR, newest first: ID, time, kind, number of field
+    changes still in the history, and description (for an editor visit, the image)."""
+    project = _open(project_dir)
+    for op in project.ops(limit):
+        at = datetime.datetime.fromtimestamp(op["at"]).strftime("%Y-%m-%d %H:%M:%S")
+        click.echo(f"{op['id']:>6}  {at}  {op['kind']:<9} {op['changes']:>5}  {op['description'] or ''}")
+
+
+@main.command()
+@click.argument("project_dir", type=click.Path(exists=True, file_okay=False))
+@click.argument("op", type=int)
+def rollback(project_dir: str, op: int) -> None:
+    """Undo operation OP (see 'history') in the project at PROJECT_DIR: every field it changed gets its earlier value
+    back. Fields changed again since are left alone and listed. The rollback is itself an operation, so it can be
+    rolled back too. Needs the project to be closed in the editor."""
+    project = _open(project_dir, lock=True)
+    try:
+        new, skipped, restored = project.rollback(op)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    for item, field in skipped:
+        click.echo(f"Changed since, left alone: {project.items[item]['path']} {field}", err=True)
+    click.echo(f"Restored {restored} fields as operation {new}; {len(skipped)} left alone.", err=True)
+
+
+@main.command()
+@click.argument("project_dir", type=click.Path(exists=True, file_okay=False))
+@click.option("--keep-revisions", type=click.IntRange(0), default=None, help="Keep this many newest history entries per field.")
+@click.option("--older-than", default=None, help="Only prune entries of operations older than this (e.g. 12h, 30d, 2w).")
+@click.option("--dry-run", "-n", is_flag=True, help="Report what would be pruned without changing anything.")
+def gc(project_dir: str, keep_revisions: int | None, older_than: str | None, dry_run: bool) -> None:
+    """Prune old history in the project at PROJECT_DIR, and LaMa masks and patches nothing refers to afterwards.
+
+    With both options, an entry goes only when it is beyond the newest --keep-revisions of its field and older than
+    --older-than. Pruned operations can no longer be rolled back; current decisions are never touched. Needs the
+    project to be closed in the editor.
+    """
+    if keep_revisions is None and older_than is None:
+        raise click.UsageError("Give --keep-revisions, --older-than or both.")
+    project = _open(project_dir, lock=True)
+    result = project.gc(keep_revisions=keep_revisions, older_than=_age(older_than), dry_run=dry_run)
+    for path in result["artifacts"]:
+        click.echo(f"{'Would remove' if dry_run else 'Removed'} {path}", err=True)
+    click.echo(
+        f"{'Would prune' if dry_run else 'Pruned'} {result['entries']} history entries, {len(result['ops'])} operations and "
+        f"{len(result['artifacts'])} artifacts.",
+        err=True,
+    )
 
 
 if __name__ == "__main__":

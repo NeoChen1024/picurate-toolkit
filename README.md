@@ -12,7 +12,7 @@ now; how they should feed into each other is something the workflow has to show 
 | [picurate-dedupe](docs/dedupe.md)                 | Find duplicates by CLIP similarity, confirm them pixel by pixel, move the losers to a trash directory. |
 | [picurate-dedupe-review](docs/dedupe-review.md)   | GUI for the duplicate groups a single threshold should not decide.                                     |
 | [picurate-tag](docs/tagger.md)                    | Danbooru-tag captions for training datasets, in Anima or sd-scripts (SDXL) layout.                     |
-| [picurate-project](docs/project.md)               | Create a dataset project and import existing image/caption pairs into it.                              |
+| [picurate-project](docs/project.md)               | Create a dataset project, import existing image/caption pairs, roll back or prune its edit history.    |
 | [picurate-dataset-editor](docs/dataset-editor.md) | GUI for going through a dataset by hand: captions with tag completion, crops, watermark removal.       |
 
 ## Installation

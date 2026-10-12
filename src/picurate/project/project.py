@@ -1,9 +1,9 @@
 """Dataset projects: a directory that references external images and owns everything derived from them.
 
 ``project.json`` holds the settings and the source folders. ``project.sqlite`` holds the items (one per imported
-image) and the human decisions about them, stored per field: a current-state table, and an append-only history in
-which every change belongs to an operation, so that one editing session or one batch decision can be rolled back as a
-unit. A field without a row has its default (for the caption: the derived one). Source images and their caption
+image) and the human decisions about them, stored per field: a current-state table, and a history in which every
+change belongs to an operation and records the value before and after it, so that one editing session or one batch
+decision can be rolled back as a unit, and old history can be pruned without breaking that. A field without a row has its default (for the caption: the derived one). Source images and their caption
 files are only ever read.
 
 An item is identified by ``(source_id, relative path)`` (see :mod:`picurate.common.images`); a project's
@@ -26,13 +26,14 @@ from blake3 import blake3
 
 from ..common.images import STANDALONE_SOURCE, item_id, list_directory_relative
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 # What a project imports, and what an export refuses to overwrite: static formats a training pipeline reads.
 EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 REVIEW_STATUSES = ("unreviewed", "approved", "skip")
 # Human decision fields and their defaults. The caption's default is the derived caption, see Project.state.
 DEFAULTS = {"caption": None, "crop": None, "fills": [], "review_status": "unreviewed", "exclusion": None}
 COMMIT_EVERY = 1000
+ARTIFACT_DIRS = ("masks", "patches")
 
 SCHEMA = """
 CREATE TABLE items (
@@ -49,7 +50,7 @@ CREATE TABLE items (
 CREATE TABLE ops (
     id INTEGER PRIMARY KEY,
     at REAL NOT NULL,
-    kind TEXT NOT NULL,             -- edit, ...
+    kind TEXT NOT NULL,             -- edit, rollback, ...
     description TEXT
 );
 CREATE TABLE state (
@@ -64,7 +65,8 @@ CREATE TABLE history (
     op INTEGER NOT NULL,
     item BLOB NOT NULL,
     field TEXT NOT NULL,
-    value TEXT                      -- JSON; NULL = back to the default
+    previous TEXT,                  -- JSON before the operation; NULL = the default
+    value TEXT                      -- JSON after it; NULL = the default
 );
 CREATE INDEX history_item ON history (item, field, seq);
 CREATE INDEX history_op ON history (op);
@@ -334,7 +336,6 @@ class Project:
         item = state["item_id"]
         if item not in self.items:
             raise ValueError("Cannot save an unknown item")
-        stored = self._decisions(item).get(item, {})
         changed = []
         with self._lock:
             self.db.execute("BEGIN")
@@ -343,29 +344,132 @@ class Project:
                     value = state[field]
                     if field == "caption" and value == self.derived_caption(item):
                         value = None
-                    is_default = value == default
-                    if (None if is_default else value) == stored.get(field):
-                        continue
-                    encoded = None if is_default else json.dumps(value, ensure_ascii=False)
-                    if is_default:
-                        self.db.execute("DELETE FROM state WHERE item = ? AND field = ?", (item, field))
-                    else:
-                        self.db.execute("INSERT OR REPLACE INTO state VALUES (?, ?, ?, ?)", (item, field, encoded, op))
-                    last = self.db.execute(
-                        "SELECT seq, op FROM history WHERE item = ? AND field = ? ORDER BY seq DESC LIMIT 1", (item, field)
-                    ).fetchone()
-                    if last is not None and last[1] == op:
-                        self.db.execute("UPDATE history SET value = ? WHERE seq = ?", (encoded, last[0]))
-                    else:
-                        self.db.execute(
-                            "INSERT INTO history (op, item, field, value) VALUES (?, ?, ?, ?)", (op, item, field, encoded)
-                        )
-                    changed.append(field)
+                    encoded = None if value == default else json.dumps(value, ensure_ascii=False)
+                    if self._write(item, field, encoded, op):
+                        changed.append(field)
                 self.db.execute("COMMIT")
             except BaseException:
                 self.db.execute("ROLLBACK")
                 raise
         return changed
+
+    def _stored(self, item: bytes, field: str) -> str | None:
+        row = self.db.execute("SELECT value FROM state WHERE item = ? AND field = ?", (item, field)).fetchone()
+        return None if row is None else row[0]
+
+    def _write(self, item: bytes, field: str, encoded: str | None, op: int) -> bool:
+        """Set one field to ``encoded`` (JSON, ``None`` for the default) as part of ``op``, inside the caller's
+        transaction. Returns whether it changed."""
+        before = self._stored(item, field)
+        if encoded == before:
+            return False
+        if encoded is None:
+            self.db.execute("DELETE FROM state WHERE item = ? AND field = ?", (item, field))
+        else:
+            self.db.execute("INSERT OR REPLACE INTO state VALUES (?, ?, ?, ?)", (item, field, encoded, op))
+        last = self.db.execute(
+            "SELECT seq, op, previous FROM history WHERE item = ? AND field = ? ORDER BY seq DESC LIMIT 1", (item, field)
+        ).fetchone()
+        if last is not None and last[1] == op:
+            if encoded == last[2]:  # back where the operation started: it did not change this field after all
+                self.db.execute("DELETE FROM history WHERE seq = ?", (last[0],))
+            else:
+                self.db.execute("UPDATE history SET value = ? WHERE seq = ?", (encoded, last[0]))
+        else:
+            self.db.execute(
+                "INSERT INTO history (op, item, field, previous, value) VALUES (?, ?, ?, ?, ?)", (op, item, field, before, encoded)
+            )
+        return True
+
+    # Operations: listing, rollback and pruning.
+
+    def ops(self, limit: int | None = None) -> list[dict]:
+        """The most recent operations first, with the number of field changes each still has in the history."""
+        rows = self.db.execute(
+            "SELECT o.id, o.at, o.kind, o.description, COUNT(h.seq) FROM ops o LEFT JOIN history h ON h.op = o.id"
+            " GROUP BY o.id ORDER BY o.id DESC" + (" LIMIT ?" if limit is not None else ""),
+            () if limit is None else (limit,),
+        )
+        return [dict(zip(("id", "at", "kind", "description", "changes"), row)) for row in rows]
+
+    def rollback(self, op: int) -> tuple[int, list[tuple[bytes, str]], int]:
+        """Restore every field ``op`` changed to its value before ``op``, as a new operation. A field changed again
+        since is left alone and listed. Returns ``(new operation, skipped (item, field) pairs, restored count)``."""
+        with self._lock:
+            row = self.db.execute("SELECT kind, description FROM ops WHERE id = ?", (op,)).fetchone()
+            if row is None:
+                raise ValueError(f"No operation {op}")
+            changes = self.db.execute(
+                "SELECT item, field, previous, value FROM history WHERE op = ? ORDER BY seq", (op,)
+            ).fetchall()
+            if not changes:
+                raise ValueError(f"Operation {op} has no changes left in the history")
+            self.db.execute("BEGIN")
+            try:
+                new = self.begin_op("rollback", f"rollback of {op} ({row[0]}{': ' + row[1] if row[1] else ''})")
+                skipped = []
+                restored = 0
+                for item, field, before, value in changes:
+                    if self._stored(item, field) != value:
+                        skipped.append((item, field))
+                    elif self._write(item, field, before, new):
+                        restored += 1
+                self.db.execute("COMMIT")
+            except BaseException:
+                self.db.execute("ROLLBACK")
+                raise
+        return new, skipped, restored
+
+    def artifacts_in_use(self) -> set[str]:
+        """Project-relative paths of the LaMa masks and patches that the current state or the history refers to."""
+        used = set()
+        rows = self.db.execute(
+            "SELECT value FROM state WHERE field = 'fills' UNION ALL"
+            " SELECT previous FROM history WHERE field = 'fills' UNION ALL SELECT value FROM history WHERE field = 'fills'"
+        )
+        for (encoded,) in rows:
+            for fill in json.loads(encoded) if encoded else []:
+                used.update(fill[key] for key in ("mask", "patch") if key in fill)
+        return used
+
+    def gc(self, *, keep_revisions: int | None = None, older_than: float | None = None, dry_run: bool = False) -> dict:
+        """Prune history entries that are beyond the newest ``keep_revisions`` of their field and/or belong to an
+        operation older than ``older_than`` seconds (both rules must hold when both are given), the operations left
+        without entries, and the LaMa artifacts nothing refers to afterwards. Returns what was (or would be) removed."""
+        if keep_revisions is None and older_than is None:
+            raise ValueError("Give a number of revisions to keep, an age, or both")
+        conditions, args = [], []
+        if keep_revisions is not None:
+            conditions.append("(SELECT COUNT(*) FROM history n WHERE n.item = h.item AND n.field = h.field AND n.seq > h.seq) >= ?")
+            args.append(keep_revisions)
+        if older_than is not None:
+            conditions.append("(SELECT at FROM ops WHERE id = h.op) < ?")
+            args.append(time.time() - older_than)
+        prune = "SELECT seq FROM history h WHERE " + " AND ".join(conditions)
+        empty_ops = "SELECT id FROM ops WHERE id NOT IN (SELECT op FROM history) AND id NOT IN (SELECT op FROM state)"
+        with self._lock:
+            self.db.execute("BEGIN")
+            try:
+                entries = self.db.execute(f"SELECT COUNT(*) FROM ({prune})", args).fetchone()[0]
+                self.db.execute(f"DELETE FROM history WHERE seq IN ({prune})", args)
+                ops = [row[0] for row in self.db.execute(empty_ops)]
+                self.db.execute(f"DELETE FROM ops WHERE id IN ({empty_ops})")
+                used = self.artifacts_in_use()
+                self.db.execute("ROLLBACK" if dry_run else "COMMIT")
+            except BaseException:
+                self.db.execute("ROLLBACK")
+                raise
+        artifacts = sorted(
+            path
+            for name in ARTIFACT_DIRS
+            for file in (self.directory / name).iterdir()
+            if file.is_file() and (path := f"{name}/{file.name}") not in used
+        )
+        if not dry_run:
+            for path in artifacts:
+                (self.directory / path).unlink()
+            self.db.execute("VACUUM")
+        return {"entries": entries, "ops": ops, "artifacts": artifacts}
 
     def export_snapshot(self, states, fmt: str) -> dict:
         return {
