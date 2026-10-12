@@ -1,7 +1,5 @@
 # TODO
 
-* [ ] Port the dataset editor (project-based captions, crops and LaMa watermark repair) from my scripts repository
-  to PySide6 as `picurate-dataset-editor` (`picurate.dataset_editor`), then keep improving it here.
 * [ ] Let the parts feed each other once the workflow settles: captions from the tag database in the editor,
   duplicate hints on import.
 * [ ] Store a mean-centered copy or normalized embeddings to make thresholds model-independent? (`calibrate` measures

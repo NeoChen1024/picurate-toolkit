@@ -179,7 +179,7 @@ class CanvasTests(unittest.TestCase):
     def test_fit_follows_the_final_viewport(self):
         """A fit asked for before the layout has settled (mode switch, resize, 100% with scrollbars) must end up
         matching the viewport the view actually gets, not the stale one it had at the time."""
-        from picurate.dedupe.gui.jobs import qimage
+        from picurate.common.qt import qimage
 
         def expected(view):
             size = view.maximumViewportSize()

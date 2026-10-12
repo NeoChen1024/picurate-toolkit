@@ -20,8 +20,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The PySide6 GUIs (picurate-dedupe-review). The CLIs never import Qt.
+# The PySide6 GUIs (picurate-dedupe-review, picurate-dataset-editor). The CLIs never import Qt.
 gui = ["PySide6>=6.7"]
+# Mask generation for the dataset editor's LaMa repair; Hi-SAM and SAM 2 themselves are installed from source by
+# `python -m picurate.dataset_editor.install_repair`.
+repair = ["einops", "hydra-core", "iopath", "setuptools"]
 # Dataset preprocessing and CLIP fine-tuning scripts (src/clip_training), not needed for deduplication.
 training = [
     "accelerate",
@@ -40,6 +43,7 @@ training = [
 picurate-dedupe = "picurate.dedupe.cli:cli"
 picurate-dedupe-review = "picurate.dedupe.gui.app:main"
 picurate-tag = "picurate.tagger.cli:main"
+picurate-dataset-editor = "picurate.dataset_editor.app:main"
 clip-dataset-preprocess = "clip_training.dataset_preprocessing:main"
 
 [build-system]
@@ -51,6 +55,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "picurate.dedupe" = ["policies.toml"]
+"picurate.dataset_editor" = ["data/*.csv"]
 
 [tool.black]
 line-length = 132
