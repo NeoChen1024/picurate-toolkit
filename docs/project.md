@@ -9,6 +9,7 @@ projects so far; see [TODO](TODO.md).
 ```shell
 picurate-project init my-dataset
 picurate-project import my-dataset -r ~/pictures/set-a ~/pictures/extra.png
+picurate-project sync my-dataset             # later: pick up new, changed and vanished images
 picurate-dataset-editor my-dataset
 ```
 
@@ -17,12 +18,25 @@ picurate-dataset-editor my-dataset
 * A directory contributes the images directly in it; with `-r` (the editor: *Include subfolders*) also those in its
   subdirectories. Hidden (dot) files and directories are skipped unless `--include-hidden`; single files can be given
   too. PNG, JPEG, WebP and BMP are imported; other files are ignored.
+* `--include` / `--exclude` (the editor: rules typed one per line as `+ PATTERN` / `- PATTERN`) filter what is
+  below a directory like rsync's: the first rule that matches decides, unmatched paths are imported, and an excluded
+  directory is not descended into. A pattern without `/` matches a file or directory name; one with `/` or `**`
+  matches the path relative to the imported directory, from its root when it starts with `/`. `*` stays within a
+  name, `**` crosses directories, a trailing `/` matches directories only and `/***` a directory with everything in
+  it. Only PNG files, in every subdirectory: `-r --include '*/' --include '*.png' --exclude '*'`. Single files given
+  by name are not filtered.
 * A same-stem UTF-8 `.txt` next to an image becomes its imported caption, unless `--no-captions`. The caption file
   is never changed, and later changes to it are not picked up.
 * An image already in the project, through any source folder that contains it, is skipped and keeps its edits, so
-  importing a directory again only adds what is new; nothing appears without an explicit import.
-* Every new image is hashed (BLAKE3, read sequentially), so an import reads each file once. Progress is committed
-  every 1000 images; an interrupted import is resumed by running it again.
+  importing a directory again only adds what is new; nothing appears without an import or a sync.
+* Images are only statted (size, mtime), never read, so importing a large library over the network is quick. Progress
+  is committed every 1000 images; an interrupted import is resumed by running it again.
+
+**Sync** brings a project up to date with its source folders, as they were imported: new images of an imported
+directory are added (recursive, hidden and filtered as the last import of that directory was; a folder from which only single files were imported
+gets nothing new), changed ones get their new size and mtime recorded, and vanished ones are marked missing until they
+come back. A source folder that is not there at all is skipped and listed rather than marked missing. Captions and
+decisions are kept.
 * Each image gets an output name from its path relative to the imported directory; names that collide (two sources
   with an `a/1.png`) get a suffix from the image's ID.
 
@@ -34,9 +48,14 @@ source folder, and its item ID is derived from both (BLAKE3 in key-derivation mo
 over the source ID, a NUL byte and the path). The embedding, review and tag databases key everything by the item ID;
 a standalone image directory has the all-zero source ID, so its databases use the same IDs.
 
-**Relink Sources** in the editor points a source folder somewhere else after checking the contents of every image in
-it; the IDs do not change. An image that is missing or changed keeps its caption and review status editable, but
-cannot be edited or exported; its thumbnail is marked `[!]`.
+**Relink Sources** in the editor points a source folder somewhere else after checking that every image is there with
+its recorded file size (images marked missing may stay missing, but at least one must be found); the IDs do not
+change.
+
+The project keeps no content hash. A crop and fills record the image size they were made on: a source image of
+another size keeps its caption and review status editable, but its image edits cannot be changed or exported, and its
+thumbnail is marked `[!]`. Another file size or mtime alone only warns. LaMa repairs additionally refuse when the
+pixels they were computed from changed ([dataset editor](dataset-editor.md#image-edits)).
 
 ## Decisions and history
 
@@ -65,9 +84,9 @@ touched; pruned operations can no longer be rolled back. Nothing is pruned autom
 ## Project directory
 
 ```
-project.json        schema version, source folders (ID → path), export and completion settings
-project.sqlite      items     one row per image: ID, source ID and relative path, size, mtime, BLAKE3 of the file,
-                              the imported caption and where it came from, output name
+project.json        schema version, source folders (ID → path and how it was imported), export and completion settings
+project.sqlite      items     one row per image: ID, source ID and relative path, size, mtime, the imported caption
+                              and where it came from, output name, missing (as of the last sync)
                     state     the current decisions, one row per image and changed field (JSON)
                     history   every change: operation, image, field, previous and new value (NULL: the default)
                     ops       when each operation happened and what it was

@@ -33,6 +33,27 @@ def _age(value: str | None) -> float | None:
     return float(match[1]) * AGE_UNITS[match[2]]
 
 
+class _OrderedFilters(click.Command):
+    """Keeps the command-line order of --include and --exclude, which decides between them (first match wins)."""
+
+    def make_parser(self, ctx: click.Context):
+        parser = super().make_parser(ctx)
+        parse_args = parser.parse_args
+
+        def parse(args):
+            opts, largs, order = parse_args(args=args)
+            ctx.meta["filter_order"] = [param.name for param in order if param.name in ("include", "exclude")]
+            return opts, largs, order
+
+        parser.parse_args = parse
+        return parser
+
+
+def _filters(ctx: click.Context, include: tuple[str, ...], exclude: tuple[str, ...]) -> list[tuple[str, str]]:
+    values = {"include": iter(include), "exclude": iter(exclude)}
+    return [("+" if name == "include" else "-", next(values[name])) for name in ctx.meta.get("filter_order", [])]
+
+
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 def main() -> None:
     """Dataset projects: the images stay where they are; captions and edits live in the project directory."""
@@ -49,23 +70,42 @@ def init(project_dir: str) -> None:
     click.echo(f"Created project {project.directory}", err=True)
 
 
-@main.command("import")
+@main.command("import", cls=_OrderedFilters)
 @click.argument("project_dir", type=click.Path(exists=True, file_okay=False))
 @click.argument("sources", nargs=-1, required=True, type=click.Path(exists=True))
 @click.option(
     "--include-hidden", is_flag=True, help="Also import hidden (dot) files and directories, which are skipped by default."
 )
 @click.option("--recursive", "-r", is_flag=True, help="Also import images in subdirectories.")
+@click.option("--include", multiple=True, metavar="PATTERN", help="rsync-style include rule for paths below a directory source.")
+@click.option("--exclude", multiple=True, metavar="PATTERN", help="rsync-style exclude rule; rules apply in command-line order.")
 @click.option("--no-captions", is_flag=True, help="Import the images only, ignoring caption files next to them.")
 @click.option("--verbose", "-v", is_flag=True, help="Debug logging.")
+@click.pass_context
 def import_(
-    project_dir: str, sources: tuple[str, ...], recursive: bool, include_hidden: bool, no_captions: bool, verbose: bool
+    ctx: click.Context,
+    project_dir: str,
+    sources: tuple[str, ...],
+    recursive: bool,
+    include_hidden: bool,
+    include: tuple[str, ...],
+    exclude: tuple[str, ...],
+    no_captions: bool,
+    verbose: bool,
 ) -> None:
     """Import images from SOURCES (directories, with -r also their subdirectories, or single files) into the project at
     PROJECT_DIR.
 
-    A same-stem UTF-8 .txt next to an image becomes its imported caption, unless --no-captions. Images already in the project are skipped
-    with their edits kept, so an interrupted import can simply be run again.
+    A same-stem UTF-8 .txt next to an image becomes its imported caption, unless --no-captions. Images already in the
+    project are skipped with their edits kept, so an interrupted import can simply be run again.
+
+    \b
+    --include/--exclude work like rsync's, on paths relative to each directory given; the first rule that matches
+    decides, and an excluded directory is not descended into. A pattern without '/' matches the file or directory
+    name, one with '/' or '**' the path (a leading '/' anchors it to the directory); a trailing '/' matches
+    directories only, '/***' a directory and everything in it. Only PNG files, in every subdirectory:
+      picurate-project import P -r --include '*/' --include '*.png' --exclude '*' SOURCE
+    The rules are recorded with the source folder for 'sync'.
     """
     setup_logging(verbose)
     try:
@@ -80,11 +120,41 @@ def import_(
 
         try:
             imported, skipped = project.import_images(
-                sources, captions=not no_captions, recursive=recursive, include_hidden=include_hidden, progress=progress
+                sources,
+                captions=not no_captions,
+                recursive=recursive,
+                include_hidden=include_hidden,
+                filters=_filters(ctx, include, exclude),
+                progress=progress,
             )
         except ValueError as e:
             raise click.ClickException(str(e)) from e
     click.echo(f"Imported {imported} images, skipped {skipped} already in the project; {len(project.items)} in total.", err=True)
+
+
+@main.command()
+@click.argument("project_dir", type=click.Path(exists=True, file_okay=False))
+@click.option("--verbose", "-v", is_flag=True, help="Debug logging.")
+def sync(project_dir: str, verbose: bool) -> None:
+    """Bring the project at PROJECT_DIR up to date with its source folders: import new images of imported
+    directories (recursive and hidden as they were imported), record changed images, mark vanished ones missing.
+    Captions and decisions are kept. Needs the project to be closed in the editor."""
+    setup_logging(verbose)
+    project = _open(project_dir, lock=True)
+    with tqdm.tqdm(unit="img", desc="Syncing", dynamic_ncols=True) as bar:
+
+        def progress(done: int, total: int) -> None:
+            bar.total = total
+            bar.update(done - bar.n)
+
+        result = project.sync(progress)
+    for root in result["unavailable"]:
+        click.echo(f"Source folder not found, skipped (relink it in the editor): {root}", err=True)
+    click.echo(
+        f"Added {result['added']}, changed {result['changed']}, newly missing {result['missing']}, back {result['back']}; "
+        f"{len(project.items)} images, {sum(row['missing'] for row in project.items.values())} missing.",
+        err=True,
+    )
 
 
 @main.command()

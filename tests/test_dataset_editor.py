@@ -86,9 +86,13 @@ class ProjectTests(unittest.TestCase):
         other.lock()
 
     def test_source_change(self):
-        self.path.write_bytes(b"changed")
+        """A changed file only warns; edits made on an image of another size are refused."""
+        self.assertIsNone(validate_source(self.path, self.state))
+        self.state.update(crop=[0, 0, 50, 50], image_size=[120, 100])
+        Image.new("RGB", (100, 100)).save(self.path)
+        self.assertIn("changed", validate_source(self.path, self.state))
         with self.assertRaises(ValueError):
-            validate_source(self.path, self.state)
+            render(load_image(self.path), self.state)
 
     def test_import_snapshot_dedup_and_collision(self):
         other = self.base / "other"
@@ -141,7 +145,7 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(export_project(directory, webp, cancelled=lambda: True), (0, True))
         self.assertTrue((output / "image.png").exists())
         self.path.write_bytes(b"changed")
-        with self.assertRaises(ValueError):
+        with self.assertRaises(OSError):  # unreadable now
             export_project(directory, webp)
         self.assertTrue((output / "image.png").exists())
         self.im.save(self.path)

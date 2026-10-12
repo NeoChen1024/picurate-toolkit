@@ -12,16 +12,11 @@ GUI and the tagger's `update`/`export` go away; `encode-test`, the tagger's `run
 `dedupe-import` stay plain directories. Sources stay read-only in the sense that image contents are never modified;
 moving a discarded image into the project's trash is allowed.
 
-Project identity, storage, per-field decisions with history, rollback and GC, and databases keyed by item ID are in
-place ([projects](project.md)). Still open:
+Project identity, stat-only import and sync, storage, per-field decisions with history, rollback and GC, and
+databases keyed by item ID are in place ([projects](project.md)). Still open:
 
-* [ ] **Cheap import and sync.** Import only stats files (path, size, mtime); no content hash in the project, so
-  importing a library over NFS does not read it. Syncing a source adds new files, updates the recorded size and mtime
-  of changed ones (the stages re-run them by mtime) and marks vanished ones as missing.
-* [ ] **Source checks without a project hash.** Crop and fills record the image size they were made on; rendering
-  and export refuse a source of another size, warn on another file size or mtime, and LaMa repairs keep their own
-  region hash. When the project's `embeddings.sqlite` has a content hash for the item, export and relink verify the
-  file against it; otherwise relink checks existence and file size.
+* [ ] **Verify sources against the embedding database's content hash** (when it has one for the item) in export and
+  relink, on top of the size checks ([sources](project.md#sources-and-identity)).
 * [ ] **Stages write only their own files; reading combines them** (one implementation in `picurate.project`, used by
   the editor, the tagger and export):
   * Excluded = (losers of decided groups in `review.sqlite`) overridden by the human exclusion decision (force keep

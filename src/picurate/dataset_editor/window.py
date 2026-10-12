@@ -36,8 +36,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..common.images import PathFilter
 from ..common.qt import Job
-from ..project.project import Project, validate_source
+from ..project.project import Project, check_image_size, validate_source
 from .canvas import Canvas, ThumbnailDelegate, Thumbnails
 from .caption_editor import CaptionEditor
 from .mask_editor import MaskEditor
@@ -469,9 +470,25 @@ class Window(QMainWindow):
         files = choice.addButton("Image files…", QMessageBox.ButtonRole.AcceptRole)
         choice.addButton(QMessageBox.StandardButton.Cancel)
         choice.exec()
+        filters = []
         if choice.clickedButton() == folder:
             directory = QFileDialog.getExistingDirectory(self, "Import image folder")
             paths = [directory] if directory else []
+            while paths:
+                text, ok = QInputDialog.getMultiLineText(
+                    self,
+                    "Import filters",
+                    "Optional rsync-style rules, one per line, first match wins:\n"
+                    "- *_draft.png    exclude by name\n+ */    then + *.png    then - *    only PNG files\n"
+                    "- /raw/    a directory at the top of the folder",
+                )
+                if not ok:
+                    return
+                try:
+                    filters = [PathFilter.parse(line) for line in text.splitlines() if line.strip()]
+                    break
+                except ValueError as error:
+                    self.error(error)
         elif choice.clickedButton() == files:
             paths, _ = QFileDialog.getOpenFileNames(
                 self, "Import images", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp *.PNG *.JPG *.JPEG *.WEBP *.BMP)"
@@ -483,7 +500,7 @@ class Window(QMainWindow):
             recursive = subfolders.isChecked()
 
             def run():
-                imported, skipped = project.import_images(paths, recursive=recursive)
+                imported, skipped = project.import_images(paths, recursive=recursive, filters=filters)
                 return f"Imported {imported} images; skipped {skipped} existing references"
 
             self.project_job("Importing images and captions…", run)
@@ -506,7 +523,7 @@ class Window(QMainWindow):
 
             def run():
                 project.relink(source_id, root)
-                return "Source folder relinked; image contents verified"
+                return "Source folder relinked; every image found with its recorded file size"
 
             self.project_job("Verifying replacement images…", run)
 
@@ -540,8 +557,10 @@ class Window(QMainWindow):
         self.canvas.setEnabled(False)
 
         def read(signals):
-            validate_source(path, state)
-            return load_image(path), None
+            warning = validate_source(path, state)
+            image = load_image(path)
+            check_image_size(image.size, state)
+            return image, None, warning
 
         job = Job(read).connect(lambda result: self.loaded(result, generation), lambda error: self.load_error(error, generation))
         self.pool.start(job)
@@ -551,17 +570,19 @@ class Window(QMainWindow):
             row = self.thumbs.currentIndex().row()
             self.model.issues[row] = error
             self.model.dataChanged.emit(self.model.index(row), self.model.index(row))
-            self.filename.setText("Source unavailable: " + error)
+            self.filename.setText("Image not editable: " + error)
             self.status_message.setText("Source missing or changed — caption and review state remain editable")
 
     def loaded(self, result, generation):
         if generation != self.generation:
             return
-        image, state = result
+        image, state, *warning = result
         self.im = image
         if state is None:
             self.canvas.setEnabled(True)
             self.filename.setText(f"{self.state['image']}\n{self.im.width} × {self.im.height}")
+            if warning and warning[0]:
+                self.status_message.setText(warning[0])
             self.set_ratio(self.ratio.currentText())
             self.refresh(True)
             return
@@ -585,6 +606,9 @@ class Window(QMainWindow):
         self.saving.stop()
         if self.project and self.state and getattr(self, "dirty", False):
             try:
+                if self.im is not None:
+                    edited = self.state["crop"] or self.state["fills"]
+                    self.state["image_size"] = [self.im.width, self.im.height] if edited else None
                 if self.op is None:
                     self.op = self.project.begin_op("edit", self.state["image"])
                 self.project.save(self.state, self.op)

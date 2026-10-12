@@ -1,10 +1,11 @@
 """Dataset projects: a directory that references external images and owns everything derived from them.
 
-``project.json`` holds the settings and the source folders. ``project.sqlite`` holds the items (one per imported
+``project.json`` holds the settings and the source folders with how they were imported, so that a sync can find
+new, changed and vanished images. ``project.sqlite`` holds the items (one per imported
 image) and the human decisions about them, stored per field: a current-state table, and a history in which every
 change belongs to an operation and records the value before and after it, so that one editing session or one batch
 decision can be rolled back as a unit, and old history can be pruned without breaking that. A field without a row has its default (for the caption: the derived one). Source images and their caption
-files are only ever read.
+files are only ever read. The project keeps no content hash: an import only stats the files.
 
 An item is identified by ``(source_id, relative path)`` (see :mod:`picurate.common.images`); a project's
 ``source_id`` is 256 random bits created when a source folder is first imported.
@@ -19,20 +20,22 @@ import shutil
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 
 from blake3 import blake3
 
-from ..common.images import STANDALONE_SOURCE, item_id, list_directory_relative
+from ..common.images import STANDALONE_SOURCE, PathFilter, item_id, list_directory_relative
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 # What a project imports, and what an export refuses to overwrite: static formats a training pipeline reads.
 EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 REVIEW_STATUSES = ("unreviewed", "approved", "skip")
 # Human decision fields and their defaults. The caption's default is the derived caption, see Project.state.
-DEFAULTS = {"caption": None, "crop": None, "fills": [], "review_status": "unreviewed", "exclusion": None}
+# image_size: the (EXIF-oriented) size the crop and fills were made on; a source of another size refuses them.
+DEFAULTS = {"caption": None, "crop": None, "fills": [], "image_size": None, "review_status": "unreviewed", "exclusion": None}
 COMMIT_EVERY = 1000
+ITEM_COLUMNS = ("id", "source_id", "path", "size", "mtime_ns", "caption", "caption_path", "output_stem", "missing")
 ARTIFACT_DIRS = ("masks", "patches")
 
 SCHEMA = """
@@ -40,12 +43,12 @@ CREATE TABLE items (
     id BLOB PRIMARY KEY,
     source_id BLOB NOT NULL,
     path TEXT NOT NULL,             -- relative to the source folder, '/'-separated
-    size INTEGER NOT NULL,
+    size INTEGER NOT NULL,          -- as of the import or the last sync
     mtime_ns INTEGER NOT NULL,
-    blake3 BLOB NOT NULL,           -- of the file's contents
     caption TEXT,                   -- imported from caption_path, NULL if there was none
     caption_path TEXT,
-    output_stem TEXT NOT NULL
+    output_stem TEXT NOT NULL,
+    missing INTEGER NOT NULL DEFAULT 0  -- not found by the last sync
 );
 CREATE TABLE ops (
     id INTEGER PRIMARY KEY,
@@ -141,11 +144,13 @@ class Project:
         self.db = sqlite3.connect(database, check_same_thread=False, isolation_level=None)
         self.db.execute("PRAGMA journal_mode = WAL")
         self.db.execute("PRAGMA synchronous = NORMAL")
-        self.sources = {bytes.fromhex(key): Path(value) for key, value in self.settings["sources"].items()}
+        self.sources = {bytes.fromhex(key): Path(value["path"]) for key, value in self.settings["sources"].items()}
+        # How each source was imported: directory (else single files), recursive, include_hidden, captions.
+        self.source_modes = {
+            bytes.fromhex(key): {k: v for k, v in value.items() if k != "path"} for key, value in self.settings["sources"].items()
+        }
         self.items = {}
-        for row in self.db.execute(
-            "SELECT id, source_id, path, size, mtime_ns, blake3, caption, caption_path, output_stem FROM items ORDER BY rowid"
-        ):
+        for row in self.db.execute(f"SELECT {', '.join(ITEM_COLUMNS)} FROM items ORDER BY rowid"):
             self.items[row[0]] = self._item(row)
         for name in ("masks", "patches", "output"):
             (self.directory / name).mkdir(parents=True, exist_ok=True)
@@ -162,8 +167,8 @@ class Project:
     @staticmethod
     def _item(row) -> dict:
         safe_relative(row[2])
-        safe_relative(row[8])
-        return dict(zip(("id", "source_id", "path", "size", "mtime_ns", "blake3", "caption", "caption_path", "output_stem"), row))
+        safe_relative(row[7])
+        return dict(zip(ITEM_COLUMNS, row))
 
     def lock(self) -> None:
         """Hold the project for one editor. The OS releases the lock when the process ends, however it ends."""
@@ -182,7 +187,9 @@ class Project:
         self.db.close()
 
     def save_settings(self) -> None:
-        self.settings["sources"] = {key.hex(): str(value) for key, value in self.sources.items()}
+        self.settings["sources"] = {
+            key.hex(): {"path": str(value), **self.source_modes[key]} for key, value in self.sources.items()
+        }
         atomic_json(self.directory / "project.json", self.settings)
 
     def source_path(self, item: bytes) -> Path:
@@ -196,22 +203,33 @@ class Project:
         captions: bool = True,
         recursive: bool = False,
         include_hidden: bool = False,
+        filters: Sequence[tuple[str, str]] = (),
         progress: Callable[[int, int], None] = lambda done, total: None,
     ) -> tuple[int, int]:
-        """Import the images in directories (with ``recursive``, also in their subdirectories) and individual files. With ``captions``, a same-stem ``.txt`` becomes the
-        image's imported caption. An image already in the project, through any source folder that contains it, is
-        skipped and keeps its edits. Hidden files and directories inside an imported directory are skipped unless
-        ``include_hidden``. Every new image is hashed, so this reads all of them once; progress is committed every
-        1000 images, and running the import again resumes it. Returns ``(imported, skipped)``."""
+        """Import the images in directories (with ``recursive``, also in their subdirectories) and individual files.
+        With ``captions``, a same-stem ``.txt`` becomes the image's imported caption. An image already in the project,
+        through any source folder that contains it, is skipped and keeps its edits. Hidden files and directories inside
+        an imported directory are skipped unless ``include_hidden``, and so is whatever the rsync-style ``filters``
+        (``("+" | "-", pattern)``, see :class:`~picurate.common.images.PathFilter`) exclude below a directory; files
+        given by name are not filtered. Images are only statted, not read; progress is
+        committed every 1000 images, and running the import again resumes it. How a source folder was imported is
+        recorded for :meth:`sync` (a directory import widens what an earlier one recorded, and its filters replace
+        earlier ones). Returns
+        ``(imported, skipped)``."""
         known = set(self.items)
         names = {row["output_stem"].casefold() for row in self.items.values()}
         candidates = []
         new_sources = {}  # recorded once an image is actually imported from them
+        modes = {}
+        filters = [list(rule) for rule in filters]
+        path_filter = PathFilter(filters)
         for entry in paths:
             entry = Path(entry).expanduser().resolve()
             root = entry if entry.is_dir() else entry.parent
             if entry.is_dir():
-                listing = list_directory_relative(str(entry), recursive=recursive, include_hidden=include_hidden)
+                listing = list_directory_relative(
+                    str(entry), recursive=recursive, include_hidden=include_hidden, path_filter=path_filter
+                )
                 files = sorted(entry / name for name in listing)
             else:
                 files = [entry]
@@ -219,6 +237,15 @@ class Project:
             source_id = next((key for key, value in known_sources.items() if value == root), None)
             if source_id is None:
                 source_id = new_sources[root] = new_source_id()
+            old = modes.get(source_id) or self.source_modes.get(source_id) or {}
+            directory = entry.is_dir()
+            modes[source_id] = {
+                "directory": old.get("directory", False) or directory,
+                "recursive": old.get("recursive", False) or (directory and recursive),
+                "include_hidden": old.get("include_hidden", False) or (directory and include_hidden),
+                "captions": captions,
+                "filters": filters if directory else old.get("filters", []),
+            }
             candidates += [(root, source_id, path) for path in files if path.suffix.lower() in EXTENSIONS]
 
         def present(path: Path) -> bool:
@@ -254,11 +281,10 @@ class Project:
             if source_id not in self.sources:
                 # Publishing a source folder before its items is safe if interrupted.
                 self.sources[source_id] = root
+                self.source_modes[source_id] = modes[source_id]
                 self.save_settings()
             stat = path.stat()
-            rows.append(
-                (identifier, source_id, relative, stat.st_size, stat.st_mtime_ns, file_digest(path), caption, caption_path, stem)
-            )
+            rows.append((identifier, source_id, relative, stat.st_size, stat.st_mtime_ns, caption, caption_path, stem, 0))
             names.add(stem.casefold())
             known.add(identifier)
             imported += 1
@@ -266,25 +292,83 @@ class Project:
                 self._insert_items(rows)
                 rows = []
         self._insert_items(rows)
+        changed = {key: mode for key, mode in modes.items() if key in self.sources and self.source_modes.get(key) != mode}
+        if changed:
+            self.source_modes.update(changed)
+            self.save_settings()
         progress(len(candidates), len(candidates))
         return imported, skipped
+
+    def sync(self, progress: Callable[[int, int], None] = lambda done, total: None) -> dict:
+        """Bring the project up to date with its source folders: import new images of directory sources (as they
+        were imported), record the size and mtime of changed images, and mark images that are gone as missing (or no
+        longer missing). A source folder that is not there at all (unmounted, moved) is skipped and listed; relink it.
+        Imported captions and every decision are kept. Returns counts of ``added``, ``changed``, ``missing`` and
+        ``back``, and the unavailable source folders."""
+        counts = {"added": 0, "changed": 0, "missing": 0, "back": 0}
+        unavailable = {key for key, root in self.sources.items() if not root.is_dir()}
+        updates = []
+        for done, (key, row) in enumerate(list(self.items.items())):
+            progress(done, len(self.items))
+            if row["source_id"] in unavailable:
+                continue
+            try:
+                stat = (self.sources[row["source_id"]] / row["path"]).stat()
+            except OSError:
+                if not row["missing"]:
+                    counts["missing"] += 1
+                    updates.append((row["size"], row["mtime_ns"], 1, key))
+                continue
+            if row["missing"]:
+                counts["back"] += 1
+            elif (stat.st_size, stat.st_mtime_ns) != (row["size"], row["mtime_ns"]):
+                counts["changed"] += 1
+            else:
+                continue
+            updates.append((stat.st_size, stat.st_mtime_ns, 0, key))
+        with self._lock:
+            self.db.execute("BEGIN")
+            self.db.executemany("UPDATE items SET size = ?, mtime_ns = ?, missing = ? WHERE id = ?", updates)
+            self.db.execute("COMMIT")
+        for size, mtime_ns, missing, key in updates:
+            self.items[key].update(size=size, mtime_ns=mtime_ns, missing=missing)
+        for key, mode in list(self.source_modes.items()):
+            if mode["directory"] and key not in unavailable:
+                added, _ = self.import_images(
+                    [self.sources[key]],
+                    captions=mode["captions"],
+                    recursive=mode["recursive"],
+                    include_hidden=mode["include_hidden"],
+                    filters=mode["filters"],
+                )
+                counts["added"] += added
+        progress(len(self.items), len(self.items))
+        return {**counts, "unavailable": [self.sources[key] for key in unavailable]}
 
     def _insert_items(self, rows: list[tuple]) -> None:
         with self._lock:
             self.db.execute("BEGIN")
-            self.db.executemany("INSERT INTO items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            self.db.executemany(
+                f"INSERT INTO items ({', '.join(ITEM_COLUMNS)}) VALUES ({', '.join('?' * len(ITEM_COLUMNS))})", rows
+            )
             self.db.execute("COMMIT")
             for row in rows:
                 self.items[row[0]] = self._item(row)
 
     def relink(self, source_id: bytes, root) -> None:
-        """Point a source folder elsewhere, after checking the contents of every image in it."""
+        """Point a source folder elsewhere, after checking that every image in it is there with the same file size
+        (images already marked missing may stay missing, but at least one image must be found)."""
         root = Path(root).expanduser().resolve()
+        found = 0
         for row in self.items.values():
             if row["source_id"] == source_id:
                 path = root / row["path"]
-                if not path.is_file() or file_digest(path) != row["blake3"]:
+                if path.is_file() and path.stat().st_size == row["size"]:
+                    found += 1
+                elif path.exists() or not row["missing"]:
                     raise ValueError(f"Missing or different source image: {path}")
+        if not found:
+            raise ValueError(f"None of the source's images are in {root}")
         self.sources[source_id] = root
         self.save_settings()
 
@@ -306,7 +390,7 @@ class Project:
         state = {
             "item_id": item,
             "image": row["path"],
-            "source": {"size": row["size"], "mtime_ns": row["mtime_ns"], "blake3": row["blake3"].hex()},
+            "source": {"size": row["size"], "mtime_ns": row["mtime_ns"]},
             **{field: json.loads(json.dumps(default)) for field, default in DEFAULTS.items()},
             **decisions,
         }
@@ -486,6 +570,22 @@ class Project:
         }
 
 
-def validate_source(path, state: dict) -> None:
-    if file_digest(path).hex() != state["source"]["blake3"]:
-        raise ValueError("Source file changed; review the edit recipe before continuing")
+def validate_source(path, state: dict) -> str | None:
+    """Raise if the source image is missing; return a warning if its size or mtime differs from the recorded one.
+    Whether the edits still fit is decided by the image size (see :func:`check_image_size`)."""
+    try:
+        stat = Path(path).stat()
+    except OSError as error:
+        raise ValueError(f"Source image missing: {path}") from error
+    if (stat.st_size, stat.st_mtime_ns) != (state["source"]["size"], state["source"]["mtime_ns"]):
+        return f"Source file changed since import or the last sync: {path}"
+    return None
+
+
+def check_image_size(size: tuple[int, int], state: dict) -> None:
+    """Refuse edits made on an image of another size than ``size``."""
+    recorded = state.get("image_size")
+    if recorded is not None and list(size) != list(recorded):
+        raise ValueError(
+            f"The source image is now {size[0]}×{size[1]}, but its crop and fills were made on {recorded[0]}×{recorded[1]}"
+        )

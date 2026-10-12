@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import tempfile
 import uuid
@@ -11,7 +12,9 @@ from pathlib import Path
 from blake3 import blake3
 from PIL import Image, ImageDraw, ImageOps, ImageStat
 
-from ..project.project import EXTENSIONS, atomic_json, file_digest, safe_relative, validate_source
+from ..project.project import EXTENSIONS, atomic_json, check_image_size, file_digest, safe_relative, validate_source
+
+logger = logging.getLogger(__name__)
 
 
 def load_image(path) -> Image.Image:
@@ -58,6 +61,7 @@ def render(im: Image.Image, state: dict, crop: bool = True, project_dir=None) ->
     changed the pixels they were computed from."""
     if state.get("operations"):
         raise ValueError("This version cannot render recorded model operations")
+    check_image_size(im.size, state)
     result = im.copy()
     boxes = []
     for fill in state.get("fills", []):
@@ -102,7 +106,8 @@ def render(im: Image.Image, state: dict, crop: bool = True, project_dir=None) ->
 
 
 def export_one(source, output, state: dict, fmt: str, output_stem: str, project_dir=None) -> list[str]:
-    validate_source(source, state)
+    if warning := validate_source(source, state):
+        logger.warning("%s", warning)
     image = render(load_image(source), state, project_dir=project_dir)
     target = Path(output) / (str(safe_relative(output_stem)) + (".png" if fmt == "PNG" else ".webp"))
     target.parent.mkdir(parents=True, exist_ok=True)
