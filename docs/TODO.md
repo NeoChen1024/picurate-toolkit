@@ -12,11 +12,9 @@ GUI and the tagger's `update`/`export` go away; `encode-test`, the tagger's `run
 `dedupe-import` stay plain directories. Sources stay read-only in the sense that image contents are never modified;
 moving a discarded image into the project's trash is allowed.
 
-Project identity, stat-only import and sync, storage, per-field decisions with history, rollback and GC, and
-databases keyed by item ID are in place ([projects](project.md)). Still open:
+Project identity, stat-only import and sync, storage, per-field decisions with history, rollback and GC, databases
+keyed by item ID, and content hashes in the embedding database (reuse, source checks) are in place ([projects](project.md)). Still open:
 
-* [ ] **Verify sources against the embedding database's content hash** (when it has one for the item) in export and
-  relink, on top of the size checks ([sources](project.md#sources-and-identity)).
 * [ ] **Stages write only their own files; reading combines them** (one implementation in `picurate.project`, used by
   the editor, the tagger and export):
   * Excluded = (losers of decided groups in `review.sqlite`) overridden by the human exclusion decision (force keep
@@ -35,9 +33,6 @@ databases keyed by item ID are in place ([projects](project.md)). Still open:
   `picurate-dedupe-review`. Shared: the project, thumbnail and image loading, and every image marked with what
   excluded it (a duplicate group, a culling query, a human). The Duplicates tab is the current review window, keys
   unchanged. The Culling tab (below) loads embeddings, the text tower and tag scores only when first opened.
-* [ ] **Content hash in the embedding database**: BLAKE3 of the file, computed by the decode worker from the bytes it
-  reads anyway. `update-db --reuse-from DB` copies rows of the same model whose content hash matches instead of
-  encoding again (new images deduplicated with `dedupe-import --import-db`, then moved into the library).
 * [ ] **`dedupe-import`: a directory against a project.** `-i NEW_DIR --project LIB --trash-dir T` moves images of
   `NEW_DIR` already in `LIB` (its items not excluded) to `T`. `--import-db` becomes optional (without it the import
   side is encoded in memory). Duplicates within `NEW_DIR` stay out of scope.

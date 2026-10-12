@@ -189,6 +189,7 @@ def _update(
     include_hidden: bool,
     batch_size: int,
     workers: int | None,
+    reuse_from: str | None = None,
 ) -> None:
     logger.info("Updating database %s from %s", db, image_dir)
     try:
@@ -202,6 +203,7 @@ def _update(
             batch_size=batch_size,
             workers=workers,
             progress_factory=_progress_factory("Encoding", "image"),
+            reuse_from=reuse_from,
         )
     except RuntimeError as e:
         raise click.ClickException(str(e)) from e
@@ -546,6 +548,13 @@ def dedupe_import(
 @db_arg
 @model_options
 @update_options
+@click.option(
+    "--reuse-from",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Another database of the same model: images whose content (BLAKE3) it already holds are copied from it instead "
+    "of encoded. Every new or changed image is read once more to hash it.",
+)
 def update_db(
     image_dir: str,
     db: str,
@@ -559,6 +568,7 @@ def update_db(
     clean_orphans: bool,
     include_hidden: bool,
     skip_update: bool,
+    reuse_from: str | None,
 ) -> None:
     """Only (re)encode images into the database, without matching."""
     if not skip_update:
@@ -572,6 +582,7 @@ def update_db(
                 include_hidden=include_hidden,
                 batch_size=batch_size,
                 workers=workers,
+                reuse_from=reuse_from,
             )
     records, embeddings = _load(db)
     logger.info("%s holds %d embeddings of shape %s", db, len(records), embeddings.shape[1:])

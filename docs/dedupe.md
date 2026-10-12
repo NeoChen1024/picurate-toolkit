@@ -107,11 +107,14 @@ criteria = [
 
 **Database.** Table `embeddings` has one row per image: the [item ID](project.md#sources-and-identity) with the source
 ID and path (relative to the image directory) it is derived from, `mtime`, `size`, `width`, `height`, `format` as
-observed at encoding time, and the raw little-endian float16 embedding. Table `meta` records `model_id`, `dim`, `dtype`
+observed at encoding time, `blake3` of the file contents (hashed by the decode worker from the bytes it reads anyway),
+and the raw little-endian float16 embedding. Table `meta` records `model_id`, `dim`, `dtype`
 and `schema_version`; a database of another model or schema version is refused unless `--force-update` rebuilds it. FP16 storage is lossless: the model runs in FP16 on CUDA, so
 every value it emits is already an FP16 number. On update, stored mtimes are compared with the files on disk; changed
 or new images are (re)encoded and rows without a file are deleted. Writes are committed per batch, so an interrupted
-run keeps its progress.
+run keeps its progress. `update-db --reuse-from OTHER.sqlite` first hashes the images that need encoding and copies
+the embedding of every one whose contents another database of the same model already holds; this is how images
+deduplicated with `dedupe-import --import-db` and then moved into the library avoid a second encode.
 
 **Matching.** Embeddings are loaded as one `(N, D)` array and uploaded once. The self-dedupe searches the upper
 triangle of the distance matrix in blocks of rows (each distance block under 256 MiB), collects all pairs under the

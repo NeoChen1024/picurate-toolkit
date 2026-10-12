@@ -5,7 +5,8 @@ new, changed and vanished images. ``project.sqlite`` holds the items (one per im
 image) and the human decisions about them, stored per field: a current-state table, and a history in which every
 change belongs to an operation and records the value before and after it, so that one editing session or one batch
 decision can be rolled back as a unit, and old history can be pruned without breaking that. A field without a row has its default (for the caption: the derived one). Source images and their caption
-files are only ever read. The project keeps no content hash: an import only stats the files.
+files are only ever read. The project keeps no content hash: an import only stats the files. Once the images are
+encoded for deduplication, export and relink check them against the content hashes in ``embeddings.sqlite``.
 
 An item is identified by ``(source_id, relative path)`` (see :mod:`picurate.common.images`); a project's
 ``source_id`` is 256 random bits created when a source folder is first imported.
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -23,9 +25,10 @@ import time
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 
-from blake3 import blake3
+from ..common.images import STANDALONE_SOURCE, PathFilter, file_digest, item_id, list_directory_relative
+from ..dedupe.db_store import SCHEMA_VERSION as EMBEDDING_SCHEMA
 
-from ..common.images import STANDALONE_SOURCE, PathFilter, item_id, list_directory_relative
+logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 5
 # What a project imports, and what an export refuses to overwrite: static formats a training pipeline reads.
@@ -37,6 +40,7 @@ DEFAULTS = {"caption": None, "crop": None, "fills": [], "image_size": None, "rev
 COMMIT_EVERY = 1000
 ITEM_COLUMNS = ("id", "source_id", "path", "size", "mtime_ns", "caption", "caption_path", "output_stem", "missing")
 ARTIFACT_DIRS = ("masks", "patches")
+EMBEDDINGS = "embeddings.sqlite"  # written by picurate-dedupe; only read here, for the content hashes
 
 SCHEMA = """
 CREATE TABLE items (
@@ -80,15 +84,6 @@ def new_source_id() -> bytes:
     while (value := os.urandom(32)) == STANDALONE_SOURCE:
         pass
     return value
-
-
-def file_digest(path) -> bytes:
-    """BLAKE3 of a file's contents, read sequentially (parallel reads would make spinning disks seek)."""
-    hasher = blake3()
-    with open(path, "rb") as stream:
-        while chunk := stream.read(1 << 20):
-            hasher.update(chunk)
-    return hasher.digest()
 
 
 def safe_relative(value) -> Path:
@@ -356,14 +351,18 @@ class Project:
                 self.items[row[0]] = self._item(row)
 
     def relink(self, source_id: bytes, root) -> None:
-        """Point a source folder elsewhere, after checking that every image in it is there with the same file size
-        (images already marked missing may stay missing, but at least one image must be found)."""
+        """Point a source folder elsewhere, after checking that every image in it is there with the same file size and,
+        if the embedding database has it, the same content hash (images already marked missing may stay missing, but at
+        least one image must be found)."""
         root = Path(root).expanduser().resolve()
+        hashes = self.content_hashes()
         found = 0
-        for row in self.items.values():
+        for item, row in self.items.items():
             if row["source_id"] == source_id:
                 path = root / row["path"]
                 if path.is_file() and path.stat().st_size == row["size"]:
+                    if item in hashes and file_digest(path) != hashes[item][1]:
+                        raise ValueError(f"Source image with other contents than when it was encoded: {path}")
                     found += 1
                 elif path.exists() or not row["missing"]:
                     raise ValueError(f"Missing or different source image: {path}")
@@ -555,7 +554,23 @@ class Project:
             self.db.execute("VACUUM")
         return {"entries": entries, "ops": ops, "artifacts": artifacts}
 
+    def content_hashes(self) -> dict[bytes, tuple[float, bytes]]:
+        """``{item: (mtime, BLAKE3)}`` as of encoding, from the project's embedding database; empty without one."""
+        path = self.directory / EMBEDDINGS
+        if not path.exists():
+            return {}
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        try:
+            version = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+            if version is None or version[0] != EMBEDDING_SCHEMA:
+                logger.warning("%s has another schema version; source images are not checked against it", path)
+                return {}
+            return {row[0]: (row[1], row[2]) for row in conn.execute("SELECT id, mtime, blake3 FROM embeddings")}
+        finally:
+            conn.close()
+
     def export_snapshot(self, states, fmt: str) -> dict:
+        hashes = self.content_hashes()
         return {
             "project_id": self.settings["project_id"],
             "format": fmt,
@@ -564,6 +579,9 @@ class Project:
                     "state": {**state, "item_id": state["item_id"].hex()},
                     "source_path": str(self.source_path(state["item_id"])),
                     "output_stem": self.items[state["item_id"]]["output_stem"],
+                    "content": (
+                        [hashes[state["item_id"]][0], hashes[state["item_id"]][1].hex()] if state["item_id"] in hashes else None
+                    ),
                 }
                 for state in states
             ],

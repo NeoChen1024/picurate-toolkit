@@ -6,6 +6,7 @@ behind so the GPU never waits for the decoders (or the other way round).
 from __future__ import annotations
 
 import contextlib
+import io
 import logging
 import multiprocessing as mp
 import os
@@ -17,6 +18,7 @@ from typing import TypeVar
 
 import PIL.Image
 import torch
+from blake3 import blake3
 
 from .images import ImageRecord, Item, Roots
 
@@ -38,14 +40,19 @@ def _load_image(
 
     Any failure here means "skip this file", so the catch is deliberately broad: a corrupt file must not take the
     whole run down, and Pillow raises a wide variety of exception types for broken inputs.
+
+    The file is read whole once, so its BLAKE3 comes along without a second read.
     """
     try:
         st = os.stat(image_path)
-        with PIL.Image.open(image_path) as img:
+        with open(image_path, "rb") as stream:
+            data = stream.read()
+        digest = blake3(data).digest()
+        with PIL.Image.open(io.BytesIO(data)) as img:
             fmt = img.format or os.path.splitext(item.path)[1].lstrip(".").upper()
             width, height = img.size
             arrays = preprocessor(img)
-        record = ImageRecord(item.path, st.st_mtime, st.st_size, width, height, fmt, item.source_id, item.id)
+        record = ImageRecord(item.path, st.st_mtime, st.st_size, width, height, fmt, item.source_id, item.id, digest)
         return image_path, (record, arrays)
     except Exception as e:  # noqa: BLE001 - see docstring
         return image_path, e

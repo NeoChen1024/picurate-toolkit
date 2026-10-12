@@ -166,6 +166,15 @@ def item_id(source_id: bytes, relative_path: str) -> bytes:
     return blake3(data, derive_key_context=ITEM_ID_CONTEXT).digest()
 
 
+def file_digest(path) -> bytes:
+    """BLAKE3 of a file's contents, read sequentially (parallel reads would make spinning disks seek)."""
+    hasher = blake3()
+    with open(path, "rb") as stream:
+        while chunk := stream.read(1 << 20):
+            hasher.update(chunk)
+    return hasher.digest()
+
+
 def standalone_roots(image_dir: str) -> dict[bytes, str]:
     return {STANDALONE_SOURCE: image_dir}
 
@@ -199,6 +208,7 @@ class ImageRecord:
     format: str  # PIL format name: "JPEG", "PNG", "GIF", "WEBP", ...
     source_id: bytes = STANDALONE_SOURCE
     id: bytes = field(default=b"")
+    blake3: bytes | None = None  # of the file's contents, when it was read whole
 
     def __post_init__(self) -> None:
         if not self.id:

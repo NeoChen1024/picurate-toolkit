@@ -49,10 +49,12 @@ over the source ID, a NUL byte and the path). The embedding, review and tag data
 a standalone image directory has the all-zero source ID, so its databases use the same IDs.
 
 **Relink Sources** in the editor points a source folder somewhere else after checking that every image is there with
-its recorded file size (images marked missing may stay missing, but at least one must be found); the IDs do not
-change.
+its recorded file size and, for images in the project's `embeddings.sqlite`, the same content hash (images marked
+missing may stay missing, but at least one must be found); the IDs do not change.
 
-The project keeps no content hash. A crop and fills record the image size they were made on: a source image of
+The project keeps no content hash of its own; once the images are encoded for deduplication, the BLAKE3 in
+`embeddings.sqlite` is used. Export refuses a source whose contents differ while its mtime is still the one recorded
+at encoding (damage or a swapped file) and only warns when the mtime changed too. A crop and fills record the image size they were made on: a source image of
 another size keeps its caption and review status editable, but its image edits cannot be changed or exported, and its
 thumbnail is marked `[!]`. Another file size or mtime alone only warns. LaMa repairs additionally refuse when the
 pixels they were computed from changed ([dataset editor](dataset-editor.md#image-edits)).

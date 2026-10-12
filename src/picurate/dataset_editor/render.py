@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
+import os
 import shutil
 import tempfile
 import uuid
@@ -12,7 +14,8 @@ from pathlib import Path
 from blake3 import blake3
 from PIL import Image, ImageDraw, ImageOps, ImageStat
 
-from ..project.project import EXTENSIONS, atomic_json, check_image_size, file_digest, safe_relative, validate_source
+from ..common.images import file_digest
+from ..project.project import EXTENSIONS, atomic_json, check_image_size, safe_relative, validate_source
 
 logger = logging.getLogger(__name__)
 
@@ -105,10 +108,26 @@ def render(im: Image.Image, state: dict, crop: bool = True, project_dir=None) ->
     return result
 
 
-def export_one(source, output, state: dict, fmt: str, output_stem: str, project_dir=None) -> list[str]:
+def check_content(source, data: bytes, content) -> None:
+    """Compare a source's bytes with ``content`` = ``[mtime, BLAKE3 hex]`` from the embedding database: other contents
+    under the same mtime mean damage or a swapped file and are refused; with a new mtime, an edit, which only warns."""
+    mtime, digest = content
+    if blake3(data).hexdigest() != digest:
+        if os.stat(source).st_mtime == mtime:
+            raise ValueError(f"Source image contents changed without a new modification time (damaged?): {source}")
+        logger.warning("Source image changed since it was encoded: %s", source)
+
+
+def export_one(source, output, state: dict, fmt: str, output_stem: str, project_dir=None, content=None) -> list[str]:
     if warning := validate_source(source, state):
         logger.warning("%s", warning)
-    image = render(load_image(source), state, project_dir=project_dir)
+    if content is None:
+        image = load_image(source)
+    else:
+        data = Path(source).read_bytes()
+        check_content(source, data, content)
+        image = load_image(io.BytesIO(data))
+    image = render(image, state, project_dir=project_dir)
     target = Path(output) / (str(safe_relative(output_stem)) + (".png" if fmt == "PNG" else ".webp"))
     target.parent.mkdir(parents=True, exist_ok=True)
     image.save(target, format=fmt, **({"lossless": True, "method": 4} if fmt == "WEBP" else {}))
@@ -151,7 +170,9 @@ def export_project(directory, snapshot: dict, cancelled=lambda: False, progress=
             # Refuse to replace unmanaged captions/images in any supported format.
             if any((stem.parent / (stem.name + ext)).exists() for ext in EXTENSIONS | {".txt"}):
                 raise ValueError(f"Unmanaged output file conflicts with {item['output_stem']}")
-            files.extend(export_one(item["source_path"], stage, item["state"], fmt, item["output_stem"], directory))
+            files.extend(
+                export_one(item["source_path"], stage, item["state"], fmt, item["output_stem"], directory, item.get("content"))
+            )
             progress(i + 1)
         if cancelled():
             return 0, True

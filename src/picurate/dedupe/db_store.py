@@ -2,7 +2,9 @@
 
 One database file holds every embedding of an image directory or project. Each row is keyed by the item ID (see
 :mod:`picurate.common.images`), keeps the source ID and relative path it was derived from, and stores the file metadata
-observed at encoding time (mtime, size, width, height, format) plus the raw float16 embedding bytes. CLIP models run in fp16 on CUDA, so their outputs are exactly representable in fp16 and
+observed at encoding time (mtime, size, width, height, format, BLAKE3 of the contents) plus the raw float16 embedding
+bytes. The content hash lets another database's rows be reused for the same file elsewhere, and lets a project verify
+its sources. CLIP models run in fp16 on CUDA, so their outputs are exactly representable in fp16 and
 storing them as fp32 would just double the size.
 
 A ``meta`` table records the model id, embedding dimension and schema version so a database is never silently reused
@@ -19,7 +21,7 @@ import numpy as np
 
 from ..common.images import ImageRecord
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 EMBEDDING_DTYPE = np.float16
 
 _META = """
@@ -38,8 +40,10 @@ CREATE TABLE IF NOT EXISTS embeddings (
     width     INTEGER NOT NULL,
     height    INTEGER NOT NULL,
     format    TEXT NOT NULL,
+    blake3    BLOB NOT NULL,
     embedding BLOB NOT NULL
 );
+CREATE INDEX IF NOT EXISTS embeddings_blake3 ON embeddings (blake3);
 """
 # Note: deliberately a rowid table. WITHOUT ROWID stores rows in an index b-tree whose small local payload limit pushes
 # every ~2.5 KiB embedding into overflow pages (~60% file bloat and 4x slower writes).
@@ -158,13 +162,14 @@ class EmbeddingDB:
                     int(rec.width),
                     int(rec.height),
                     rec.format,
+                    rec.blake3,
                     vec.tobytes(),
                 )
             )
         if prepared:
             self.conn.executemany(
-                "INSERT OR REPLACE INTO embeddings (id, source_id, path, mtime, size, width, height, format, embedding)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO embeddings (id, source_id, path, mtime, size, width, height, format, blake3, embedding)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 prepared,
             )
         self.conn.commit()
@@ -178,20 +183,32 @@ class EmbeddingDB:
         self.conn.commit()
         return cur.rowcount if cur.rowcount >= 0 else len(ids)
 
+    def by_content(self, digests: Iterable[bytes]) -> dict[bytes, tuple[int, int, str, bytes]]:
+        """``{blake3: (width, height, format, embedding bytes)}`` for the given content hashes that have a row."""
+        out = {}
+        for digest in digests:
+            row = self.conn.execute(
+                "SELECT width, height, format, embedding FROM embeddings WHERE blake3 = ? LIMIT 1", (digest,)
+            ).fetchone()
+            if row is not None:
+                out[digest] = row
+        return out
+
     def load_all(self) -> tuple[list[ImageRecord], np.ndarray]:
         """Every row as ``(records, (N, D) float16 array)``, ordered by source and path, with one memory copy for the
         matrix."""
         dim = self.dim
         rows = self.conn.execute(
-            "SELECT path, mtime, size, width, height, format, source_id, id, embedding FROM embeddings ORDER BY source_id, path"
+            "SELECT path, mtime, size, width, height, format, source_id, id, blake3, embedding FROM embeddings"
+            " ORDER BY source_id, path"
         ).fetchall()
         if not rows:
             return [], np.empty((0, dim or 0), dtype=EMBEDDING_DTYPE)
         if dim is None:
             raise RuntimeError(f"Database {self.path} has rows but no recorded dimension; it is corrupt.")
-        records = [ImageRecord(*row[:8]) for row in rows]
+        records = [ImageRecord(*row[:9]) for row in rows]
         # bytearray.join yields a mutable buffer, so frombuffer below is a writable zero-copy view.
-        blob = bytearray().join(row[8] for row in rows)
+        blob = bytearray().join(row[9] for row in rows)
         expected = len(rows) * dim * np.dtype(EMBEDDING_DTYPE).itemsize
         if len(blob) != expected:
             raise RuntimeError(f"Database {self.path} embedding blobs total {len(blob)} bytes, expected {expected}; it is corrupt.")

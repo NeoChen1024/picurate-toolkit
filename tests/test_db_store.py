@@ -8,7 +8,7 @@ from picurate.dedupe.db_store import EmbeddingDB, ImageRecord, ModelMismatchErro
 
 
 def rec(path, mtime=1.0, size=1, width=4, height=3, fmt="JPEG"):
-    return ImageRecord(path, mtime, size, width, height, fmt)
+    return ImageRecord(path, mtime, size, width, height, fmt, blake3=bytes(32))
 
 
 class EmbeddingDBTests(unittest.TestCase):
