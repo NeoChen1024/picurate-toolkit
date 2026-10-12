@@ -63,7 +63,12 @@ pixels they were computed from changed ([dataset editor](dataset-editor.md#image
 
 What a person decides about an image is stored per field: the caption, the crop, the fills, the review status and
 an exclusion (none, force keep or force exclude, with a reason). A field without a stored value has its default; for
-the caption that is the imported one, so an unedited caption keeps following it. Excluded images are not exported.
+the caption that is the imported one, so an unedited caption keeps following it.
+
+The other stages write only their own files in the project directory, and reading the project combines them with
+these decisions. An image is **excluded** when a person forced it out, or, with no human exclusion decision, when a
+decided duplicate group in `review.sqlite` does not keep it ([deduplication](dedupe.md#what-takes-part)), unless a
+person excluded every copy the group keeps; force keep overrides the group. Excluded images are not exported, and the editor marks them with what excluded them.
 
 Every change belongs to an operation (in the editor: one visit to an image). The history keeps one entry per field
 and operation with the value before and after it; a field that ends an operation where it started gets no entry.

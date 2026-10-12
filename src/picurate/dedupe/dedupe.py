@@ -10,8 +10,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ..common.images import ImageRecord
-from .keeping import Policy
 from .similarity import DistanceIndex, find_close_pairs_cross, find_close_pairs_self
 
 logger = logging.getLogger(__name__)
@@ -96,17 +94,6 @@ def group_edges(n: int, edges: Sequence[tuple[int, int, float]]) -> list[Duplica
     return sorted(by_root.values(), key=lambda g: g.members[0])
 
 
-def find_duplicate_groups(
-    paths: Sequence[str], index: DistanceIndex, threshold: float, progress: Progress = None
-) -> list[list[int]]:
-    """Connected components of the "distance <= threshold" relation, as lists of row indices.
-
-    The relation is not transitive: A may match B and B match C while A and C fall just outside the threshold, so all
-    edges are collected first and merged with union-find. Only the upper triangle is searched, in blocks of rows.
-    """
-    return [g.members for g in group_edges(index.n, find_duplicate_edges(paths, index, threshold, progress))]
-
-
 def find_cross_pairs(
     query_paths: Sequence[str],
     queries: DistanceIndex,
@@ -127,21 +114,6 @@ def find_cross_pairs(
     return pairs
 
 
-def find_cross_duplicates(
-    query_paths: Sequence[str],
-    queries: DistanceIndex,
-    base_paths: Sequence[str],
-    base: DistanceIndex,
-    threshold: float,
-    progress: Progress = None,
-) -> dict[int, int]:
-    """For every query row that has a match in ``base``: ``{query_row: number_of_matches}``."""
-    hits: dict[int, int] = {}
-    for i, _, _ in find_cross_pairs(query_paths, queries, base_paths, base, threshold, progress):
-        hits[i] = hits.get(i, 0) + 1
-    return hits
-
-
 def move_to_trash(root_dir: str, relative_path: str, trash_dir: str, *, dry_run: bool, reason: str = "") -> bool:
     """Move one file into ``trash_dir`` preserving its relative path. Returns True when moved (or would be, in dry run)."""
     src = os.path.join(root_dir, relative_path)
@@ -158,17 +130,3 @@ def move_to_trash(root_dir: str, relative_path: str, trash_dir: str, *, dry_run:
         return False
     logger.info('Moved "%s" to trash%s', src, suffix)
     return True
-
-
-def trash_duplicate_groups(
-    groups: Sequence[Sequence[int]], records: Sequence[ImageRecord], root_dir: str, trash_dir: str, policy: Policy, *, dry_run: bool
-) -> int:
-    """Apply ``policy`` to each group, keep the winner, move the rest. Returns the number of files moved."""
-    moved = 0
-    for group in groups:
-        candidates = [records[i] for i in group]
-        keep = policy.select(candidates)
-        for rec in candidates:
-            if rec is not keep and move_to_trash(root_dir, rec.path, trash_dir, dry_run=dry_run, reason=f"keeping {keep.path}"):
-                moved += 1
-    return moved

@@ -1,21 +1,23 @@
-"""Review sessions: duplicate groups found at a loose threshold, the reviewer's decisions, and applying them.
+"""Review sessions: a project's duplicate groups found at a loose threshold, and the reviewer's decisions.
 
-Everything lives in a SQLite file of its own next to the embedding database (``pictures.review.sqlite`` for
-``pictures.sqlite``), so a ``--force-update`` rebuild of the embeddings never touches decisions, and a review of a
-large library (tens of thousands of groups) is indexed rather than parsed. No Qt in here; the GUI and the CLI both
-drive this module.
+Everything lives in ``review.sqlite`` in the project, a file of its own beside ``embeddings.sqlite``, so a
+``--force-update`` rebuild of the embeddings never touches decisions, and a review of a large library (tens of
+thousands of groups) is indexed rather than parsed. No Qt in here; the GUI and the CLI both drive this module.
+Nothing is moved from here: the losers of decided groups count as excluded when the project is read.
 
 Members are identified by item ID (see :mod:`picurate.common.images`), and a group by the BLAKE3 hash of its sorted
 member IDs. Re-matching upserts by that key: an unchanged group keeps
 its row, decision and history; a group whose membership changed is a new group, and the old row is marked
 ``stale``. A group nobody has changed yet (``touched`` is 0) gets its starting status re-derived on every run, so a
-new rule (the pixel check, another auto threshold) reaches the groups still waiting for review.
+new rule (the pixel check, another auto threshold) reaches the groups still waiting for review. A new group that
+shares members with a group the reviewer changed starts pending with that group's keeps (``carried_from``), and is
+not re-derived: a human decision is only ever replaced by another one.
 
 Starting status: with the pixel check, ``decided`` when every edge differs only by compression, else ``pending``;
 without it, ``decided`` when every edge is within the auto threshold.
 
-A decided group must keep at least one member, unless the reviewer marked it ``discard``: then applying it moves every
-member. Unticking every keep is not enough on its own, since that is as often a slip as an intent.
+A decided group must keep at least one member, unless the reviewer marked it ``discard``: then every member is
+excluded. Unticking every keep is not enough on its own, since that is as often a slip as an intent.
 
 A file of another schema version is refused; there is no upgrade, matching runs again into a new file.
 """
@@ -27,21 +29,24 @@ import logging
 import os
 import sqlite3
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from blake3 import blake3
 
-from ..common.images import ImageRecord, Roots, standalone_roots
-from .dedupe import DuplicateGroup, move_to_trash
+from ..common.images import ImageRecord, Roots
 from .keeping import Policy
 from .pixel_check import SAME, PixelVerdict
 
+if TYPE_CHECKING:
+    from .dedupe import DuplicateGroup  # imports torch; only a type here
+
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 GROUP_KEY_CONTEXT = "picurate review group v1"
-STATUSES = ("pending", "decided", "skipped", "applied", "stale")
+STATUSES = ("pending", "decided", "skipped", "stale")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS groups (
@@ -55,7 +60,8 @@ CREATE TABLE IF NOT EXISTS groups (
     updated_at   REAL NOT NULL,
     pixel        TEXT,              -- 'same' when every edge differs only by compression, 'different', NULL: unchecked
     touched      INTEGER NOT NULL DEFAULT 0, -- changed by the reviewer since it was created
-    discard      INTEGER NOT NULL DEFAULT 0  -- the reviewer chose to move every member, keeping none
+    discard      INTEGER NOT NULL DEFAULT 0, -- the reviewer chose to exclude every member, keeping none
+    carried_from INTEGER                -- keeps taken over from this (now stale) group the reviewer had changed
 );
 CREATE INDEX IF NOT EXISTS groups_status ON groups (status, min_distance);
 CREATE TABLE IF NOT EXISTS members (
@@ -93,20 +99,7 @@ CREATE TABLE IF NOT EXISTS history (
     discard   INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS history_group ON history (group_id, id);
-CREATE TABLE IF NOT EXISTS applied (
-    item       BLOB PRIMARY KEY,
-    path       TEXT NOT NULL,
-    trash_path TEXT NOT NULL,
-    group_id   INTEGER NOT NULL REFERENCES groups (id) ON DELETE CASCADE,
-    at         REAL NOT NULL
-);
 """
-
-
-def default_review_path(db_path: str) -> str:
-    """``pictures.sqlite`` -> ``pictures.review.sqlite``."""
-    root, _ = os.path.splitext(db_path)
-    return root + ".review.sqlite"
 
 
 def group_key(ids: Iterable[bytes]) -> bytes:
@@ -127,6 +120,7 @@ class GroupRow:
     touched: bool = False
     discard: bool = False
     kept: int | None = None  # members kept; None when not read
+    carried_from: int | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -159,6 +153,7 @@ class UpsertStats:
     redecided: int = 0  # untouched groups that went from pending to decided under the current rule
     reopened: int = 0  # untouched groups that went from decided back to pending
     pixel_same: int = 0  # groups of this run whose every edge differs only by compression
+    carried: int = 0  # new groups that took over the keeps of a changed group sharing members
 
 
 def initial_status(max_distance: float, pixel: str | None, auto_threshold: float) -> str:
@@ -168,13 +163,6 @@ def initial_status(max_distance: float, pixel: str | None, auto_threshold: float
 
 
 EdgeKey = tuple[bytes, bytes]
-
-
-@dataclass(slots=True, frozen=True)
-class Move:
-    group_id: int
-    member: MemberRow
-    keep: tuple[str, ...]  # paths of the kept members; empty for a discarded group
 
 
 class ReviewDB:
@@ -220,15 +208,14 @@ class ReviewDB:
     def set_meta(self, key: str, value: object) -> None:
         self.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, str(value)))
 
-    def begin_session(self, *, image_dir: str, model_id: str, review_threshold: float, auto_threshold: float, policy: str) -> None:
-        """Record what the groups were produced with. A later session with another model refuses to mix."""
-        previous = self.get_meta("model_id")
-        if previous is not None and previous != model_id:
-            raise ValueError(
-                f"Review database {self.path} holds groups from model '{previous}', not '{model_id}'. Use another file."
-            )
+    def begin_session(self, *, project_id: str, model_id: str, review_threshold: float, auto_threshold: float, policy: str) -> None:
+        """Record what the groups were produced with. A later session with another model or project refuses to mix."""
+        for key, value in (("project_id", project_id), ("model_id", model_id)):
+            previous = self.get_meta(key)
+            if previous is not None and previous != value:
+                raise ValueError(f"Review database {self.path} holds groups of {key} '{previous}', not '{value}'. Move it away.")
         for k, v in (
-            ("image_dir", os.path.abspath(image_dir)),
+            ("project_id", project_id),
             ("model_id", model_id),
             ("review_threshold", review_threshold),
             ("auto_threshold", auto_threshold),
@@ -250,6 +237,22 @@ class ReviewDB:
         return None if v is None else float(v)
 
     # -- matching results --------------------------------------------------------------------------------------------
+
+    def _decided_before(self, items: Sequence[bytes], current: set[bytes]) -> tuple[int, dict[bytes, bool]] | None:
+        """The most recently changed group the reviewer touched (or that carried keeps itself) sharing a member with
+        ``items`` and not part of this run, with its keeps."""
+        marks = ",".join("?" * len(items))
+        rows = self.conn.execute(
+            f"""SELECT DISTINCT g.id, g.key FROM groups g JOIN members m ON m.group_id = g.id
+                WHERE m.item IN ({marks}) AND (g.touched OR g.carried_from IS NOT NULL)
+                ORDER BY g.updated_at DESC, g.id DESC""",
+            list(items),
+        ).fetchall()
+        for row in rows:
+            if row["key"] not in current:
+                keeps = self.conn.execute("SELECT item, keep FROM members WHERE group_id = ?", (row["id"],)).fetchall()
+                return row["id"], {r["item"]: bool(r["keep"]) for r in keeps}
+        return None
 
     def upsert_groups(
         self,
@@ -286,12 +289,22 @@ class ReviewDB:
             for a, b, d in edges:
                 by_pair[(a, b)] = d
                 by_pair[(b, a)] = d
-            row = self.conn.execute("SELECT id, status, touched FROM groups WHERE key = ?", (key,)).fetchone()
+            row = self.conn.execute("SELECT id, status, touched, carried_from FROM groups WHERE key = ?", (key,)).fetchone()
             if row is None:
                 status = start
+                keeps = {r.id: r is winner for r in records}
+                carried = self._decided_before([r.id for r in records], seen)
+                if carried is not None:
+                    carried, old_keeps = carried
+                    overlap = {i: k for i, k in old_keeps.items() if i in keeps}
+                    if any(overlap.values()):
+                        keeps = {i: overlap.get(i, False) for i in keeps}
+                    status = "pending"
+                    stats.carried += 1
                 cur = self.conn.execute(
-                    "INSERT INTO groups (key, n, min_distance, max_distance, status, note, updated_at, pixel) VALUES (?, ?, ?, ?, ?, '', ?, ?)",
-                    (key, len(records), dmin, dmax, status, now, group_pixel),
+                    "INSERT INTO groups (key, n, min_distance, max_distance, status, note, updated_at, pixel, carried_from)"
+                    " VALUES (?, ?, ?, ?, ?, '', ?, ?, ?)",
+                    (key, len(records), dmin, dmax, status, now, group_pixel, carried),
                 )
                 assert cur.lastrowid is not None
                 gid = int(cur.lastrowid)
@@ -304,7 +317,7 @@ class ReviewDB:
                             r.id,
                             r.source_id,
                             r.path,
-                            int(r is winner),
+                            int(keeps[r.id]),
                             r.width,
                             r.height,
                             r.size,
@@ -317,14 +330,14 @@ class ReviewDB:
                 )
                 self._snapshot(gid, now)
                 stats.new += 1
-                if status == "decided":
+                if status == "decided" and carried is None:
                     stats.predecided += 1
             else:
                 gid = int(row["id"])
                 old_status = new_status = row["status"]
                 if new_status == "stale":
                     new_status = "pending"
-                rederive = not row["touched"] and new_status in ("pending", "decided")
+                rederive = not row["touched"] and row["carried_from"] is None and new_status in ("pending", "decided")
                 if rederive:
                     new_status = start
                     if old_status == "pending" and new_status == "decided":
@@ -397,6 +410,7 @@ class ReviewDB:
             bool(row["touched"]),
             bool(row["discard"]),
             row["kept"],
+            row["carried_from"],
         )
 
     def groups(
@@ -409,10 +423,10 @@ class ReviewDB:
     ) -> list[GroupRow]:
         """Groups ordered by minimum distance (the surest first). ``status`` filters; ``None`` means every status
         except ``stale``. ``pixel`` ("same" / "different") filters on the pixel check. ``keeps_nothing`` lists only
-        groups with every keep unticked that are not marked discard (Apply refuses those when decided);
+        groups with every keep unticked that are not marked discard (those cannot be decided);
         ``discarded`` only groups marked discard."""
         if status is None:
-            statuses: tuple[str, ...] = ("pending", "decided", "skipped", "applied")
+            statuses: tuple[str, ...] = ("pending", "decided", "skipped")
         elif isinstance(status, str):
             statuses = (status,)
         else:
@@ -533,8 +547,6 @@ class ReviewDB:
         if status is not None and status not in STATUSES:
             raise ValueError(f"Unknown status {status!r}")
         g = self.group(group_id)
-        if g.status == "applied":
-            raise ValueError("An applied group cannot be changed; undo the apply first")
         now = time.time()
         current = {m.item: m.keep for m in self.members(group_id)}
         if keeps:
@@ -573,7 +585,7 @@ class ReviewDB:
         self.conn.commit()
 
     def discard(self, group_id: int) -> None:
-        """Mark a group to have every member moved by Apply (keeps nothing, decided)."""
+        """Mark a group to have every member excluded (keeps nothing, decided)."""
         self.decide(group_id, keeps={m.item: False for m in self.members(group_id)}, status="decided", discard=True)
 
     def keep_only(self, group_id: int, item: bytes, *, status: str | None = "decided") -> None:
@@ -604,8 +616,6 @@ class ReviewDB:
         if len(rows) < 2:
             return False
         current, previous = rows
-        if self.group(group_id).status == "applied":
-            raise ValueError("An applied group cannot be changed; undo the apply first")
         for item, keep in json.loads(previous["keep_json"]).items():
             self.conn.execute(
                 "UPDATE members SET keep = ? WHERE group_id = ? AND item = ?", (int(keep), group_id, bytes.fromhex(item))
@@ -620,128 +630,12 @@ class ReviewDB:
         self.conn.commit()
         return True
 
-    # -- applying ----------------------------------------------------------------------------------------------------
+    # -- exclusion -----------------------------------------------------------------------------------------------------
 
-    def plan_apply(self, group_ids: Sequence[int] | None = None) -> list[Move]:
-        """Files that applying the decided groups would move, with what is kept instead. A decided group keeping
-        nothing is left out unless it is marked discard (see :meth:`groups` with ``keeps_nothing``)."""
-        if group_ids is None:
-            targets = [g.id for g in self.groups("decided")]
-        else:
-            targets = [gid for gid in group_ids if self.group(gid).status == "decided"]
-        moves: list[Move] = []
-        for gid in targets:
-            members = self.members(gid)
-            keep = tuple(m.path for m in members if m.keep)
-            if not keep and not self.group(gid).discard:
-                logger.debug("Group %d keeps nothing and is not marked discard; refusing to move all of its files", gid)
-                continue
-            moves.extend(Move(gid, m, keep) for m in members if not m.keep)
-        return moves
-
-    def mark_applied(self, group_id: int, moved: Iterable[tuple[MemberRow, str]]) -> None:
-        now = time.time()
-        self.conn.executemany(
-            "INSERT OR REPLACE INTO applied (item, path, trash_path, group_id, at) VALUES (?, ?, ?, ?, ?)",
-            [(m.item, m.path, t, group_id, now) for m, t in moved],
-        )
-        self.conn.execute("UPDATE groups SET status = 'applied', touched = 1, updated_at = ? WHERE id = ?", (now, group_id))
-        self._snapshot(group_id, now)
-        self.conn.commit()
-
-    def applied(self, group_id: int | None = None) -> list[tuple[str, str, int]]:
-        sql = "SELECT path, trash_path, group_id FROM applied"
-        rows = self.conn.execute(
-            sql + (" WHERE group_id = ?" if group_id is not None else ""), (group_id,) if group_id is not None else ()
-        ).fetchall()
-        return [(r["path"], r["trash_path"], r["group_id"]) for r in rows]
-
-    def mark_unapplied(self, group_id: int) -> None:
-        now = time.time()
-        self.conn.execute("DELETE FROM applied WHERE group_id = ?", (group_id,))
-        self.conn.execute("UPDATE groups SET status = 'decided', updated_at = ? WHERE id = ?", (now, group_id))
-        self._snapshot(group_id, now)
-        self.conn.commit()
-
-
-def changed_on_disk(roots: Roots, members: Sequence[MemberRow]) -> list[str]:
-    """Member paths whose file is missing or has a different mtime/size than when the group was stored."""
-    out = []
-    for m in members:
-        try:
-            st = os.stat(m.file(roots))
-        except OSError:
-            out.append(m.path)
-            continue
-        if st.st_mtime != m.mtime or st.st_size != m.size:
-            out.append(m.path)
-    return out
-
-
-def apply_decisions(
-    review: ReviewDB,
-    image_dir: str,
-    trash_dir: str,
-    *,
-    dry_run: bool,
-    group_ids: Sequence[int] | None = None,
-    progress: Callable[[int], object] | None = None,
-) -> tuple[int, list[int]]:
-    """Move the losers of every decided group of a standalone ``image_dir`` to ``trash_dir``. Returns ``(files moved,
-    group ids refused)``.
-
-    A group is refused, and left ``decided``, when any member changed on disk since it was stored; re-run
-    ``update-db`` and re-match for those.
-    """
-    moves = review.plan_apply(group_ids)
-    by_group: dict[int, list[Move]] = {}
-    for mv in moves:
-        by_group.setdefault(mv.group_id, []).append(mv)
-    moved_total = 0
-    refused: list[int] = []
-    for gid, group_moves in by_group.items():
-        members = review.members(gid)
-        changed = changed_on_disk(standalone_roots(image_dir), members)
-        if changed:
-            logger.warning(
-                "Group %d: %d file(s) changed on disk since matching, skipping: %s", gid, len(changed), ", ".join(changed[:5])
-            )
-            refused.append(gid)
-            continue
-        done: list[tuple[MemberRow, str]] = []
-        for mv in group_moves:
-            if move_to_trash(
-                image_dir,
-                mv.member.path,
-                trash_dir,
-                dry_run=dry_run,
-                reason=f"keeping {', '.join(mv.keep)}" if mv.keep else "whole group discarded",
-            ):
-                done.append((mv.member, os.path.join(trash_dir, mv.member.path)))
-        moved_total += len(done)
-        if not dry_run:
-            review.mark_applied(gid, done)
-        if progress is not None:
-            progress(1)
-    return moved_total, refused
-
-
-def unapply_group(review: ReviewDB, image_dir: str, group_id: int) -> int:
-    """Move a group's trashed files back where they were. Returns the number restored."""
-    restored = 0
-    for path, trash_path, _ in review.applied(group_id):
-        dest = os.path.join(image_dir, path)
-        if not os.path.exists(trash_path):
-            logger.warning("Cannot restore %s: %s is gone", path, trash_path)
-            continue
-        if os.path.exists(dest):
-            logger.warning("Cannot restore %s: destination exists", path)
-            continue
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        os.replace(trash_path, dest)
-        restored += 1
-    review.mark_unapplied(group_id)
-    return restored
+    def losers(self) -> dict[bytes, tuple[int, list[bytes]]]:
+        """``{item: (group id, kept items)}`` for every member a decided group does not keep (every member of a
+        discarded group). Decided groups that keep nothing without being discarded exclude nothing."""
+        return losers(self.conn)
 
 
 def store_matches(
@@ -757,3 +651,24 @@ def store_matches(
     items = [([records[i] for i in g.members], [(records[i].id, records[j].id, d) for i, j, d in g.edges]) for g in groups]
     by_id = None if pixel is None else {(records[i].id, records[j].id): v for (i, j), v in pixel.items()}
     return review.upsert_groups(items, policy, auto_threshold, by_id)
+
+
+def losers(conn: sqlite3.Connection, item: bytes | None = None) -> dict[bytes, tuple[int, list[bytes]]]:
+    """See :meth:`ReviewDB.losers`; ``item`` limits it to one item. Also used on a read-only connection."""
+    where = " AND m.item = ?" if item is not None else ""
+    groups: dict[int, list[bytes]] = {}
+    out: dict[bytes, tuple[int, list[bytes]]] = {}
+    rows = conn.execute(
+        f"""SELECT m.item, g.id FROM members m JOIN groups g ON g.id = m.group_id
+            WHERE g.status = 'decided' AND NOT m.keep
+              AND (g.discard OR EXISTS (SELECT 1 FROM members k WHERE k.group_id = g.id AND k.keep)){where}
+            ORDER BY g.id""",
+        () if item is None else (item,),
+    ).fetchall()
+    for member, gid in rows:
+        if member in out:
+            continue
+        if gid not in groups:
+            groups[gid] = [r[0] for r in conn.execute("SELECT item FROM members WHERE group_id = ? AND keep", (gid,))]
+        out[member] = (gid, groups[gid])
+    return out

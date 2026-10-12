@@ -18,7 +18,6 @@ from __future__ import annotations
 import io
 import logging
 import math
-import os
 import random
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -26,7 +25,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import PIL.Image
 
-from ..common.images import ImageRecord
+from ..common.images import ImageRecord, Roots
 from .encoder import CLIPImageEncoder, Preprocessed
 from .similarity import DistanceIndex
 
@@ -92,7 +91,7 @@ class Calibration:
 
 def calibrate(
     encoder: CLIPImageEncoder,
-    image_dir: str,
+    roots: Roots,
     records: Sequence[ImageRecord],
     embeddings: np.ndarray,
     index: DistanceIndex,
@@ -126,7 +125,7 @@ def calibrate(
         pending.clear()
 
     for row in rows:
-        path = os.path.join(image_dir, records[row].path)
+        path = records[row].file(roots)
         try:
             with PIL.Image.open(path) as img:
                 base = img.convert("RGB")

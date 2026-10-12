@@ -51,6 +51,7 @@ class Thumbnails(QAbstractListModel):
         self.cache, self.pending = {}, set()
         self.status = {}
         self.issues = {}
+        self.excluded = {}  # row -> why
 
     def rowCount(self, parent=QModelIndex()):
         return len(self.paths)
@@ -58,13 +59,17 @@ class Thumbnails(QAbstractListModel):
     def data(self, index, role):
         row = index.row()
         if role == Qt.ItemDataRole.DisplayRole:
-            return self.paths[row].name + (" [!]" if row in self.issues else "")
+            return ("✕ " if row in self.excluded else "") + self.paths[row].name + (" [!]" if row in self.issues else "")
         if role == REVIEW_ROLE:
             return self.status.get(row, "unreviewed")
         if role in (Qt.ItemDataRole.ToolTipRole, Qt.ItemDataRole.AccessibleTextRole):
             status = self.status.get(row, "unreviewed")
             label = REVIEW_BADGES.get(status, REVIEW_BADGES["unreviewed"])[1]
-            return f"{self.paths[row].name} — {label}" + (f"\n{self.issues[row]}" if row in self.issues else "")
+            return (
+                f"{self.paths[row].name} — {label}"
+                + (f"\n{self.excluded[row]}" if row in self.excluded else "")
+                + (f"\n{self.issues[row]}" if row in self.issues else "")
+            )
         if role == Qt.ItemDataRole.SizeHintRole:
             return QSize(160, 165)
         if role == Qt.ItemDataRole.DecorationRole:

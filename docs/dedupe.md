@@ -1,32 +1,37 @@
 # Deduplication (`picurate-dedupe`)
 
-Finds duplicates by CLIP image-embedding distance, confirms them pixel by pixel, and moves the losers to a trash
-directory. Embeddings live in one SQLite file per image directory and are updated incrementally, so a re-run only
-encodes what changed. Everything is held in memory during matching: about 2.3 KiB per image in FP16 for the default
+Finds duplicates among the images of a [project](project.md) by CLIP image-embedding distance and confirms them pixel
+by pixel. A library is cleaned as a project over the library folders. Embeddings live in the project's
+`embeddings.sqlite` and are updated incrementally, so a re-run only encodes what changed; duplicate groups go to its
+`review.sqlite`. Nothing is moved: the images a decided group does not keep count as excluded, and the editor does
+not export them. Everything is held in memory during matching: about 2.3 KiB per image in FP16 for the default
 1152-dimensional model, so a million images need about 2.3 GiB of RAM and VRAM.
 
-`picurate-dedupe <subcommand> --help` lists every option. Borderline groups can be handed to a human instead, see
-[duplicate review](dedupe-review.md).
+`picurate-dedupe <subcommand> --help` lists every option. Groups the pixel check does not settle are decided by a
+human in [picurate-curate](curate.md).
 
 ## Usage
 
-Find duplicates within a directory and move the losers to a trash directory:
+Find the duplicate groups of a project (`picurate-project sync` first picks up new and changed files):
 
 ```shell
-picurate-dedupe dedupe -i pictures -d pictures.sqlite --trash-dir trash -k highest-quality
+picurate-dedupe dedupe library -k highest-quality                  # only what the pixel check decides
+picurate-dedupe dedupe library --review-threshold 1.5              # also store looser groups for review
+picurate-dedupe review-status library
 ```
 
-Remove images from an "importing" directory that already exist in a "base" collection:
+Move the images of an incoming directory that the project already has to a trash directory, before adding the rest
+to the library:
 
 ```shell
-picurate-dedupe dedupe-import --base-image-dir pictures --base-db pictures.sqlite \
-                              --import-image-dir incoming --import-db incoming.sqlite --trash-dir trash
+picurate-dedupe dedupe-import -i incoming library --trash-dir trash --import-db incoming.sqlite
+picurate-dedupe update-db library --reuse-from incoming.sqlite     # after moving incoming into the library and syncing
 ```
 
-Only (re)encode a directory into its database, or print the distance matrix of a few images to pick a threshold:
+Only (re)encode a project into its database, or print the distance matrix of a few images to pick a threshold:
 
 ```shell
-picurate-dedupe update-db -i pictures -d pictures.sqlite
+picurate-dedupe update-db library
 picurate-dedupe encode-test a.jpg a_copy.png b.jpg
 ```
 
@@ -34,8 +39,33 @@ Calibrate a threshold from the collection itself: sample images, synthesize loss
 histograms of how far the copies land from the stored embedding next to how far the nearest *different* image is:
 
 ```shell
-picurate-dedupe calibrate -i pictures -d pictures.sqlite -s 200 --seed 0 --variants jpeg90,half,quarter
+picurate-dedupe calibrate library -s 200 --seed 0 --variants jpeg90,half,quarter
 ```
+
+## What takes part
+
+Every image of the project that is present (not marked missing by the last sync) and not excluded by a person (force
+exclude in the editor). The losers of decided groups do take part, so their groups stay the same from run to run.
+Rows of missing and excluded images stay in `embeddings.sqlite`, so they are not encoded again if they come back;
+rows of images no longer in the project are dropped. `dedupe` writes `review.sqlite`, so it refuses to start while
+picurate-curate has the project open; encoding does not hold that lock, but matching needs it.
+
+**Starting status.** `dedupe` stores every group found at `--review-threshold` (default: `--threshold`):
+
+* Groups whose every pair passes the pixel check start *decided*, with the keeping policy's winner kept, whatever
+  their embedding distance. Their other members are excluded.
+* Every other group starts *pending*, even one within `--threshold`: that is how artist revisions and pages of one
+  pixiv set reach a human.
+* With `--no-pixel-check`, groups entirely within `--threshold` start decided instead.
+
+A looser `--review-threshold` answers "worth a human look", not "safe to merge"; it may well be looser than anything
+`calibrate` would suggest.
+
+**Re-running.** Groups are identified by their members. A re-run (after adding images, or with another threshold)
+keeps the decisions of groups whose membership did not change and marks the others stale; a stale group excludes
+nothing. Groups nobody has touched get their starting status re-derived, and pixel results are reused for files that
+did not change. A new group that shares members with a group the reviewer changed starts pending with that group's
+keeps, and is never re-derived: a human decision is only replaced by another one.
 
 ## Options worth knowing
 
@@ -49,14 +79,16 @@ picurate-dedupe calibrate -i pictures -d pictures.sqlite -s 200 --seed 0 --varia
   gives the same sample again (not promised across versions). `--variants` picks the lossy copies to synthesize
   (`jpeg90`, `jpeg75`, `webp80`, `half`, `quarter`); `-t` may be repeated to see what several thresholds would catch.
   The suggestion is the largest variant distance rounded up, provided it is below the nearest different image.
-* `--pixel-check/--no-pixel-check` (default on): for every pair within the threshold, compare the pixels and drop the
-  pair unless the two differ by compression alone. `dedupe` then never merges an edited or revised copy, and
-  `dedupe-import` never counts one as already present. It only ever blocks matches.
+* `--pixel-check/--no-pixel-check` (default on): compare the pixels of every pair within the threshold. A group is
+  only decided automatically when every pair differs by compression alone, so an edited or revised copy goes to a
+  human, and `dedupe-import` never counts one as already present.
 * `--pixel-buffer` (default 2048 MiB): decoded pixels the pixel check keeps across all its processes, so an image
   shared by several pairs is decoded once.
 * `-k, --keeping-logic` (default `largest`) and `--keeping-config`: see [keeping policies](#keeping-policies).
-* `-n, --dry-run`: report what would be moved without moving. The database is still refreshed; add `--skip-update`
-  for a run that writes nothing at all.
+* `dedupe-import`: `--trash-dir` (omit it to only report) and `-n, --dry-run`. Images of the project that are
+  excluded do not count as already present. `--import-db` keeps the import side's embeddings for the next run or for
+  `update-db --reuse-from`; without it they go to a temporary file. Duplicates within the import directory are not
+  looked for.
 * `-m, --model-id`: a timm model name; any CLIP/SigLIP image tower timm ships works, NaFlex (`naflexvit_*`) or
   fixed-resolution (e.g. `vit_so400m_patch16_siglip_512.v2_webli`). A database is bound to the model it was encoded
   with; switching models on an existing database requires `-f, --force-update`, which re-encodes everything.
@@ -71,8 +103,9 @@ picurate-dedupe calibrate -i pictures -d pictures.sqlite -s 200 --seed 0 --varia
 FP16 inference is not batch-invariant: the same image encoded in a different batch comes out up to ~0.04 away. That
 is far below the default threshold, but it is why near-identical files are not exactly zero apart.
 
-Hidden (dot) files and directories are skipped unless `--include-hidden` is given; build output and caches live
-there. Files whose extension Pillow does not recognize are ignored. Files that fail to decode are skipped with a warning and
+Which files a project has is decided by its [import](project.md#importing); `dedupe-import` skips hidden (dot) files
+and directories of the import directory unless `--include-hidden` is given. Files whose extension Pillow does not
+recognize are ignored. Files that fail to decode are skipped with a warning and
 retried on the next run. Very large images, truncated files and PNGs with bad checksums on metadata chunks (e.g. the
 `iCCP` chunk some Pixiv uploads carry) are accepted, like an image viewer would.
 
@@ -106,15 +139,16 @@ criteria = [
 ## How it works
 
 **Database.** Table `embeddings` has one row per image: the [item ID](project.md#sources-and-identity) with the source
-ID and path (relative to the image directory) it is derived from, `mtime`, `size`, `width`, `height`, `format` as
+ID and path (relative to the source folder) it is derived from, `mtime`, `size`, `width`, `height`, `format` as
 observed at encoding time, `blake3` of the file contents (hashed by the decode worker from the bytes it reads anyway),
 and the raw little-endian float16 embedding. Table `meta` records `model_id`, `dim`, `dtype`
 and `schema_version`; a database of another model or schema version is refused unless `--force-update` rebuilds it. FP16 storage is lossless: the model runs in FP16 on CUDA, so
 every value it emits is already an FP16 number. On update, stored mtimes are compared with the files on disk; changed
-or new images are (re)encoded and rows without a file are deleted. Writes are committed per batch, so an interrupted
-run keeps its progress. `update-db --reuse-from OTHER.sqlite` first hashes the images that need encoding and copies
+or new images are (re)encoded. Writes are committed per batch, so an interrupted run keeps its progress. `update-db --reuse-from OTHER.sqlite` first hashes the images that need encoding and copies
 the embedding of every one whose contents another database of the same model already holds; this is how images
 deduplicated with `dedupe-import --import-db` and then moved into the library avoid a second encode.
+
+The review database is described under [picurate-curate](curate.md#review-database).
 
 **Matching.** Embeddings are loaded as one `(N, D)` array and uploaded once. The self-dedupe searches the upper
 triangle of the distance matrix in blocks of rows (each distance block under 256 MiB), collects all pairs under the

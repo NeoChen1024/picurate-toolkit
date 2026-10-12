@@ -1,4 +1,4 @@
-"""List models and delegates for the review window."""
+"""List models and delegates for the Duplicates tab."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from PySide6.QtCore import QAbstractListModel, QModelIndex, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QStyledItemDelegate
 
-from ..review import GroupRow
+from ..dedupe.review import GroupRow
 
 STATUS_ROLE = Qt.ItemDataRole.UserRole
 GROUP_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -16,7 +16,6 @@ STATUS_BADGES = {
     "pending": ("P", "Pending", "#ef8888"),
     "decided": ("D", "Decided", "#78d899"),
     "skipped": ("S", "Skipped", "#7ed6df"),
-    "applied": ("A", "Applied", "#9a9a9a"),
     "stale": ("!", "Stale", "#d8b878"),
 }
 

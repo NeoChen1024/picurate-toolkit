@@ -9,7 +9,7 @@ import PIL.Image
 import PIL.ImageFile
 from PySide6.QtGui import QImage, QPixmap
 
-from ...common.qt import Job, Signals, qimage
+from ..common.qt import Job, Signals, qimage
 
 # Same leniency as the encoder: this is the user's own collection, behave like an image viewer.
 PIL.Image.MAX_IMAGE_PIXELS = None

@@ -6,39 +6,39 @@ from unittest import mock
 import numpy as np
 from click.testing import CliRunner
 
-from picurate.common.images import ImageRecord, Item
+from picurate.common.images import ImageRecord
 from picurate.dedupe import cli as cli_mod
 from picurate.dedupe.cli import cli
-
-
-def _records(*names):
-    return [ImageRecord(n, 0.0, 1, 1, 1, "JPEG") for n in names]
+from picurate.project.project import REVIEW, Project
 
 
 class CliTests(unittest.TestCase):
     def setUp(self):
-        self.runner = CliRunner()
         self.tmp = tempfile.TemporaryDirectory()
-        self.img = os.path.join(self.tmp.name, "img")
-        os.makedirs(self.img)
+        img = os.path.join(self.tmp.name, "img")
+        os.makedirs(img)
+        for name in ("a.png", "b.png", "c.png"):
+            open(os.path.join(img, name), "wb").close()
+        self.project = Project(os.path.join(self.tmp.name, "project"), create=True)
+        self.project.import_images([img])
+        self.ids = {row["path"]: item for item, row in self.project.items.items()}
 
     def tearDown(self):
+        self.project.close()
         self.tmp.cleanup()
 
-    def test_dedupe_dry_run_still_refreshes_database(self):
-        trash = os.path.join(self.tmp.name, "trash")
-        with (
-            mock.patch.object(cli_mod, "CLIPImageEncoder"),
-            mock.patch.object(cli_mod, "update_database") as upd,
-            mock.patch.object(
-                cli_mod, "load_database", return_value=(_records("a.jpg", "b.jpg"), np.array([[0.0], [0.05]], dtype=np.float32))
-            ),
-        ):
-            result = self.runner.invoke(cli, ["dedupe", "-i", self.img, "-d", "db.sqlite", "-n", "--trash-dir", trash, "-c", "cpu"])
+    def test_update_keeps_rows_of_every_project_item(self):
+        """Excluded and missing images are not encoded, but their rows stay; only removed items lose theirs."""
+        state = self.project.state(self.ids["b.png"])
+        state["exclusion"] = {"decision": "exclude", "reason": "test"}
+        self.project.save(state, self.project.begin_op("edit"))
+        self.project.db.execute("UPDATE items SET missing = 1 WHERE id = ?", (self.ids["c.png"],))
+        with mock.patch.object(cli_mod, "CLIPImageEncoder"), mock.patch.object(cli_mod, "update_database") as upd:
+            with mock.patch.object(cli_mod, "load_database", return_value=([], np.empty((0, 0), np.float16))):
+                result = CliRunner().invoke(cli, ["update-db", str(self.project.directory), "-c", "cpu"])
         self.assertEqual(result.exit_code, 0, result.output)
-        upd.assert_called_once()
-        self.assertTrue(upd.call_args.kwargs["clean_orphans"])
-        self.assertFalse(os.path.exists(trash))  # dry run moved nothing
+        self.assertEqual([item.path for item in upd.call_args.args[2]], ["a.png"])
+        self.assertEqual(set(upd.call_args.kwargs["keep_rows"]), set(self.ids.values()))
 
 
 class PixelCheckCliTests(unittest.TestCase):
@@ -59,70 +59,78 @@ class PixelCheckCliTests(unittest.TestCase):
         edited = base.copy()
         PIL.ImageDraw.Draw(edited).text((500, 440), "@artist", fill=(255, 255, 255), font_size=14)
         edited.save(os.path.join(self.img, "c.png"))
-        self.records = []
-        for name, size in [("a.png", 3), ("b.jpg", 1), ("c.png", 2)]:
-            st = os.stat(os.path.join(self.img, name))
-            self.records.append(ImageRecord(name, st.st_mtime, size, 640, 480, "PNG"))
         self.emb = np.array([[0.0], [0.03], [0.06]], dtype=np.float32)
-        self.db = os.path.join(self.tmp.name, "pictures.sqlite")
         self.trash = os.path.join(self.tmp.name, "trash")
+        self.projects = []
 
     def tearDown(self):
+        for project in self.projects:
+            project.close()
         self.tmp.cleanup()
 
-    def run_cli(self, *args, records=None, emb=None):
+    def project(self, directory, sizes):
+        """A project over ``directory`` and embedding records of its images."""
+        project = Project(os.path.join(self.tmp.name, "project"), create=True)
+        self.projects.append(project)
+        project.import_images([directory])
+        records = []
+        for item, row in project.items.items():
+            st = os.stat(project.source_path(item))
+            records.append(ImageRecord(row["path"], st.st_mtime, sizes[row["path"]], 640, 480, "PNG", row["source_id"], item))
+        return project, sorted(records, key=lambda r: r.path)
+
+    def run_cli(self, *args, records, emb=None):
         with (
-            mock.patch.object(cli_mod, "load_database", return_value=(records or self.records, self.emb if emb is None else emb)),
+            mock.patch.object(cli_mod, "load_database", return_value=(records, self.emb if emb is None else emb)),
             mock.patch.object(cli_mod, "EmbeddingDB") as store,
         ):
             store.return_value.__enter__.return_value.model_id = "m"
             return CliRunner().invoke(cli, [*args, "--skip-update", "-c", "cpu", "-j", "1"])
 
-    def test_dedupe_merges_compression_only_and_keeps_the_edit(self):
-        res = self.run_cli("dedupe", "-i", self.img, "-d", self.db, "--trash-dir", self.trash)
-        self.assertEqual(res.exit_code, 0, res.output)
-        self.assertEqual(sorted(os.listdir(self.trash)), ["b.jpg"])  # largest (a.png) kept, the edit untouched
-        self.assertTrue(os.path.exists(os.path.join(self.img, "c.png")))
-
     def test_review_mode_stores_pixel_results_and_reuses_them(self):
         from picurate.dedupe import review as rv
 
-        res = self.run_cli("dedupe", "-i", self.img, "-d", self.db, "--review-threshold", "0.5")
+        project, records = self.project(self.img, {"a.png": 3, "b.jpg": 1, "c.png": 2})
+        res = self.run_cli("dedupe", str(project.directory), "--review-threshold", "0.5", records=records)
         self.assertEqual(res.exit_code, 0, res.output)
-        with rv.ReviewDB(rv.default_review_path(self.db)) as review:
+        a, b = records[0].id, records[1].id
+        with rv.ReviewDB(str(project.directory / REVIEW)) as review:
             g = review.groups()[0]
             self.assertEqual((g.status, g.pixel), ("pending", "different"))  # the edit keeps the group in review
-            self.assertEqual(review.edge_pixels(g.id)[(Item.standalone("a.png").id, Item.standalone("b.jpg").id)].status, "same")
+            self.assertEqual(review.edge_pixels(g.id)[(a, b)].status, "same")
             self.assertEqual(review.get_meta("pixel_check"), "on")
+        self.assertEqual(sorted(os.listdir(self.img)), ["a.png", "b.jpg", "c.png"])  # nothing moved
         with mock.patch.object(cli_mod, "check_pairs", side_effect=AssertionError("nothing should be re-read")):
-            res = self.run_cli("dedupe", "-i", self.img, "-d", self.db, "--review-threshold", "0.5")
+            res = self.run_cli("dedupe", str(project.directory), "--review-threshold", "0.5", records=records)
         self.assertEqual(res.exit_code, 0, res.output)
-        res = CliRunner().invoke(cli, ["review-status", "-d", self.db])
+        res = CliRunner().invoke(cli, ["review-status", str(project.directory)])
         self.assertIn("with pixel differences", res.output)
 
     def test_dedupe_import_ignores_an_edited_copy(self):
         base = os.path.join(self.tmp.name, "base")
         os.makedirs(base)
         os.rename(os.path.join(self.img, "a.png"), os.path.join(base, "a.png"))
-        base_rec = [ImageRecord("a.png", 0.0, 3, 640, 480, "PNG")]
-        imports = [r for r in self.records if r.path != "a.png"]
-        with mock.patch.object(
-            cli_mod,
-            "load_database",
-            side_effect=[(base_rec, np.array([[0.0]], dtype=np.float32)), (imports, np.array([[0.03], [0.06]], dtype=np.float32))],
+        project, base_records = self.project(base, {"a.png": 3})
+        imports = [ImageRecord(p, 0.0, 1, 640, 480, "PNG") for p in ("b.jpg", "c.png")]
+        with (
+            mock.patch.object(cli_mod, "CLIPImageEncoder"),
+            mock.patch.object(cli_mod, "update_database"),
+            mock.patch.object(
+                cli_mod,
+                "load_database",
+                side_effect=[
+                    (base_records, np.array([[0.0]], dtype=np.float32)),
+                    (imports, np.array([[0.03], [0.06]], dtype=np.float32)),
+                ],
+            ),
         ):
             res = CliRunner().invoke(
                 cli,
                 [
                     "dedupe-import",
-                    "--base-image-dir",
-                    base,
-                    "--base-db",
-                    "b.sqlite",
-                    "--import-image-dir",
+                    "-i",
                     self.img,
-                    "--import-db",
-                    "i.sqlite",
+                    str(project.directory),
                     "--trash-dir",
                     self.trash,
                     "--skip-update",
@@ -134,6 +142,7 @@ class PixelCheckCliTests(unittest.TestCase):
             )
         self.assertEqual(res.exit_code, 0, res.output)
         self.assertEqual(sorted(os.listdir(self.trash)), ["b.jpg"])
+        self.assertEqual(sorted(os.listdir(base)), ["a.png"])
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 import PIL.Image
 
-from picurate.common.images import ImageRecord
+from picurate.common.images import ImageRecord, standalone_roots
 from picurate.dedupe import calibrate as cal
 from picurate.dedupe.similarity import DistanceIndex
 
@@ -62,7 +62,15 @@ class DistanceTests(unittest.TestCase):
             )
             emb = emb.astype(np.float16)
             result = cal.calibrate(
-                enc, tmp, records, emb, DistanceIndex(emb, "cpu"), samples=4, seed=0, variants=("jpeg90", "half"), batch_size=3
+                enc,
+                standalone_roots(tmp),
+                records,
+                emb,
+                DistanceIndex(emb, "cpu"),
+                samples=4,
+                seed=0,
+                variants=("jpeg90", "half"),
+                batch_size=3,
             )
             self.assertEqual(result.skipped, ["broken.png"])
             self.assertEqual(set(result.series), {"nearest-other", "jpeg90", "half"})

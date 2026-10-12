@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import os
+import tempfile
 from collections.abc import Callable, Generator
+from pathlib import Path
 
 import click
 import humanize
@@ -13,16 +14,17 @@ import numpy as np
 import torch
 import tqdm
 
-from ..common.images import ImageRecord, Roots, standalone_items, standalone_roots
+from ..common.images import ImageRecord, Item, Roots, standalone_items, standalone_roots
 from ..common.log import setup_logging
+from ..project.project import EMBEDDINGS, REVIEW, Project
 from .calibrate import VARIANTS, calibrate, default_variants, report
 from .db_store import EmbeddingDB, ModelMismatchError, load_database
-from .dedupe import find_cross_pairs, find_duplicate_edges, group_edges, move_to_trash, trash_duplicate_groups
+from .dedupe import find_cross_pairs, find_duplicate_edges, group_edges, move_to_trash
 from .encoder import CLIPImageEncoder, default_model_id, default_seq_len, precision_choices
 from .encoding_pipeline import update_database
 from .keeping import PolicyError, load_policies
 from .pixel_check import PixelVerdict, check_pairs, default_buffer_mib
-from .review import ReviewDB, apply_decisions, default_review_path, store_matches
+from .review import ReviewDB, store_matches
 from .similarity import DistanceIndex, default_euclidean_distance_threshold, euclidean_distance
 
 logger = logging.getLogger(__name__)
@@ -84,39 +86,16 @@ update_options = _options(
         is_flag=True,
         help="Re-encode every image, ignoring modification times. Also rebinds the DB to --model-id.",
     ),
-    click.option(
-        "--clean-orphans/--no-clean-orphans",
-        default=True,
-        show_default=True,
-        help="Remove DB entries whose image no longer exists.",
-    ),
-    click.option(
-        "--include-hidden", is_flag=True, help="Also include hidden (dot) files and directories, which are skipped by default."
-    ),
-    click.option("--skip-update", is_flag=True, help="Do not touch the database, only match what is already in it."),
+    click.option("--skip-update", is_flag=True, help="Do not touch the embedding database, only match what is already in it."),
 )
 
-match_options = _options(
-    click.option(
-        "--threshold",
-        "-t",
-        type=float,
-        default=default_euclidean_distance_threshold,
-        show_default=True,
-        help="Euclidean distance at or below which two images count as duplicates (lower = stricter).",
-    ),
-    click.option(
-        "--trash-dir",
-        type=click.Path(file_okay=False),
-        default=None,
-        help="Move duplicates here (mirroring their relative paths). Omit to only report.",
-    ),
-    click.option(
-        "--dry-run",
-        "-n",
-        is_flag=True,
-        help="Report what would be moved without moving. The DB is still refreshed unless --skip-update.",
-    ),
+threshold_option = click.option(
+    "--threshold",
+    "-t",
+    type=float,
+    default=default_euclidean_distance_threshold,
+    show_default=True,
+    help="Euclidean distance at or below which two images count as duplicates (lower = stricter).",
 )
 
 pixel_options = _options(
@@ -136,16 +115,7 @@ pixel_options = _options(
     ),
 )
 
-image_dir_arg = click.option(
-    "--image-dir", "-i", type=click.Path(exists=True, file_okay=False), required=True, help="Directory of images."
-)
-db_arg = click.option(
-    "--db",
-    "-d",
-    type=click.Path(dir_okay=False),
-    required=True,
-    help="SQLite embedding database for --image-dir (created if missing).",
-)
+project_arg = click.argument("project_dir", type=click.Path(exists=True, file_okay=False))
 
 
 # -- helpers ---------------------------------------------------------------------------------------------------------
@@ -179,31 +149,81 @@ def _encoder(
         encoder.close()
 
 
-def _update(
+def _project(project_dir: str) -> Project:
+    try:
+        return Project(project_dir)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+
+
+def _lock_review(project: Project, *, check_only: bool = False) -> None:
+    """Take the review database for this run; ``check_only`` fails early without holding it (through encoding)."""
+    try:
+        project.lock("review")
+    except ValueError as e:
+        raise click.ClickException(f"{e}; close it and run again") from e
+    if check_only:
+        project.unlock("review")
+
+
+def _scope(project: Project) -> tuple[Roots, list[Item]]:
+    """The project's roots, and the items taking part: present (not marked missing by the last sync) and not
+    excluded by a person. Losers of duplicate groups take part, so their groups stay stable."""
+    roots = {source: str(path) for source, path in project.sources.items()}
+    human = project.human_excluded()
+    items = [
+        Item(item, row["source_id"], row["path"]) for item, row in project.items.items() if not row["missing"] and item not in human
+    ]
+    return roots, items
+
+
+def _embeddings(project: Project) -> str:
+    return str(project.directory / EMBEDDINGS)
+
+
+def _update_project(
     encoder: CLIPImageEncoder,
-    image_dir: str,
-    db: str,
+    project: Project,
     *,
     force_update: bool,
-    clean_orphans: bool,
-    include_hidden: bool,
     batch_size: int,
     workers: int | None,
     reuse_from: str | None = None,
 ) -> None:
-    logger.info("Updating database %s from %s", db, image_dir)
+    """Encode the project's new and changed images into its embedding database. Rows of items still in the project
+    are kept even when they take no part now (missing, excluded by a person); rows of removed items are dropped."""
+    roots, items = _scope(project)
+    logger.info("Updating %s", _embeddings(project))
+    try:
+        update_database(
+            encoder,
+            roots,
+            items,
+            _embeddings(project),
+            force_update=force_update,
+            batch_size=batch_size,
+            workers=workers,
+            progress_factory=_progress_factory("Encoding", "image"),
+            reuse_from=reuse_from,
+            keep_rows=project.items.keys(),
+        )
+    except RuntimeError as e:
+        raise click.ClickException(str(e)) from e
+
+
+def _update_dir(
+    encoder: CLIPImageEncoder, image_dir: str, db: str, *, include_hidden: bool, batch_size: int, workers: int | None
+) -> None:
+    logger.info("Updating %s from %s", db, image_dir)
     try:
         update_database(
             encoder,
             standalone_roots(image_dir),
             standalone_items(image_dir, include_hidden=include_hidden),
             db,
-            force_update=force_update,
-            clean_orphans=clean_orphans,
             batch_size=batch_size,
             workers=workers,
             progress_factory=_progress_factory("Encoding", "image"),
-            reuse_from=reuse_from,
         )
     except RuntimeError as e:
         raise click.ClickException(str(e)) from e
@@ -216,8 +236,14 @@ def _load(db: str) -> tuple[list[ImageRecord], np.ndarray]:
         raise click.ClickException(str(e)) from e
 
 
-def _load_index(db: str, device: str, what: str = "database") -> tuple[list[ImageRecord], DistanceIndex]:
+def _load_index(
+    db: str, device: str, what: str = "database", only: set[bytes] | None = None
+) -> tuple[list[ImageRecord], DistanceIndex]:
+    """Load ``db`` onto ``device``; ``only`` keeps the rows of these item IDs."""
     records, embeddings = _load(db)
+    if only is not None:
+        rows = [i for i, r in enumerate(records) if r.id in only]
+        records, embeddings = [records[i] for i in rows], embeddings[rows]
     if not records:
         raise click.ClickException(f"No entries in the {what} {db}. Run an update first.")
     index = DistanceIndex(embeddings, device)
@@ -233,9 +259,9 @@ def _load_index(db: str, device: str, what: str = "database") -> tuple[list[Imag
     return records, index
 
 
-def _review(path: str) -> ReviewDB:
+def _review(path) -> ReviewDB:
     try:
-        return ReviewDB(path)
+        return ReviewDB(str(path))
     except ValueError as e:
         raise click.ClickException(str(e)) from e
 
@@ -265,17 +291,23 @@ def _policy(name: str, config: str | None):
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.option("--verbose", "-v", is_flag=True, help="Debug logging.")
 def cli(verbose: bool) -> None:
-    """Image deduplication by CLIP embedding similarity."""
+    """Image deduplication by CLIP embedding similarity, on a project (see picurate-project)."""
     setup_logging(verbose)
     torch.set_float32_matmul_precision("highest")  # distance math must not silently use TF32
 
 
 @cli.command()
-@image_dir_arg
-@db_arg
+@project_arg
 @model_options
 @update_options
-@match_options
+@threshold_option
+@click.option(
+    "--review-threshold",
+    type=float,
+    default=None,
+    help="Match at this looser distance; groups beyond what starts decided wait for review in picurate-curate "
+    "(default: --threshold, so only the groups decided automatically are stored).",
+)
 @click.option(
     "--keeping-logic", "-k", default="largest", show_default=True, help="Which copy of a duplicate group to keep (a policy name)."
 )
@@ -285,21 +317,9 @@ def cli(verbose: bool) -> None:
     default=None,
     help="TOML file adding/overriding keeping policies.",
 )
-@click.option(
-    "--review-threshold",
-    type=float,
-    default=None,
-    help="Review mode: match at this looser distance and store every group in the review database for the GUI / review-apply "
-    "instead of moving anything. Groups whose every pair passes the pixel check start decided (keeping-policy winner kept); "
-    "with --no-pixel-check, groups entirely within --threshold do.",
-)
-@click.option(
-    "--review-db", type=click.Path(dir_okay=False), default=None, help="Review database path (default: <db>.review.sqlite)."
-)
 @pixel_options
 def dedupe(
-    image_dir: str,
-    db: str,
+    project_dir: str,
     model_id: str,
     device: str,
     compile_: bool,
@@ -307,108 +327,76 @@ def dedupe(
     batch_size: int,
     workers: int | None,
     force_update: bool,
-    clean_orphans: bool,
-    include_hidden: bool,
     skip_update: bool,
     threshold: float,
-    trash_dir: str | None,
-    dry_run: bool,
+    review_threshold: float | None,
     keeping_logic: str,
     keeping_config: str | None,
-    review_threshold: float | None,
-    review_db: str | None,
     pixel_check: bool,
     pixel_buffer: int,
 ) -> None:
-    """Find duplicates within one image directory."""
+    """Find duplicate groups among the images of the project at PROJECT_DIR.
+
+    New and changed images are encoded into the project's embeddings.sqlite, and the groups go to its review.sqlite.
+    Groups whose every pair differs by compression alone (with --no-pixel-check: lie within --threshold) start decided,
+    keeping the policy's winner; the others wait for review in picurate-curate. The images a decided group does not
+    keep count as excluded: the editor does not export them. Nothing is moved here. Images a person excluded take no part; run 'picurate-project sync' first to
+    pick up new files. Needs picurate-curate to be closed.
+    """
     policy = _policy(keeping_logic, keeping_config)  # validate before spending time on encoding
-    if review_threshold is not None:
-        if trash_dir is not None:
-            raise click.ClickException("--review-threshold stores groups for review and moves nothing; drop --trash-dir.")
-        if review_threshold < threshold:
-            raise click.ClickException(f"--review-threshold ({review_threshold}) must be at least --threshold ({threshold}).")
+    if review_threshold is None:
+        review_threshold = threshold
+    elif review_threshold < threshold:
+        raise click.ClickException(f"--review-threshold ({review_threshold}) must be at least --threshold ({threshold}).")
+    project = _project(project_dir)
+    _lock_review(project, check_only=True)
+    review_path = project.directory / REVIEW
+    if review_path.exists():
+        _review(review_path).close()  # refuse another schema version before encoding
     if not skip_update:
         with _encoder(model_id, device, compile_=compile_, seq_len=seq_len) as encoder:
-            _update(
-                encoder,
-                image_dir,
-                db,
-                force_update=force_update,
-                clean_orphans=clean_orphans,
-                include_hidden=include_hidden,
-                batch_size=batch_size,
-                workers=workers,
-            )
-
-    records, index = _load_index(db, device)
-    paths = [r.path for r in records]
-    if review_threshold is not None:
-        with _progress(index.n, "Matching") as progress:
-            edges = find_duplicate_edges(paths, index, review_threshold, progress)
-        index.release()
-        review_path = review_db or default_review_path(db)
-        with EmbeddingDB(db) as store, _review(review_path) as review:
-            try:
-                review.begin_session(
-                    image_dir=image_dir,
-                    model_id=store.model_id or "",
-                    review_threshold=review_threshold,
-                    auto_threshold=threshold,
-                    policy=policy.name,
-                )
-            except ValueError as e:
-                raise click.ClickException(str(e)) from e
-            review.set_meta("pixel_check", "on" if pixel_check else "off")
-            roots = standalone_roots(image_dir)
-            pixel = _review_pixel_check(review, edges, records, roots, workers, pixel_buffer) if pixel_check else None
-            stats = store_matches(review, group_edges(index.n, edges), records, policy, threshold, pixel)
-            counts = review.counts()
-        rule = "every pair differs by compression only" if pixel_check else f"within {threshold:g}"
-        logger.info(
-            "Review database %s: %d groups this run (%d new, %d of them start decided because %s; %d seen before, of which %d untouched ones "
-            "were re-decided and %d reopened), %d went stale; now %d pending, %d decided, %d skipped, %d applied",
-            review_path,
-            stats.new + stats.kept,
-            stats.new,
-            stats.predecided,
-            rule,
-            stats.kept,
-            stats.redecided,
-            stats.reopened,
-            stats.stale,
-            counts["pending"],
-            counts["decided"],
-            counts["skipped"],
-            counts["applied"],
-        )
-        return
+            _update_project(encoder, project, force_update=force_update, batch_size=batch_size, workers=workers)
+    _lock_review(project)
+    roots, items = _scope(project)
+    records, index = _load_index(_embeddings(project), device, only={item.id for item in items})
     with _progress(index.n, "Matching") as progress:
-        edges = find_duplicate_edges(paths, index, threshold, progress)
+        edges = find_duplicate_edges([r.path for r in records], index, review_threshold, progress)
     index.release()
-    if pixel_check and edges:
-        roots = standalone_roots(image_dir)
-        verdicts = _pixel_check([(records[i].file(roots), records[j].file(roots)) for i, j, _ in edges], workers, pixel_buffer)
-        for (i, j, _), v in zip(edges, verdicts):
-            if not v.same:
-                _log_blocked(paths[i], paths[j], v)
-        blocked = sum(1 for v in verdicts if not v.same)
-        edges = [e for e, v in zip(edges, verdicts) if v.same]
-        logger.info(
-            "Pixel check: %d of %d matched pairs differ by more than compression and are not merged", blocked, len(verdicts)
-        )
-    groups = [g.members for g in group_edges(index.n, edges)]
-
-    duplicates = sum(len(g) - 1 for g in groups)
-    moved = 0
-    if trash_dir is not None and groups:
-        moved = trash_duplicate_groups(groups, records, image_dir, trash_dir, policy, dry_run=dry_run)
+    with EmbeddingDB(_embeddings(project)) as store, _review(review_path) as review:
+        try:
+            review.begin_session(
+                project_id=project.settings["project_id"],
+                model_id=store.model_id or "",
+                review_threshold=review_threshold,
+                auto_threshold=threshold,
+                policy=policy.name,
+            )
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
+        review.set_meta("pixel_check", "on" if pixel_check else "off")
+        pixel = _review_pixel_check(review, edges, records, roots, workers, pixel_buffer) if pixel_check else None
+        stats = store_matches(review, group_edges(index.n, edges), records, policy, threshold, pixel)
+        counts = review.counts()
+        excluded = len(review.losers())
+    rule = "every pair differs by compression only" if pixel_check else f"within {threshold:g}"
     logger.info(
-        "Done: %d images, %d duplicates in %d groups%s%s",
-        index.n,
-        duplicates,
-        len(groups),
-        f", {moved} files moved" if trash_dir is not None else "",
-        " (dry run, nothing moved)" if dry_run else "",
+        "%s: %d groups this run (%d new, %d of them start decided because %s, %d took over the keeps of a changed group; "
+        "%d seen before, of which %d untouched ones were re-decided and %d reopened), %d went stale; now %d pending, "
+        "%d decided, %d skipped; %d images excluded as duplicates",
+        review_path,
+        stats.new + stats.kept,
+        stats.new,
+        stats.predecided,
+        rule,
+        stats.carried,
+        stats.kept,
+        stats.redecided,
+        stats.reopened,
+        stats.stale,
+        counts["pending"],
+        counts["decided"],
+        counts["skipped"],
+        excluded,
     )
 
 
@@ -442,25 +430,39 @@ def _review_pixel_check(
 
 @cli.command("dedupe-import")
 @click.option(
-    "--base-image-dir",
+    "--import-image-dir",
+    "-i",
     type=click.Path(exists=True, file_okay=False),
     required=True,
-    help="Directory of images already in the collection.",
+    help="Directory of new images, before they are added to the library.",
 )
-@click.option("--base-db", type=click.Path(dir_okay=False), required=True, help="Embedding database for --base-image-dir.")
+@project_arg
 @click.option(
-    "--import-image-dir", type=click.Path(exists=True, file_okay=False), required=True, help="Directory of images to be imported."
+    "--import-db",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Embedding database for --import-image-dir, kept for the next run or for update-db --reuse-from "
+    "(default: a temporary one).",
 )
-@click.option("--import-db", type=click.Path(dir_okay=False), required=True, help="Embedding database for --import-image-dir.")
+@click.option(
+    "--trash-dir",
+    type=click.Path(file_okay=False),
+    default=None,
+    help="Move new images already in the project here (mirroring their relative paths). Omit to only report.",
+)
+@click.option("--dry-run", "-n", is_flag=True, help="Report what would be moved without moving.")
+@click.option("--include-hidden", is_flag=True, help="Also include hidden (dot) files and directories of the import directory.")
 @model_options
 @update_options
-@match_options
+@threshold_option
 @pixel_options
 def dedupe_import(
-    base_image_dir: str,
-    base_db: str,
     import_image_dir: str,
-    import_db: str,
+    project_dir: str,
+    import_db: str | None,
+    trash_dir: str | None,
+    dry_run: bool,
+    include_hidden: bool,
     model_id: str,
     device: str,
     compile_: bool,
@@ -468,84 +470,73 @@ def dedupe_import(
     batch_size: int,
     workers: int | None,
     force_update: bool,
-    clean_orphans: bool,
-    include_hidden: bool,
     skip_update: bool,
     threshold: float,
-    trash_dir: str | None,
-    dry_run: bool,
     pixel_check: bool,
     pixel_buffer: int,
 ) -> None:
-    """Remove images from an import directory that already exist in a base directory."""
-    if not skip_update:
-        with _encoder(model_id, device, compile_=compile_, seq_len=seq_len) as encoder:
-            _update(
-                encoder,
-                base_image_dir,
-                base_db,
-                force_update=force_update,
-                clean_orphans=clean_orphans,
-                include_hidden=include_hidden,
-                batch_size=batch_size,
-                workers=workers,
-            )
-            _update(
-                encoder,
-                import_image_dir,
-                import_db,
-                force_update=force_update,
-                clean_orphans=clean_orphans,
-                include_hidden=include_hidden,
-                batch_size=batch_size,
-                workers=workers,
-            )
+    """Find the images of a new directory that the project at PROJECT_DIR already has, and move them to --trash-dir.
 
-    base_records, base_index = _load_index(base_db, device, "base database")
-    import_records, import_index = _load_index(import_db, device, "import database")
+    The project's images that are excluded (by a person or as duplicates) do not count. Duplicates within the import
+    directory are not looked for. The project's embeddings are brought up to date first unless --skip-update.
+    """
+    project = _project(project_dir)
+    with contextlib.ExitStack() as stack:
+        if import_db is None:
+            import_db = str(Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="picurate-import-"))) / "import.sqlite")
+        with _encoder(model_id, device, compile_=compile_, seq_len=seq_len) as encoder:
+            if not skip_update:
+                _update_project(encoder, project, force_update=force_update, batch_size=batch_size, workers=workers)
+            _update_dir(encoder, import_image_dir, import_db, include_hidden=include_hidden, batch_size=batch_size, workers=workers)
+        roots, items = _scope(project)
+        excluded = {state["item_id"] for state in project.states() if state["excluded"]}
+        base_records, base_index = _load_index(
+            _embeddings(project), device, "project database", only={item.id for item in items} - excluded
+        )
+        import_records, import_index = _load_index(import_db, device, "import database")
     base_paths = [r.path for r in base_records]
     import_paths = [r.path for r in import_records]
     with _progress(import_index.n, "Matching") as progress:
         pairs = find_cross_pairs(import_paths, import_index, base_paths, base_index, threshold, progress)
     base_index.release()
     import_index.release()
+    import_roots = standalone_roots(import_image_dir)
     if pixel_check and pairs:
         verdicts = _pixel_check(
-            [(os.path.join(import_image_dir, import_paths[i]), os.path.join(base_image_dir, base_paths[j])) for i, j, _ in pairs],
-            workers,
-            pixel_buffer,
+            [(import_records[i].file(import_roots), base_records[j].file(roots)) for i, j, _ in pairs], workers, pixel_buffer
         )
         for (i, j, _), v in zip(pairs, verdicts):
             if not v.same:
-                _log_blocked(import_paths[i], f"base: {base_paths[j]}", v)
+                _log_blocked(import_paths[i], f"project: {base_records[j].file(roots)}", v)
         logger.info(
             "Pixel check: %d of %d matched pairs differ by more than compression and do not count",
             sum(1 for v in verdicts if not v.same),
             len(verdicts),
         )
         pairs = [p for p, v in zip(pairs, verdicts) if v.same]
-    hits: dict[int, int] = {}
-    for i, _, _ in pairs:
-        hits[i] = hits.get(i, 0) + 1
+    hits: dict[int, list[int]] = {}
+    for i, j, _ in pairs:
+        hits.setdefault(i, []).append(j)
 
     moved = 0
-    if trash_dir is not None:
-        for i in sorted(hits):
-            if move_to_trash(import_image_dir, import_paths[i], trash_dir, dry_run=dry_run):
-                moved += 1
+    for i in sorted(hits):
+        reason = f"already in the project as {base_records[hits[i][0]].file(roots)}"
+        if trash_dir is None:
+            logger.info('"%s" is %s', import_records[i].file(import_roots), reason)
+        elif move_to_trash(import_image_dir, import_paths[i], trash_dir, dry_run=dry_run, reason=reason):
+            moved += 1
     logger.info(
-        "Done: %d import images, %d already present in base (%d matches)%s%s",
+        "Done: %d import images, %d already in the project (%d matches)%s%s",
         import_index.n,
         len(hits),
-        sum(hits.values()),
+        sum(len(v) for v in hits.values()),
         f", {moved} files moved" if trash_dir is not None else "",
         " (dry run, nothing moved)" if dry_run else "",
     )
 
 
 @cli.command("update-db")
-@image_dir_arg
-@db_arg
+@project_arg
 @model_options
 @update_options
 @click.option(
@@ -556,8 +547,7 @@ def dedupe_import(
     "of encoded. Every new or changed image is read once more to hash it.",
 )
 def update_db(
-    image_dir: str,
-    db: str,
+    project_dir: str,
     model_id: str,
     device: str,
     compile_: bool,
@@ -565,27 +555,18 @@ def update_db(
     batch_size: int,
     workers: int | None,
     force_update: bool,
-    clean_orphans: bool,
-    include_hidden: bool,
     skip_update: bool,
     reuse_from: str | None,
 ) -> None:
-    """Only (re)encode images into the database, without matching."""
+    """Only (re)encode the project's images into its embedding database, without matching."""
+    project = _project(project_dir)
     if not skip_update:
         with _encoder(model_id, device, compile_=compile_, seq_len=seq_len) as encoder:
-            _update(
-                encoder,
-                image_dir,
-                db,
-                force_update=force_update,
-                clean_orphans=clean_orphans,
-                include_hidden=include_hidden,
-                batch_size=batch_size,
-                workers=workers,
-                reuse_from=reuse_from,
+            _update_project(
+                encoder, project, force_update=force_update, batch_size=batch_size, workers=workers, reuse_from=reuse_from
             )
-    records, embeddings = _load(db)
-    logger.info("%s holds %d embeddings of shape %s", db, len(records), embeddings.shape[1:])
+    records, embeddings = _load(_embeddings(project))
+    logger.info("%s holds %d embeddings of shape %s", _embeddings(project), len(records), embeddings.shape[1:])
 
 
 @cli.command("encode-test")
@@ -618,19 +599,14 @@ def encode_test(model_id: str, device: str, compile_: bool, seq_len: int, dtype:
     click.echo(euclidean_distance(features, features))
 
 
-review_db_option = click.option(
-    "--review-db", type=click.Path(dir_okay=False), default=None, help="Review database path (default: <db>.review.sqlite)."
-)
-
-
 @cli.command("review-status")
-@db_arg
-@review_db_option
-def review_status(db: str, review_db: str | None) -> None:
-    """Print what the review database holds."""
-    path = review_db or default_review_path(db)
-    if not os.path.exists(path):
-        raise click.ClickException(f"No review database at {path}. Run dedupe --review-threshold first.")
+@project_arg
+def review_status(project_dir: str) -> None:
+    """Print what the project's review database holds."""
+    project = _project(project_dir)
+    path = project.directory / REVIEW
+    if not path.exists():
+        raise click.ClickException(f"No review database at {path}. Run dedupe first.")
     with _review(path) as review:
         counts = review.counts()
         click.echo(
@@ -643,57 +619,19 @@ def review_status(db: str, review_db: str | None) -> None:
             different = pixel.get((status, "different"), 0)
             extra = f"  ({same} compression only, {different} with pixel differences)" if same or different else ""
             click.echo(f"  {status:8s} {n}{extra}")
-        moves = review.plan_apply()
-        click.echo(f"  {len(moves)} files would be moved by review-apply")
+        click.echo(f"  {len(review.losers())} images excluded as duplicates")
         discarded = review.groups("decided", discarded=True)
         if discarded:
-            click.echo(f"  {len(discarded)} decided groups are discarded whole (every member is moved)")
-        keepless = review.groups("decided", keeps_nothing=True)
+            click.echo(f"  {len(discarded)} decided groups are discarded whole (every member is excluded)")
+        keepless = review.groups(("pending", "skipped"), keeps_nothing=True)
         if keepless:
             click.echo(
-                f"  {len(keepless)} decided groups keep nothing and are skipped: {', '.join(str(g.id) for g in keepless[:20])}{' …' if len(keepless) > 20 else ''}"
+                f"  {len(keepless)} open groups keep nothing: {', '.join(str(g.id) for g in keepless[:20])}{' …' if len(keepless) > 20 else ''}"
             )
-
-
-@cli.command("review-apply")
-@image_dir_arg
-@db_arg
-@review_db_option
-@click.option(
-    "--trash-dir",
-    type=click.Path(file_okay=False),
-    required=True,
-    help="Move the losers of decided groups here (mirroring their relative paths).",
-)
-@click.option("--dry-run", "-n", is_flag=True, help="Report what would be moved without moving.")
-def review_apply(image_dir: str, db: str, review_db: str | None, trash_dir: str, dry_run: bool) -> None:
-    """Move the losers of every decided group to the trash directory."""
-    path = review_db or default_review_path(db)
-    if not os.path.exists(path):
-        raise click.ClickException(f"No review database at {path}. Run dedupe --review-threshold first.")
-    with _review(path) as review:
-        decided = review.groups("decided")
-        keepless = review.groups("decided", keeps_nothing=True)
-        if keepless:
-            logger.warning(
-                "%d decided groups keep nothing and are skipped (keep a member, or discard the whole group with R in the GUI): %s",
-                len(keepless),
-                ", ".join(str(g.id) for g in keepless),
-            )
-        with _progress(len(decided), "Applying", "group") as progress:
-            moved, refused = apply_decisions(review, image_dir, trash_dir, dry_run=dry_run, progress=progress)
-    logger.info(
-        "Done: %d files %s, %d groups refused because files changed on disk%s",
-        moved,
-        "would be moved" if dry_run else "moved",
-        len(refused),
-        " (dry run)" if dry_run else "",
-    )
 
 
 @cli.command("calibrate")
-@image_dir_arg
-@db_arg
+@project_arg
 @model_options
 @update_options
 @click.option("--samples", "-s", type=int, default=200, show_default=True, help="Number of images to sample from the database.")
@@ -719,8 +657,7 @@ def review_apply(image_dir: str, db: str, review_db: str | None, trash_dir: str,
     help="Threshold(s) to evaluate against the distributions (default: the dedupe default).",
 )
 def calibrate_cmd(
-    image_dir: str,
-    db: str,
+    project_dir: str,
     model_id: str,
     device: str,
     compile_: bool,
@@ -728,8 +665,6 @@ def calibrate_cmd(
     batch_size: int,
     workers: int | None,
     force_update: bool,
-    clean_orphans: bool,
-    include_hidden: bool,
     skip_update: bool,
     samples: int,
     seed: int,
@@ -738,31 +673,28 @@ def calibrate_cmd(
 ) -> None:
     """Measure how far lossy copies and different images sit, and suggest a threshold.
 
-    Samples images from the database, synthesizes variants (JPEG re-save, downscale, ...) and prints histograms of
+    Samples images of the project at PROJECT_DIR from its embedding database, synthesizes variants (JPEG re-save, downscale, ...) and prints histograms of
     their distance to the stored embedding next to the distance to the nearest different image.
     """
     variant_names = [v.strip() for v in variants.split(",") if v.strip()]
     unknown = [v for v in variant_names if v not in VARIANTS]
     if unknown:
         raise click.ClickException(f"Unknown variants {', '.join(unknown)}; available: {', '.join(VARIANTS)}")
+    project = _project(project_dir)
+    db = _embeddings(project)
     with _encoder(model_id, device, compile_=compile_, seq_len=seq_len) as encoder:
         if not skip_update:
-            _update(
-                encoder,
-                image_dir,
-                db,
-                force_update=force_update,
-                clean_orphans=clean_orphans,
-                include_hidden=include_hidden,
-                batch_size=batch_size,
-                workers=workers,
-            )
+            _update_project(encoder, project, force_update=force_update, batch_size=batch_size, workers=workers)
         with EmbeddingDB(db) as store:
             if store.model_id != encoder.model_id:
                 raise click.ClickException(
                     f"Database {db} was encoded with model '{store.model_id}', but '{encoder.model_id}' is loaded."
                 )
+        roots, items = _scope(project)
         records, embeddings = _load(db)
+        present = {item.id for item in items}
+        rows = [i for i, r in enumerate(records) if r.id in present]
+        records, embeddings = [records[i] for i in rows], embeddings[rows]
         if not records:
             raise click.ClickException(f"No entries in the database {db}. Run an update first.")
         index = DistanceIndex(embeddings, device)
@@ -770,7 +702,7 @@ def calibrate_cmd(
         with _progress(n, "Calibrating") as progress:
             result = calibrate(
                 encoder,
-                image_dir,
+                roots,
                 records,
                 embeddings,
                 index,

@@ -8,6 +8,9 @@ decision can be rolled back as a unit, and old history can be pruned without bre
 files are only ever read. The project keeps no content hash: an import only stats the files. Once the images are
 encoded for deduplication, export and relink check them against the content hashes in ``embeddings.sqlite``.
 
+Other stages write only their own files in the project directory (``embeddings.sqlite``, ``review.sqlite``); the
+project reads them and combines them with the human decisions (:meth:`Project.state`).
+
 An item is identified by ``(source_id, relative path)`` (see :mod:`picurate.common.images`); a project's
 ``source_id`` is 256 random bits created when a source folder is first imported.
 """
@@ -27,6 +30,8 @@ from pathlib import Path
 
 from ..common.images import STANDALONE_SOURCE, PathFilter, file_digest, item_id, list_directory_relative
 from ..dedupe.db_store import SCHEMA_VERSION as EMBEDDING_SCHEMA
+from ..dedupe.review import SCHEMA_VERSION as REVIEW_SCHEMA
+from ..dedupe.review import losers
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +46,11 @@ COMMIT_EVERY = 1000
 ITEM_COLUMNS = ("id", "source_id", "path", "size", "mtime_ns", "caption", "caption_path", "output_stem", "missing")
 ARTIFACT_DIRS = ("masks", "patches")
 EMBEDDINGS = "embeddings.sqlite"  # written by picurate-dedupe; only read here, for the content hashes
+REVIEW = "review.sqlite"  # written by picurate-dedupe and the curation GUI; only read here, for the exclusions
+LOCKS = {
+    "project": "The project is open in another editor",
+    "review": "The review database is in use (picurate-curate or a dedupe run)",
+}
 
 SCHEMA = """
 CREATE TABLE items (
@@ -135,7 +145,7 @@ class Project:
         if not database.exists():
             raise ValueError(f"{database} is missing")
         self._lock = threading.RLock()
-        self._lock_file = None
+        self._lock_files = {}
         self.db = sqlite3.connect(database, check_same_thread=False, isolation_level=None)
         self.db.execute("PRAGMA journal_mode = WAL")
         self.db.execute("PRAGMA synchronous = NORMAL")
@@ -165,20 +175,27 @@ class Project:
         safe_relative(row[7])
         return dict(zip(ITEM_COLUMNS, row))
 
-    def lock(self) -> None:
-        """Hold the project for one editor. The OS releases the lock when the process ends, however it ends."""
-        stream = open(self.directory / "project.lock", "a")
+    def lock(self, name: str = "project") -> None:
+        """Hold the project's decisions (``project``) or its review database (``review``) for one writer. The OS
+        releases the lock when the process ends, however it ends."""
+        if name in self._lock_files:
+            return
+        stream = open(self.directory / f"{name}.lock", "a")
         try:
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             stream.close()
-            raise ValueError("The project is open in another editor") from None
-        self._lock_file = stream
+            raise ValueError(LOCKS[name]) from None
+        self._lock_files[name] = stream
+
+    def unlock(self, name: str) -> None:
+        stream = self._lock_files.pop(name, None)
+        if stream is not None:
+            stream.close()
 
     def close(self) -> None:
-        if self._lock_file is not None:
-            self._lock_file.close()
-            self._lock_file = None
+        for name in list(self._lock_files):
+            self.unlock(name)
         self.db.close()
 
     def save_settings(self) -> None:
@@ -384,6 +401,24 @@ class Project:
                 decisions.setdefault(key, {})[field] = json.loads(value)
         return decisions
 
+    def _review_losers(self, item: bytes | None = None) -> dict[bytes, tuple[int, list[bytes]]]:
+        path = self.directory / REVIEW
+        if not path.exists():
+            return {}
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        try:
+            version = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+            if version is None or version[0] != REVIEW_SCHEMA:
+                logger.warning("%s has another schema version; its decisions are ignored until matching runs again", path)
+                return {}
+            return losers(conn, item)
+        finally:
+            conn.close()
+
+    def human_excluded(self) -> set[bytes]:
+        """Items a person excluded (force exclude); they take no part in matching."""
+        return {item for item, fields in self._decisions().items() if (fields.get("exclusion") or {}).get("decision") == "exclude"}
+
     def _state(self, item: bytes, decisions: dict) -> dict:
         row = self.items[item]
         state = {
@@ -395,16 +430,46 @@ class Project:
         }
         if state["caption"] is None:
             state["caption"] = self.derived_caption(item)
-        state["excluded"] = (state["exclusion"] or {}).get("decision") == "exclude"
         return state
 
+    @staticmethod
+    def _human_exclusion(fields: dict) -> str | None:
+        return (fields.get("exclusion") or {}).get("decision")
+
+    def _combine_exclusion(self, state: dict, losers: dict, decisions: dict | None = None) -> None:
+        """Excluded: the human decision (force keep / force exclude) if any, else a loser of a decided duplicate
+        group, unless a person excluded every copy the group keeps. Sets ``excluded`` and ``excluded_by`` (None, or
+        what excluded it). ``decisions`` holds every item's decisions, or None to look up the kept copies."""
+        human = self._human_exclusion(state)
+        state["excluded_by"] = None
+        if human == "exclude":
+            state["excluded_by"] = {"by": "human", "reason": state["exclusion"].get("reason", "")}
+        elif human is None and state["item_id"] in losers:
+            group, kept = losers[state["item_id"]]
+            if decisions is None:
+                decisions = {k: self._decisions(k).get(k, {}) for k in kept}
+            if not kept or any(self._human_exclusion(decisions.get(k, {})) != "exclude" for k in kept):
+                state["excluded_by"] = {"by": "dedupe", "group": group, "kept": [k.hex() for k in kept]}
+        state["excluded"] = state["excluded_by"] is not None
+
+    def update_exclusion(self, state: dict) -> None:
+        """Recompute ``excluded`` and ``excluded_by`` after ``state["exclusion"]`` changed."""
+        self._combine_exclusion(state, self._review_losers(state["item_id"]))
+
     def state(self, item: bytes) -> dict:
-        """The effective state of an item: its decisions over the defaults, with the derived caption if unedited."""
-        return self._state(item, self._decisions(item).get(item, {}))
+        """The effective state of an item: its decisions over the defaults, with the derived caption if unedited, and
+        whether it is excluded (``excluded``, with ``excluded_by``)."""
+        state = self._state(item, self._decisions(item).get(item, {}))
+        self._combine_exclusion(state, self._review_losers(item))
+        return state
 
     def states(self) -> list[dict]:
         decisions = self._decisions()
-        return [self._state(item, decisions.get(item, {})) for item in self.items]
+        losers = self._review_losers()
+        states = [self._state(item, decisions.get(item, {})) for item in self.items]
+        for state in states:
+            self._combine_exclusion(state, losers, decisions)
+        return states
 
     def begin_op(self, kind: str, description: str = "") -> int:
         with self._lock:

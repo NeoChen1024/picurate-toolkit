@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 
 import numpy as np
 
@@ -104,12 +104,13 @@ def update_database(
     workers: int | None = None,
     progress_factory: Callable[[int], Callable[[int], object]] | None = None,
     reuse_from: str | None = None,
+    keep_rows: Collection[bytes] | None = None,
 ) -> None:
     """Bring ``db_path`` up to date with ``items``.
 
     ``workers`` is the number of decoder processes (default: one per CPU). ``progress_factory(total)`` may return a
     callable that is invoked with increments as images are processed. With ``clean_orphans``, rows of images not in
-    ``items`` are removed. ``reuse_from`` names another database whose rows are copied for files of the same content
+    ``items`` (or in ``keep_rows``, when given) are removed. ``reuse_from`` names another database whose rows are copied for files of the same content
     (see :func:`reuse_embeddings`).
     """
     with EmbeddingDB(db_path, rebuild=force_update) as db:
@@ -128,7 +129,7 @@ def update_database(
             encode_images(encoder, db, roots, candidates, batch_size=batch_size, workers=workers, progress=progress)
 
         if clean_orphans:
-            seen = {item.id for item in items}
+            seen = set(keep_rows) if keep_rows is not None else {item.id for item in items}
             orphans = [i for i in index if i not in seen]
             if orphans:
                 logger.info("Removing %d database entries whose image is gone", len(orphans))

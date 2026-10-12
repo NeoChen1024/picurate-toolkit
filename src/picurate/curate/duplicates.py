@@ -1,10 +1,10 @@
-"""The review window: group list, comparison canvas, member panel, decisions and Apply."""
+"""The Duplicates tab: group list, comparison canvas, member panel and the decisions about the project's duplicate
+groups (``review.sqlite``). Nothing is moved from here; the losers of decided groups count as excluded."""
 
 from __future__ import annotations
 
 import itertools
 import logging
-import os
 from collections.abc import Callable
 
 import humanize
@@ -18,16 +18,14 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QFileDialog,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QListView,
     QListWidget,
     QListWidgetItem,
-    QMainWindow,
     QMessageBox,
     QPlainTextEdit,
-    QProgressDialog,
     QSplitter,
     QTextBrowser,
     QTextEdit,
@@ -36,9 +34,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...common.images import standalone_roots
-from ..keeping import Policy, load_policies
-from ..review import GroupRow, MemberRow, ReviewDB, apply_decisions, unapply_group
+from ..dedupe.keeping import Policy, load_policies
+from ..dedupe.review import GroupRow, MemberRow, ReviewDB
+from ..project.project import Project
 from .canvas import CompareCanvas
 from .jobs import LRU, Job, diff_images, load_image, qimage, thumbnail
 from .models import GROUP_ROLE, STATUS_BADGES, BadgeDelegate, GroupListModel
@@ -51,7 +49,6 @@ FILTERS = (
     "pending",
     "decided",
     "skipped",
-    "applied",
     "stale",
     "compression only",
     "pixel differences",
@@ -62,27 +59,18 @@ PIXEL_FILTERS = {"compression only": "same", "pixel differences": "different"}  
 KEEP_FILTERS = {"keeps nothing": {"keeps_nothing": True}, "discarded": {"discarded": True}}  # any status but stale
 
 
-class ReviewWindow(QMainWindow):
-    """One review database, one image directory."""
+class DuplicatesTab(QWidget):
+    """The duplicate groups of one project. The caller holds the project's review lock."""
 
-    def __init__(
-        self,
-        review_path: str,
-        image_dir: str | None = None,
-        trash_dir: str | None = None,
-        *,
-        policies: dict[str, Policy] | None = None,
-        prefetch: int = 3,
-    ):
+    def __init__(self, project: Project, review: ReviewDB, *, policies: dict[str, Policy] | None = None, prefetch: int = 3):
         super().__init__()
-        self.review = ReviewDB(review_path)
-        self.image_dir = image_dir or self.review.get_meta("image_dir") or "."
-        self.roots = standalone_roots(self.image_dir)
-        self.trash_dir = trash_dir
+        self.project = project
+        self.review = review
+        self.roots = {source: str(path) for source, path in project.sources.items()}
         self.policies = policies or load_policies()
         self.policy = self.policies.get(self.review.get_meta("policy") or "largest") or next(iter(self.policies.values()))
-        self.setWindowTitle(f"Duplicate review — {os.path.basename(review_path)}")
-        self.resize(1500, 950)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         # Two pools: whatever the current group needs (its images, its diff, thumbnails) never queues behind
         # prefetch reads, which on a network share can take seconds each.
@@ -105,6 +93,7 @@ class ReviewWindow(QMainWindow):
 
         self.current: GroupRow | None = None
         self.members: list[MemberRow] = []
+        self.exclusion_marks: dict[bytes, str] = {}
         self.a = 0
         self.b = 1
 
@@ -130,7 +119,7 @@ class ReviewWindow(QMainWindow):
     def _build_toolbar(self) -> None:
         bar = QToolBar()
         bar.setMovable(False)
-        self.addToolBar(bar)
+        self.layout().addWidget(bar)
         bar.addWidget(QLabel(" Show "))
         self.filter = QComboBox()
         self.filter.addItems(FILTERS)
@@ -173,9 +162,6 @@ class ReviewWindow(QMainWindow):
         self._action(bar, "Policy pick (P)", self.reset_pending_to_policy)
         self._action(bar, "Trash group (R)", self.discard_and_next)
         self._action(bar, "Undo (U)", self.undo)
-        bar.addSeparator()
-        self._action(bar, "Apply…", self.apply_dialog, "Ctrl+Return")
-        self._action(bar, "Undo apply", self.undo_apply)
         bar.addSeparator()
         self._action(bar, "Help", self.show_help, "F1")
 
@@ -225,17 +211,21 @@ class ReviewWindow(QMainWindow):
         split.addWidget(self.canvas)
         split.addWidget(panel)
         split.setSizes([220, 880, 400])
-        self.setCentralWidget(split)
+        self.layout().addWidget(split, 1)
 
     def _build_statusbar(self) -> None:
+        row = QHBoxLayout()
+        row.setContentsMargins(6, 0, 6, 4)
         self.position_label = QLabel("Group 0 / 0")
-        self.position_label.setContentsMargins(6, 0, 12, 0)
         self.counts_label = QLabel()
         self.message_label = QLabel()
-        self.statusBar().addPermanentWidget(self.position_label)
-        self.statusBar().addPermanentWidget(self.counts_label)
-        self.statusBar().addPermanentWidget(self.message_label, 1)
-        self.message("Ready · nothing is deleted, Apply moves files to the trash directory")
+        row.addWidget(self.position_label)
+        row.addSpacing(12)
+        row.addWidget(self.counts_label)
+        row.addSpacing(12)
+        row.addWidget(self.message_label, 1)
+        self.layout().addLayout(row)
+        self.message("Ready · nothing is moved here: the images a decided group does not keep count as excluded")
 
     # -- groups --------------------------------------------------------------------------------------------------------
 
@@ -267,11 +257,9 @@ class ReviewWindow(QMainWindow):
 
     def _update_counts(self) -> None:
         c = self.review.counts()
-        moves = len(self.review.plan_apply())
-        keepless = len(self.review.groups("decided", keeps_nothing=True))
+        excluded = len(self.review.losers())
         self.counts_label.setText(
-            f"{c['pending']} pending · {c['decided']} decided · {c['skipped']} skipped · {c['applied']} applied · {moves} files to trash"
-            + (f" · {keepless} decided keep nothing" if keepless else "")
+            f"{c['pending']} pending · {c['decided']} decided · {c['skipped']} skipped · {excluded} images excluded as duplicates"
         )
 
     def navigate(self, delta: int, pending_only: bool = False) -> None:
@@ -303,6 +291,7 @@ class ReviewWindow(QMainWindow):
     def show_group(self, group: GroupRow) -> None:
         self.current = group
         self.members = self.review.members(group.id)
+        self.exclusion_marks = self._exclusion_marks()
         keeps = [i for i, m in enumerate(self.members) if m.keep]
         self.a = keeps[0] if keeps else 0
         edges = self.review.edges(group.id)
@@ -393,12 +382,13 @@ class ReviewWindow(QMainWindow):
         if g is None:
             return
         label = STATUS_BADGES.get(g.status, STATUS_BADGES["pending"])[1]
-        self.group_label.setText(f"Group {g.id}: {g.n} images · distances {g.min_distance:.3f} – {g.max_distance:.3f}")
+        carried = f" · keeps carried over from group {g.carried_from}" if g.carried_from is not None else ""
+        self.group_label.setText(f"Group {g.id}: {g.n} images · distances {g.min_distance:.3f} – {g.max_distance:.3f}{carried}")
         kept = sum(1 for m in self.members if m.keep)
         if g.discard:
-            keeps = f"whole group discarded: Apply moves all {len(self.members)} (R restores)"
+            keeps = f"whole group discarded: all {len(self.members)} excluded once decided (R restores)"
         elif kept == 0:
-            keeps = "keeps nothing: Apply skips it; tick a member, or R to discard the whole group"
+            keeps = "keeps nothing: cannot be decided; tick a member, or R to discard the whole group"
         else:
             keeps = f"keeping {kept} of {len(self.members)}"
         self.status_label.setText(f"Status: {label} (C cycles) · {keeps}")
@@ -409,7 +399,26 @@ class ReviewWindow(QMainWindow):
         m = self.members[i]
         tag = "A" if i == self.a else "B" if i == self.b else " "
         dist = "" if m.distance_to_winner is None else f" · d={m.distance_to_winner:.3f}"
-        return f"{i + 1} [{tag}] {m.path}\n{m.width}×{m.height} · {m.format} · {humanize.naturalsize(m.size, binary=True)}{dist}"
+        text = f"{i + 1} [{tag}] {m.path}\n{m.width}×{m.height} · {m.format} · {humanize.naturalsize(m.size, binary=True)}{dist}"
+        return text + self.exclusion_marks.get(m.item, "")
+
+    def _exclusion_marks(self) -> dict[bytes, str]:
+        """What else decides about the members: a person (in the editor), or another decided group."""
+        marks = {}
+        for m in self.members:
+            if m.item not in self.project.items:
+                marks[m.item] = "\n⚠ no longer in the project"
+                continue
+            state = self.project.state(m.item)
+            human = (state["exclusion"] or {}).get("decision")
+            by = state["excluded_by"]
+            if human == "exclude":
+                marks[m.item] = f"\n✕ excluded by hand{': ' + by['reason'] if by and by.get('reason') else ''}"
+            elif human == "keep":
+                marks[m.item] = "\n✓ kept by hand"
+            elif by is not None and self.current is not None and by["group"] != self.current.id:
+                marks[m.item] = f"\n✕ excluded by group {by['group']}"
+        return marks
 
     def _refresh_members(self) -> None:
         """Update labels and check boxes in place (never rebuild the list from inside one of its own signals)."""
@@ -633,6 +642,7 @@ class ReviewWindow(QMainWindow):
         group = self.review.group(self.current.id)
         self.current = group
         self.members = self.review.members(group.id)
+        self.exclusion_marks = self._exclusion_marks()
         self.groups_model.update_group(group)
         self._refresh_members()
         self._refresh_group_label()
@@ -679,7 +689,7 @@ class ReviewWindow(QMainWindow):
             answer = QMessageBox.question(
                 self,
                 "Policy pick",
-                f"Reset the keeps of {n:,} pending group(s) to the choice of policy '{self.policy.name}'?\n\nDecided, skipped and applied groups are not touched.",
+                f"Reset the keeps of {n:,} pending group(s) to the choice of policy '{self.policy.name}'?\n\nDecided and skipped groups are not touched.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,
             )
@@ -696,11 +706,11 @@ class ReviewWindow(QMainWindow):
             self.navigate(1, pending_only=True)
 
     def discard_and_next(self) -> None:
-        """Mark the whole group to be moved by Apply, keeping none (R); on a discarded group, take the mark back."""
+        """Exclude every member of the group, keeping none (R); on a discarded group, take the mark back."""
         if self.current is None:
             return
-        if self.current.status in ("applied", "stale"):
-            self.message(f"A{'n' if self.current.status == 'applied' else ''} {self.current.status} group cannot be discarded")
+        if self.current.status == "stale":
+            self.message("A stale group cannot be discarded")
             return
         if self.current.discard:
             if self._decide(discard=False, status="pending"):
@@ -712,11 +722,11 @@ class ReviewWindow(QMainWindow):
             self.message(str(e))
             return
         self._after_change()
-        self.message(f"Group {self.current.id} discarded: Apply moves all {len(self.members)} files")
+        self.message(f"Group {self.current.id} discarded: all {len(self.members)} images are excluded")
         self.navigate(1, pending_only=True)
 
     def cycle_status(self) -> None:
-        if self.current is None or self.current.status in ("applied", "stale"):
+        if self.current is None or self.current.status == "stale":
             return
         cycle = ("pending", "decided", "skipped")
         self._decide(status=cycle[(cycle.index(self.current.status) + 1) % 3])
@@ -743,97 +753,14 @@ class ReviewWindow(QMainWindow):
         if self.current is not None and self.note.text() != self.current.note:
             self._decide(note=self.note.text())
 
-    # -- apply ---------------------------------------------------------------------------------------------------------
-
-    def plan_text(self) -> tuple[str, int]:
-        moves = self.review.plan_apply()
-        lines = [
-            f"{m.member.path}  →  trash   ({'keeping ' + ', '.join(m.keep) if m.keep else 'whole group discarded'})" for m in moves
-        ]
-        return "\n".join(lines), len(moves)
-
-    def _ensure_trash_dir(self) -> bool:
-        if self.trash_dir:
-            return True
-        chosen = QFileDialog.getExistingDirectory(self, "Trash directory (losers are moved here)")
-        if not chosen:
-            return False
-        self.trash_dir = chosen
-        return True
-
-    def apply_dialog(self) -> None:
-        text, n = self.plan_text()
-        if n == 0:
-            QMessageBox.information(self, "Nothing to apply", "No decided group has files to move.")
-            return
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Apply decisions")
-        dialog.resize(800, 600)
-        layout = QVBoxLayout(dialog)
-        layout.addWidget(
-            QLabel(
-                f"{n} files will be moved to the trash directory{': ' + self.trash_dir if self.trash_dir else ''}. Nothing is deleted."
-            )
-        )
-        keepless = self.review.groups("decided", keeps_nothing=True)
-        if keepless:
-            layout.addWidget(
-                QLabel(
-                    f"{len(keepless)} decided group(s) keep nothing and are skipped. Show → keeps nothing lists them; R discards a whole group."
-                )
-            )
-        view = QPlainTextEdit()
-        view.setReadOnly(True)
-        view.setPlainText(text)
-        layout.addWidget(view)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(f"Move {n} files")
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        if not self._ensure_trash_dir():
-            return
-        self.apply_moves()
-
-    def apply_moves(self, *, dry_run: bool = False) -> tuple[int, list[int]]:
-        assert self.trash_dir
-        decided = self.review.groups("decided")
-        progress = QProgressDialog("Moving files…", "", 0, len(decided), self)
-        progress.setCancelButton(None)
-        progress.setMinimumDuration(500)
-        done = 0
-
-        def tick(k: int) -> None:
-            nonlocal done
-            done += k
-            progress.setValue(done)
-            QApplication.processEvents()
-
-        moved, refused = apply_decisions(self.review, self.image_dir, self.trash_dir, dry_run=dry_run, progress=tick)
-        progress.close()
-        self.images.clear()
-        self.reload_groups()
-        self.message(
-            f"{moved} files moved to {self.trash_dir}"
-            + (f"; {len(refused)} groups refused because files changed on disk" if refused else "")
-        )
-        return moved, refused
-
-    def undo_apply(self) -> None:
-        if self.current is None or self.current.status != "applied":
-            self.message("Select an applied group to undo its apply")
-            return
-        restored = unapply_group(self.review, self.image_dir, self.current.id)
-        self.images.clear()
-        self._after_change()
-        self.message(f"{restored} files restored")
-
     # -- keys ----------------------------------------------------------------------------------------------------------
 
     def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt API
-        if event.type() not in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease) or QApplication.activeWindow() is not self:
+        if (
+            event.type() not in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease)
+            or QApplication.activeWindow() is not self.window()
+            or not self.isVisible()
+        ):
             return super().eventFilter(obj, event)
         widget = QApplication.focusWidget()
         while widget is not None:
@@ -910,13 +837,13 @@ class ReviewWindow(QMainWindow):
         self.help_dialog.raise_()
         self.help_dialog.activateWindow()
 
-    def closeEvent(self, event) -> None:  # noqa: N802
+    def shutdown(self) -> None:
+        """Stop background work; the window closes the review database."""
+        QApplication.instance().removeEventFilter(self)
         for job in self.loading.values():
             job.cancel()
         self.pool.waitForDone()
         self.prefetch_pool.waitForDone()
-        self.review.close()
-        super().closeEvent(event)
 
 
 _SHIFTED_DIGITS = {
@@ -937,8 +864,11 @@ HELP_HTML = """
 <p>A group marked <b>≈</b> passed the pixel check: every pair differs by lossy compression only, so it starts decided.
 The member panel shows each pair's result (≈ or ≠ and the largest local difference). The Show box can list only
 those groups, or only the ones with pixel differences.</p>
-<p>A group marked <b>∅</b> keeps nothing: every keep is unticked. It cannot be decided, and Apply skips it, since that
-is as often a slip as an intent. To move every member on purpose, discard it with <b>R</b>; it is then marked <b>✕</b>.
+<p>Nothing is moved from here. The images a decided group does not keep count as excluded: the editor marks them
+and does not export them. A person's decision in the
+editor (force keep, force exclude) overrides a group's; the member panel shows it.</p>
+<p>A group marked <b>∅</b> keeps nothing: every keep is unticked. It cannot be decided, since that is as often a slip
+as an intent. To exclude every member on purpose, discard it with <b>R</b>; it is then marked <b>✕</b>.
 Show → keeps nothing / discarded lists either kind.</p>
 <h3>Groups</h3>
 <table cellspacing="6">
@@ -946,7 +876,7 @@ Show → keeps nothing / discarded lists either kind.</p>
 <tr><td><b>Shift+Z / Shift+X</b></td><td>Previous / next <i>pending</i> group</td></tr>
 <tr><td><b>Enter</b></td><td>Mark decided and go to the next pending group</td></tr>
 <tr><td><b>S</b></td><td>Skip and go to the next pending group</td></tr>
-<tr><td><b>R</b></td><td>Discard the whole group: Apply moves every member, keeping none; R again takes it back</td></tr>
+<tr><td><b>R</b></td><td>Discard the whole group: every member is excluded, keeping none; R again takes it back</td></tr>
 <tr><td><b>C</b></td><td>Cycle pending → decided → skipped</td></tr>
 <tr><td><b>U</b></td><td>Undo the last change of this group</td></tr>
 <tr><td><b>F</b></td><td>Edit the note</td></tr>
@@ -968,12 +898,6 @@ Show → keeps nothing / discarded lists either kind.</p>
 <tr><td><b>Space+drag</b>, middle drag</td><td>Pan</td></tr>
 <tr><td><b>Home / 0</b></td><td>Fit / 100%</td></tr>
 </table>
-<h3>Applying</h3>
-<table cellspacing="6">
-<tr><td><b>Ctrl+Enter</b></td><td>Apply: list every move, then move the losers of decided groups to the trash directory</td></tr>
-<tr><td>Undo apply</td><td>Move the selected applied group's files back</td></tr>
-</table>
-<p>Nothing is ever deleted. Groups whose files changed on disk since matching are refused by Apply; re-run
-<code>update-db</code> and <code>dedupe --review-threshold</code> for those. Decisions are written to the review
-database immediately. Re-matching from the CLI keeps decisions of groups whose membership did not change.</p>
+<p>Decisions are written to the review database immediately. Re-matching from the CLI keeps the decisions of groups
+whose membership did not change; a new group that shares members with one you changed starts pending with its keeps.</p>
 """

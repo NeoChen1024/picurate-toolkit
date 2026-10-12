@@ -12,6 +12,7 @@ from picurate.dedupe import review as rv
 from picurate.dedupe.cli import cli
 from picurate.dedupe.keeping import builtin_policies
 from picurate.dedupe.pixel_check import PixelVerdict
+from picurate.project.project import REVIEW, Project
 
 
 def rec(path, size=1, w=1, h=1, mtime=0.0):
@@ -128,7 +129,7 @@ class ReviewDBTests(unittest.TestCase):
         self.assertEqual((stats.redecided, stats.reopened), (0, 1))
         self.assertEqual(self.db.group(g_ab.id).status, "pending")
 
-    def test_plan_apply_skips_groups_keeping_nothing(self):
+    def test_losers_skip_groups_keeping_nothing(self):
         self.db.upsert_groups(
             self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.05)]), (["c.png", "d.png"], [("c.png", "d.png", 0.05)])),
             LARGEST,
@@ -136,13 +137,12 @@ class ReviewDBTests(unittest.TestCase):
         )
         g1, g2 = self.db.groups()
         self.db.decide(g2.id, keeps={I("c.png"): False, I("d.png"): False})  # unticked after deciding: allowed, but flagged
-        moves = self.db.plan_apply()
-        self.assertEqual([(m.group_id, m.member.path, m.keep) for m in moves], [(g1.id, "a.png", ("b.png",))])
+        self.assertEqual(self.db.losers(), {I("a.png"): (g1.id, [I("b.png")])})
         self.assertEqual([(g.id, g.kept) for g in self.db.groups("decided", keeps_nothing=True)], [(g2.id, 0)])
         with self.assertRaises(ValueError):
             self.db.decide(g2.id, status="decided")  # deciding it again needs a keep or the discard mark
 
-    def test_discard_moves_every_member_and_undoes(self):
+    def test_discard_excludes_every_member_and_undoes(self):
         self.db.upsert_groups(self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.4)])), LARGEST, 0.1)
         gid = self.db.groups()[0].id
         with self.assertRaises(ValueError):
@@ -152,7 +152,7 @@ class ReviewDBTests(unittest.TestCase):
         self.assertEqual((g.status, g.discard, g.kept, g.touched), ("decided", True, 0, True))
         self.assertEqual(self.db.groups(keeps_nothing=True), [])
         self.assertEqual(self.db.groups(discarded=True), [g])
-        self.assertEqual(sorted((m.member.path, m.keep) for m in self.db.plan_apply()), [("a.png", ()), ("b.png", ())])
+        self.assertEqual(self.db.losers(), {I("a.png"): (gid, []), I("b.png"): (gid, [])})
         # a re-match leaves the reviewer's discard alone
         self.db.upsert_groups(self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.4)])), LARGEST, 0.1)
         g2 = self.db.group(gid)
@@ -167,66 +167,41 @@ class ReviewDBTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.db.decide(gid, discard=True)
 
-
-class ApplyTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.img = os.path.join(self.tmp.name, "img")
-        os.makedirs(os.path.join(self.img, "sub"))
-        self.recs = []
-        for p, data in [("a.png", b"aaaa"), ("sub/b.png", b"bb"), ("c.png", b"cccccc"), ("d.png", b"d")]:
-            full = os.path.join(self.img, p)
-            with open(full, "wb") as f:
-                f.write(data)
-            st = os.stat(full)
-            self.recs.append(ImageRecord(p, st.st_mtime, st.st_size, 1, 1, "PNG"))
-        self.db = rv.ReviewDB(os.path.join(self.tmp.name, "x.review.sqlite"))
-        self.trash = os.path.join(self.tmp.name, "trash")
-
-    def tearDown(self):
-        self.db.close()
-        self.tmp.cleanup()
-
-    def test_apply_moves_losers_refuses_changed_and_unapplies(self):
-        r = {x.path: x for x in self.recs}
-        self.db.upsert_groups(
-            [
-                ([r["a.png"], r["sub/b.png"]], [("a.png", "sub/b.png", 0.05)]),
-                ([r["c.png"], r["d.png"]], [("c.png", "d.png", 0.05)]),
-            ],
-            LARGEST,
-            0.1,
-        )
-        g1, g2 = self.db.groups()
-        with open(os.path.join(self.img, "d.png"), "ab") as f:
-            f.write(b"changed")
-        moved, refused = rv.apply_decisions(self.db, self.img, self.trash, dry_run=True)
-        self.assertEqual((moved, refused), (1, [g2.id]))
-        self.assertTrue(os.path.exists(os.path.join(self.img, "sub", "b.png")))
-        moved, refused = rv.apply_decisions(self.db, self.img, self.trash, dry_run=False)
-        self.assertEqual((moved, refused), (1, [g2.id]))
-        self.assertFalse(os.path.exists(os.path.join(self.img, "sub", "b.png")))
-        self.assertTrue(os.path.exists(os.path.join(self.trash, "sub", "b.png")))
-        self.assertEqual(self.db.group(g1.id).status, "applied")
-        self.assertEqual(self.db.group(g2.id).status, "decided")
-        with self.assertRaises(ValueError):
-            self.db.decide(g1.id, status="pending")
-        self.assertEqual(rv.unapply_group(self.db, self.img, g1.id), 1)
-        self.assertTrue(os.path.exists(os.path.join(self.img, "sub", "b.png")))
-        self.assertEqual(self.db.group(g1.id).status, "decided")
-        self.assertEqual(self.db.applied(), [])
+    def test_new_group_carries_the_keeps_of_a_changed_group(self):
+        """A human decision is only ever replaced by another one: when a group the reviewer changed gains a member,
+        the new group starts pending with those keeps, and later runs do not re-decide it."""
+        self.db.upsert_groups(self.groups((["a.png", "b.png"], [("a.png", "b.png", 0.05)])), LARGEST, 0.1)
+        old = self.db.groups()[0]
+        self.db.keep_only(old.id, I("a.png"))  # the policy kept b.png (larger); the reviewer prefers a.png
+        bigger = self.groups((["a.png", "b.png", "c.png"], [("a.png", "b.png", 0.05), ("b.png", "c.png", 0.05)]))
+        stats = self.db.upsert_groups(bigger, LARGEST, 0.1)
+        self.assertEqual((stats.new, stats.carried, stats.predecided, stats.stale), (1, 1, 0, 1))
+        new = next(g for g in self.db.groups() if g.id != old.id)
+        self.assertEqual((new.status, new.carried_from), ("pending", old.id))
+        self.assertEqual({m.path: m.keep for m in self.db.members(new.id)}, {"a.png": True, "b.png": False, "c.png": False})
+        self.assertEqual(self.db.losers(), {})  # nothing excluded until the reviewer decides the new group
+        self.db.upsert_groups(bigger, LARGEST, 0.1)
+        self.assertEqual(self.db.group(new.id).status, "pending")
 
 
 class CliReviewTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.img = os.path.join(self.tmp.name, "img")
-        os.makedirs(self.img)
-        self.db = os.path.join(self.tmp.name, "pictures.sqlite")
-        self.records = [ImageRecord(p, 0.0, s, 1, 1, "PNG") for p, s in [("a.png", 1), ("b.png", 2), ("c.png", 3), ("d.png", 4)]]
+        img = os.path.join(self.tmp.name, "img")
+        os.makedirs(img)
+        for p in ("a.png", "b.png", "c.png", "d.png"):
+            open(os.path.join(img, p), "wb").close()
+        self.project = Project(os.path.join(self.tmp.name, "project"), create=True)
+        self.project.import_images([img])
+        ids = {row["path"]: item for item, row in self.project.items.items()}
+        source = next(iter(self.project.sources))
+        self.records = [
+            ImageRecord(p, 0.0, s, 1, 1, "PNG", source, ids[p]) for p, s in [("a.png", 1), ("b.png", 2), ("c.png", 3), ("d.png", 4)]
+        ]
         self.emb = np.array([[0.0], [0.05], [0.3], [5.0]], dtype=np.float32)
 
     def tearDown(self):
+        self.project.close()
         self.tmp.cleanup()
 
     def run_dedupe(self, *extra):
@@ -235,20 +210,26 @@ class CliReviewTests(unittest.TestCase):
             mock.patch.object(cli_mod, "EmbeddingDB") as store,
         ):
             store.return_value.__enter__.return_value.model_id = "m"
-            return CliRunner().invoke(cli, ["dedupe", "-i", self.img, "-d", self.db, "--skip-update", "-c", "cpu", *extra])
+            return CliRunner().invoke(
+                cli, ["dedupe", str(self.project.directory), "--skip-update", "--no-pixel-check", "-c", "cpu", *extra]
+            )
 
     def test_review_threshold_stores_groups_and_moves_nothing(self):
         res = self.run_dedupe("--review-threshold", "0.5")
         self.assertEqual(res.exit_code, 0, res.output)
-        path = rv.default_review_path(self.db)
-        with rv.ReviewDB(path) as review:
+        with rv.ReviewDB(str(self.project.directory / REVIEW)) as review:
             self.assertEqual(review.counts()["pending"], 1)
             g = review.groups()[0]
             self.assertEqual(g.n, 3)
             self.assertEqual({m.path: m.keep for m in review.members(g.id)}, {"a.png": False, "b.png": False, "c.png": True})
             self.assertEqual(review.get_meta("model_id"), "m")
             self.assertEqual(review.auto_threshold, 0.1)
-        res = CliRunner().invoke(cli, ["review-status", "-d", self.db])
+        res = CliRunner().invoke(cli, ["review-status", str(self.project.directory)])
         self.assertEqual(res.exit_code, 0, res.output)
         self.assertIn("pending  1", res.output)
-        self.assertIn("0 files would be moved", res.output)
+        self.assertIn("0 images excluded", res.output)
+        self.assertEqual(len(os.listdir(os.path.join(self.tmp.name, "img"))), 4)
+
+
+if __name__ == "__main__":
+    unittest.main()

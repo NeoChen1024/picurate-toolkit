@@ -7,7 +7,7 @@ how they should feed each other.
 ## Sources of truth
 
 - [README](README.md): what the project is, the tools, installation and a quick start.
-- [Deduplication](docs/dedupe.md), [duplicate review](docs/dedupe-review.md), [tagging](docs/tagger.md),
+- [Deduplication](docs/dedupe.md), [curation](docs/curate.md), [tagging](docs/tagger.md),
   [projects](docs/project.md) and the [dataset editor](docs/dataset-editor.md): behavior, databases and project
   files, and the reasoning behind defaults.
 - [TODO](docs/TODO.md): agreed future work.
@@ -40,7 +40,7 @@ how they should feed each other.
 
 - Prefer clear computation and fast iteration over compatibility and speculative infrastructure. Do not keep
   obsolete interfaces alive for tests or for old project files unless asked.
-- Defaults stay conservative: automatic actions only where they are safe; borderline cases go to a human (the review
+- Defaults stay conservative: automatic actions only where they are safe; borderline cases go to a human (the curation
   GUI) instead of a looser default.
 - Do not add provenance bundles, generic recovery frameworks or plugin systems without an explicit request. Keep the
   mechanisms the workflows need (resumable per-batch commits, model binding, undo in the review database).
@@ -56,8 +56,9 @@ how they should feed each other.
 ## Code ownership and dependencies
 
 - One import package, `picurate` under `src/`: `common` (image walking, the decode pipeline, logging, and in `qt`
-  the background jobs the GUIs share), `project` (dataset projects and `picurate-project`), `dedupe` (including its
-  review GUI), `tagger` and `dataset_editor`. `src/clip_training` holds the separate CLIP fine-tuning scripts.
+  the background jobs the GUIs share), `project` (dataset projects and `picurate-project`), `dedupe` (the CLI and its
+  databases), `curate` (the curation GUI), `tagger` and `dataset_editor`. `src/clip_training` holds the separate CLIP
+  fine-tuning scripts.
 - Look in `picurate.common` before writing another image walker, loader or pipeline. Share mechanisms with identical
   semantics; keep each tool's policy in the tool.
 - Runtime dependencies live in `pyproject.toml` with minimum versions only; heavy optional ones go in extras. No

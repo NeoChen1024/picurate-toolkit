@@ -1,4 +1,4 @@
-"""Offscreen checks of the review GUI. Skipped when PySide6 is not installed."""
+"""Offscreen checks of the curation GUI's Duplicates tab. Skipped when PySide6 is not installed."""
 
 import os
 import tempfile
@@ -13,14 +13,15 @@ try:
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication
 
-    from picurate.dedupe.gui.canvas import CompareCanvas
-    from picurate.dedupe.gui.window import ReviewWindow
+    from picurate.curate.canvas import CompareCanvas
+    from picurate.curate.window import CurateWindow
 except ImportError:  # pragma: no cover
     QApplication = None  # type: ignore[assignment]
 
-from picurate.common.images import ImageRecord, Item
+from picurate.common.images import ImageRecord
 from picurate.dedupe.keeping import builtin_policies
 from picurate.dedupe.review import ReviewDB
+from picurate.project.project import REVIEW, Project
 
 
 @unittest.skipIf(QApplication is None, "PySide6 not installed")
@@ -40,30 +41,37 @@ class GuiTests(unittest.TestCase):
             ("c.png", (0, 255, 0), (40, 40)),
             ("d.png", (0, 250, 0), (40, 40)),
         ]:
-            full = os.path.join(self.img, path)
-            PIL.Image.new("RGB", size, colour).save(full)
-            st = os.stat(full)
-            recs[path] = ImageRecord(path, st.st_mtime, st.st_size, size[0], size[1], "PNG")
-        self.review_path = os.path.join(self.tmp.name, "x.review.sqlite")
+            PIL.Image.new("RGB", size, colour).save(os.path.join(self.img, path))
+        self.project = Project(os.path.join(self.tmp.name, "project"), create=True)
+        self.project.import_images([self.img], recursive=True)
+        self.ids = {}
+        for item, row in self.project.items.items():
+            st = os.stat(self.project.source_path(item))
+            with PIL.Image.open(self.project.source_path(item)) as im:
+                size = im.size
+            recs[row["path"]] = ImageRecord(row["path"], st.st_mtime, st.st_size, *size, "PNG", row["source_id"], item)
+            self.ids[row["path"]] = item
+        self.review_path = os.path.join(self.project.directory, REVIEW)
         with ReviewDB(self.review_path) as db:
-            db.begin_session(image_dir=self.img, model_id="m", review_threshold=1.0, auto_threshold=0.1, policy="largest")
+            db.begin_session(project_id="p", model_id="m", review_threshold=1.0, auto_threshold=0.1, policy="largest")
             db.upsert_groups(
                 [
-                    ([recs["a.png"], recs["sub/b.png"]], [("a.png", "sub/b.png", 0.3)]),
-                    ([recs["c.png"], recs["d.png"]], [("c.png", "d.png", 0.05)]),
+                    ([recs["a.png"], recs["sub/b.png"]], [(self.ids["a.png"], self.ids["sub/b.png"], 0.3)]),
+                    ([recs["c.png"], recs["d.png"]], [(self.ids["c.png"], self.ids["d.png"], 0.05)]),
                 ],
                 builtin_policies()["largest"],
                 0.1,
             )
-        self.trash = os.path.join(self.tmp.name, "trash")
-        self.win = ReviewWindow(self.review_path, trash_dir=self.trash)
-        self.win.show()
-        self.app.setActiveWindow(self.win)
+        self.window = CurateWindow(self.project.directory)
+        self.win = self.window.duplicates
+        self.window.show()
+        self.app.setActiveWindow(self.window)
         self.win.canvas.left.setFocus()
         self.win.wait_idle()
 
     def tearDown(self):
-        self.win.close()
+        self.window.close()
+        self.project.close()
         self.tmp.cleanup()
 
     def key(self, key, modifier=Qt.KeyboardModifier.NoModifier):
@@ -123,22 +131,30 @@ class GuiTests(unittest.TestCase):
         QTest.keyClick(self.win.note, Qt.Key.Key_Escape)
         self.assertFalse(self.win.note.hasFocus())
 
-    def test_apply_moves_losers(self):
-        text, n = self.win.plan_text()
-        self.assertEqual(n, 1)
-        self.assertIn("c.png", text)
-        moved, refused = self.win.apply_moves()
-        self.assertEqual((moved, refused), (1, []))
-        self.assertTrue(os.path.exists(os.path.join(self.trash, "c.png")) or os.path.exists(os.path.join(self.trash, "d.png")))
-        self.assertEqual(self.win.current.status, "applied")
-        self.win.undo_apply()
-        self.assertEqual(self.win.current.status, "decided")
-        self.assertTrue(os.path.exists(os.path.join(self.img, "c.png")) and os.path.exists(os.path.join(self.img, "d.png")))
+    def test_decided_losers_are_excluded_unless_kept_by_hand(self):
+        """What the project excludes (and so does not export) comes from the decided groups and the human decision."""
+
+        def excluded():
+            return sorted(state["image"] for state in self.project.states() if state["excluded"])
+
+        self.assertEqual(excluded(), ["c.png"])  # c/d decided automatically, equal sizes: the policy kept d.png
+        state = self.project.state(self.ids["c.png"])
+        self.assertEqual(state["excluded_by"], {"by": "dedupe", "group": self.win.current.id, "kept": [self.ids["d.png"].hex()]})
+        state["exclusion"] = {"decision": "keep", "reason": ""}
+        self.project.save(state, self.project.begin_op("edit"))
+        self.assertEqual(excluded(), [])
+        self.key(Qt.Key.Key_X)
+        self.key(Qt.Key.Key_Return)  # decide a/b: a.png is the larger one
+        self.assertEqual(excluded(), ["sub/b.png"])
+        other = Project(self.project.directory)
+        with self.assertRaises(ValueError):  # the window holds the review database
+            other.lock("review")
+        other.close()
 
     def test_policy_pick_resets_all_pending_groups(self):
         pending = next(g for g in self.win.groups_model.groups if g.status == "pending")  # a.png (40x30) / sub/b.png (20x15)
         with ReviewDB(self.review_path) as db:
-            db.decide(pending.id, keeps={Item.standalone("a.png").id: False, Item.standalone("sub/b.png").id: True})
+            db.decide(pending.id, keeps={self.ids["a.png"]: False, self.ids["sub/b.png"]: True})
         self.win.reload_groups(select_id=pending.id)
         self.win.policy_box.setCurrentText("largest")
         self.win.reset_pending_to_policy(confirm=False)
@@ -169,9 +185,9 @@ class GuiTests(unittest.TestCase):
             g = db.group(gid)
             self.assertEqual((g.status, g.discard), ("decided", True))
         self.assertTrue(self.win.groups_model.data(self.win.groups_model.index(0)).startswith("✕ "))
-        text, n = self.win.plan_text()
-        self.assertIn("sub/b.png  →  trash   (whole group discarded)", text)
-        self.assertEqual(n, 3)
+        self.assertEqual(
+            sorted(state["image"] for state in self.project.states() if state["excluded"]), ["a.png", "c.png", "sub/b.png"]
+        )
         self.key(Qt.Key.Key_R)  # takes it back
         with ReviewDB(self.review_path) as db:
             g = db.group(gid)

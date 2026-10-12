@@ -46,6 +46,9 @@ from .render import export_project, load_image, render, save_repair
 from .repair import MODEL_DEFAULTS, InferenceEngine
 from .tags import TagIndex
 
+# Automatic: excluded when a decided duplicate group does not keep the image.
+EXCLUSION_CHOICES = ("automatic", "force keep", "force exclude")
+
 
 class Window(QMainWindow):
     """One project; captions and edits auto-save 500 ms after a change, before navigation and on close."""
@@ -172,6 +175,24 @@ class Window(QMainWindow):
         self.review.currentTextChanged.connect(self.review_changed)
         layout.addWidget(QLabel("Review status (C to cycle)"))
         layout.addWidget(self.review)
+        self.exclusion = QComboBox()
+        self.exclusion.addItems(EXCLUSION_CHOICES)
+        self.exclusion.setToolTip(
+            "Automatic: excluded when a decided duplicate group does not keep it (picurate-curate). "
+            "Force keep / force exclude override that; excluded images are not exported."
+        )
+        self.exclusion.currentTextChanged.connect(self.exclusion_changed)
+        self.exclusion_reason = QLineEdit()
+        self.exclusion_reason.setPlaceholderText("Reason (optional)")
+        self.exclusion_reason.editingFinished.connect(self.exclusion_reason_edited)
+        self.exclusion_label = QLabel()
+        self.exclusion_label.setWordWrap(True)
+        layout.addWidget(QLabel("Exclusion (E to cycle)"))
+        row = QHBoxLayout()
+        row.addWidget(self.exclusion)
+        row.addWidget(self.exclusion_reason, 1)
+        layout.addLayout(row)
+        layout.addWidget(self.exclusion_label)
         QApplication.instance().installEventFilter(self)
         split = QSplitter()
         split.addWidget(self.thumbs)
@@ -231,6 +252,10 @@ class Window(QMainWindow):
                     if self.state and not event.isAutoRepeat():
                         self.review.setCurrentIndex((self.review.currentIndex() + 1) % self.review.count())
                     return True
+                if event.key() == Qt.Key.Key_E:
+                    if self.state and not event.isAutoRepeat():
+                        self.exclusion.setCurrentIndex((self.exclusion.currentIndex() + 1) % self.exclusion.count())
+                    return True
         return super().eventFilter(obj, event)
 
     def toggle_preview(self, checked):
@@ -254,6 +279,7 @@ class Window(QMainWindow):
                 <tr><td><b>Z / X</b></td><td>Previous / next image</td></tr>
                 <tr><td><b>Alt+Left / Alt+Right</b></td><td>Previous / next image (also while editing text)</td></tr>
                 <tr><td><b>C</b></td><td>Cycle Unreviewed → Approved → Skipped</td></tr>
+                <tr><td><b>E</b></td><td>Cycle exclusion: automatic → force keep → force exclude</td></tr>
                 <tr><td><b>A / S</b></td><td>Crop / Watermark Fill mode; exit Preview</td></tr>
                 <tr><td><b>D</b></td><td>Toggle Preview</td></tr>
                 <tr><td><b>F</b></td><td>Focus the caption editor</td></tr>
@@ -426,6 +452,8 @@ class Window(QMainWindow):
         self.model = Thumbnails(self.paths, self.pool)
         for i, state in enumerate(self.project.states()):
             self.model.status[i] = state["review_status"]
+            if state["excluded"]:
+                self.model.excluded[i] = self.exclusion_text(state)
             if not self.paths[i].is_file():
                 self.model.issues[i] = "Missing source — use Relink Sources"
         self.thumbs.setModel(self.model)
@@ -598,6 +626,7 @@ class Window(QMainWindow):
         self.review.blockSignals(True)
         self.review.setCurrentText(self.state["review_status"])
         self.review.blockSignals(False)
+        self.show_exclusion()
         self.filename.setText(self.state["image"])
         self.set_ratio(self.ratio.currentText())
         self.refresh(True)
@@ -624,6 +653,10 @@ class Window(QMainWindow):
         self.saving.start()
         row = self.thumbs.currentIndex().row()
         self.model.status[row] = self.state["review_status"]
+        if self.state["excluded"]:
+            self.model.excluded[row] = self.exclusion_text(self.state)
+        else:
+            self.model.excluded.pop(row, None)
         self.model.dataChanged.emit(self.model.index(row), self.model.index(row))
         self.status_message.setText("Unsaved changes…")
 
@@ -635,6 +668,44 @@ class Window(QMainWindow):
     def review_changed(self, value):
         if self.state:
             self.state["review_status"] = value
+            self.changed()
+
+    def exclusion_text(self, state):
+        by = state["excluded_by"]
+        if by is None:
+            return "Kept by hand" if (state["exclusion"] or {}).get("decision") == "keep" else "Included"
+        if by["by"] == "human":
+            return "Excluded by hand" + (f": {by['reason']}" if by["reason"] else "")
+        kept = [self.project.items[bytes.fromhex(k)]["path"] for k in by["kept"] if bytes.fromhex(k) in self.project.items]
+        if not kept:
+            return f"Excluded: duplicate group {by['group']} discarded whole"
+        return f"Excluded: duplicate of {', '.join(kept)} (group {by['group']})"
+
+    def show_exclusion(self):
+        exclusion = self.state["exclusion"] or {}
+        self.exclusion.blockSignals(True)
+        self.exclusion.setCurrentIndex({None: 0, "keep": 1, "exclude": 2}[exclusion.get("decision")])
+        self.exclusion.blockSignals(False)
+        self.exclusion_reason.blockSignals(True)
+        self.exclusion_reason.setText(exclusion.get("reason", ""))
+        self.exclusion_reason.blockSignals(False)
+        self.exclusion_reason.setEnabled(bool(exclusion))
+        self.exclusion_label.setText(self.exclusion_text(self.state))
+
+    def exclusion_changed(self, value):
+        if self.state:
+            decision = {EXCLUSION_CHOICES[1]: "keep", EXCLUSION_CHOICES[2]: "exclude"}.get(value)
+            reason = self.exclusion_reason.text().strip()
+            self.state["exclusion"] = None if decision is None else {"decision": decision, "reason": reason}
+            self.project.update_exclusion(self.state)
+            self.show_exclusion()
+            self.changed()
+
+    def exclusion_reason_edited(self):
+        if self.state and self.state["exclusion"] and self.exclusion_reason.text().strip() != self.state["exclusion"]["reason"]:
+            self.state["exclusion"] = {**self.state["exclusion"], "reason": self.exclusion_reason.text().strip()}
+            self.project.update_exclusion(self.state)
+            self.show_exclusion()
             self.changed()
 
     def checkpoint(self):

@@ -17,7 +17,8 @@ picurate-dataset-editor my-project   # a project directory, not the image direct
    approved ones only, or the current one.
 
 F1 lists the keys. The ones used most: Z / X previous / next image (or the wheel), A / S crop / fill mode, D
-preview, C cycle Unreviewed → Approved → Skipped, F focus the caption. In the caption box Tab accepts a completion,
+preview, C cycle Unreviewed → Approved → Skipped, E cycle the exclusion (automatic → force keep → force exclude),
+F focus the caption. In the caption box Tab accepts a completion,
 Enter always inserts a newline, Ctrl+R searches, Esc returns to the canvas. Single-letter keys never fire in a text
 or number field.
 
@@ -71,3 +72,10 @@ matches its crop and fills fails the export ([sources](project.md#sources-and-id
 out.
 
 Moved or missing source images are covered under [sources](project.md#sources-and-identity).
+
+## Exclusion
+
+Thumbnails of excluded images are marked ✕, with what excluded them in the tooltip: a duplicate group (and the copy
+it keeps) or a person. The Exclusion box decides it by hand: *automatic* follows the duplicate groups
+([curation](curate.md)), *force keep* and *force exclude* override them, with an optional reason. It is a decision
+like the others, saved with the image's history.

@@ -9,8 +9,8 @@ now; how they should feed into each other is something the workflow has to show 
 
 | Command                                           | What it does                                                                                           |
 | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| [picurate-dedupe](docs/dedupe.md)                 | Find duplicates by CLIP similarity, confirm them pixel by pixel, move the losers to a trash directory. |
-| [picurate-dedupe-review](docs/dedupe-review.md)   | GUI for the duplicate groups a single threshold should not decide.                                     |
+| [picurate-dedupe](docs/dedupe.md)                 | Find duplicates in a project by CLIP similarity, confirm them pixel by pixel, exclude extra copies.    |
+| [picurate-curate](docs/curate.md)                 | GUI for what a human decides about a project's images; so far the duplicate groups a threshold cannot. |
 | [picurate-tag](docs/tagger.md)                    | Danbooru-tag captions for training datasets, in Anima or sd-scripts (SDXL) layout.                     |
 | [picurate-project](docs/project.md)               | Create a dataset project, import existing image/caption pairs, roll back or prune its edit history.    |
 | [picurate-dataset-editor](docs/dataset-editor.md) | GUI for going through a dataset by hand: captions with tag completion, crops, watermark removal.       |
@@ -33,32 +33,39 @@ tools. `[training]` adds the dependencies of the CLIP fine-tuning scripts under 
 
 ## Deduplication
 
+Everything works on a project, and a library is just a project over the library folders:
+
 ```shell
-picurate-dedupe dedupe -i pictures -d pictures.sqlite --trash-dir trash -k highest-quality
+picurate-project init library
+picurate-project import library -r ~/pictures
+picurate-dedupe dedupe library -k highest-quality
 ```
 
-The first run encodes every image into `pictures.sqlite`; later runs only encode what changed, so re-running on a
-growing collection is cheap. Matching is fast: 100k images against each other take about a second on an RTX
+The first run encodes every image into the project's `embeddings.sqlite`; later runs only encode what changed
+(`picurate-project sync` picks up new files first), so re-running on a growing collection is cheap. Matching is fast: 100k images against each other take about a second on an RTX
 4080-class GPU, and a million images need about 2.3 GiB of RAM and VRAM.
 
 Things I'd want to know before trusting it with my own pictures:
 
-* Nothing is ever deleted. Losers are moved to `--trash-dir`, keeping their relative paths, and `-n` shows what
-  would happen.
+* Nothing is moved or deleted. The extra copies of a duplicate group are only marked excluded in the project, so
+  they are left out of exports; force keep in the editor overrides that.
 * The default threshold (0.1) is deliberately conservative: it catches re-encodes, not lossy copies or downscales.
   `picurate-dedupe calibrate` shows where those land on your collection if you want to go looser.
-* Every match is confirmed by a pixel check: a pair only counts when its pixels differ by compression alone, so a
-  signed, edited or revised copy is never merged, however close its embedding.
+* Every match is confirmed by a pixel check: a group is only decided automatically when its pixels differ by
+  compression alone, so a signed, edited or revised copy is never excluded without a human, however close its
+  embedding.
 * Which copy survives is a keeping policy (`largest` by default); you can write your own in TOML.
 
 For the cases in between, match with a looser `--review-threshold` and decide in the GUI instead:
 
 ```shell
-picurate-dedupe dedupe -i pictures -d pictures.sqlite --review-threshold 1.5   # stores groups, moves nothing
-picurate-dedupe-review -d pictures.sqlite --trash-dir trash                    # decide, then Apply
+picurate-dedupe dedupe library --review-threshold 1.5   # stores groups for review
+picurate-curate library                                 # decide
 ```
 
-Details: [deduplication](docs/dedupe.md), [duplicate review](docs/dedupe-review.md).
+New downloads can be checked against the library before they go in: `picurate-dedupe dedupe-import -i incoming
+library --trash-dir trash` moves what the library already has. Details: [deduplication](docs/dedupe.md),
+[curation](docs/curate.md).
 
 ## Tagging
 
@@ -81,8 +88,8 @@ picurate-dataset-editor my-dataset
 ```
 
 How I want dataset curation to go: import into a project, dedupe and cull what does not belong, batch-tag if there
-are no captions yet, then go through everything by hand in the editor. Every stage should still work on its own, and
-only import and the editor know about projects so far. The images are only referenced, never touched; captions and
+are no captions yet, then go through everything by hand in the editor. Import, deduplication, curation and the
+editor work on projects so far; tagging still works on plain directories. The images are only referenced, never touched; captions and
 edits live in the project and are rendered into a fresh dataset on export.
 
 The editor is for the part no tagger gets right: fixing captions with Danbooru/e621 completion, adding the
