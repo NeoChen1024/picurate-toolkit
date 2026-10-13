@@ -485,6 +485,7 @@ class Trainer:
             " (LoRA)" if config.model.lora else "", config.model.precision,
         )  # fmt: skip
         self._eval_labels = None
+        self._eval_loader: DataLoader | None = None
         self.stop = False
         self.skipped = 0  # consecutive steps with non-finite gradients
 
@@ -597,16 +598,21 @@ class Trainer:
             self.optimizer.eval()
         self.model.eval()
         size, count = self.eval_batch, len(self.eval_indices)
-        padded = np.resize(self.eval_indices, -(-count // size) * size)  # the last batch filled up from the start
-        batches = [[(0, int(i)) for i in padded[s : s + size]] for s in range(0, len(padded), size)]
-        loader = DataLoader(
-            self.eval_dataset,
-            batch_sampler=batches,
-            collate_fn=Collate(self.config.data.seq_len),
-            num_workers=self.config.data.workers,
-            multiprocessing_context="fork" if self.config.data.workers else None,
-            worker_init_fn=ignore_interrupt,
-        )
+        if self._eval_loader is None:
+            # Built once: its workers are forked before the first evaluation (not again from a process with live
+            # loader threads every time) and kept, like the training loader's.
+            padded = np.resize(self.eval_indices, -(-count // size) * size)  # the last batch filled up from the start
+            batches = [[(0, int(i)) for i in padded[s : s + size]] for s in range(0, len(padded), size)]
+            self._eval_loader = DataLoader(
+                self.eval_dataset,
+                batch_sampler=batches,
+                collate_fn=Collate(self.config.data.seq_len),
+                num_workers=self.config.data.workers,
+                persistent_workers=self.config.data.workers > 0,
+                multiprocessing_context="fork" if self.config.data.workers else None,
+                worker_init_fn=ignore_interrupt,
+            )
+        loader = self._eval_loader
         a, b, caption_tags = [], [], []
         autocast = torch.autocast("cuda", dtype=self.dtype, enabled=self.dtype != torch.float32)
         for batch in loader:

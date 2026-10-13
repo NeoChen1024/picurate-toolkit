@@ -7,9 +7,9 @@ from collections import OrderedDict
 import numpy as np
 import PIL.Image
 import PIL.ImageFile
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QImage
 
-from ..common.qt import Job, Signals, qimage
+from ..common.qt import Job, qimage
 
 # Same leniency as the encoder: this is the user's own collection, behave like an image viewer.
 PIL.Image.MAX_IMAGE_PIXELS = None
@@ -67,4 +67,4 @@ class LRU:
         self._d.clear()
 
 
-__all__ = ["Job", "Signals", "LRU", "load_image", "qimage", "thumbnail", "diff_images", "QPixmap"]
+__all__ = ["Job", "LRU", "load_image", "qimage", "thumbnail", "diff_images"]

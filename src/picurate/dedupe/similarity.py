@@ -107,65 +107,10 @@ def find_close_pairs_cross(
     return (ii + start).cpu().numpy(), jj.cpu().numpy(), d[ii, jj].cpu().numpy()
 
 
-# ---------------------------------------------------------------------------------------------------------------------
-# Small / reference helpers (kept for tests and the encoding test CLI).
-
-
-# slow generic numpy version, for testing and reference
 def euclidean_distance(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Compute the Euclidean distance matrix between two sets of vectors.
-
-    Accepts a, b as (D,), (1, D), or (N, D)/(M, D).
-    Returns shape (N, M).
-    """
+    """The Euclidean distance matrix between two sets of vectors, in numpy: the reference for the tests and the
+    encoding test command. Accepts ``a``, ``b`` as (D,), (1, D) or (N, D) / (M, D); returns (N, M)."""
     a = np.atleast_2d(a)
     b = np.atleast_2d(b)
     diff = a[:, np.newaxis, :] - b[np.newaxis, :, :]
     return np.linalg.norm(diff, axis=-1)
-
-
-@torch.no_grad()
-def euclidean_distance_torch_1_to_many(
-    a: torch.Tensor,
-    b: torch.Tensor,
-) -> np.ndarray:
-    """
-    a: (1, D) torch tensor
-    b: (N, D) torch tensor already on correct device
-    returns: (N,) numpy distances
-    """
-    # torch.cdist computes pairwise distances; result shape (1, N)
-    d = torch.cdist(a, b, p=2)
-    return d[0].cpu().numpy()
-
-
-@torch.no_grad()
-def find_similar_images_euclidean(
-    image_idx: int, image_embedding_1d: np.ndarray, database: torch.Tensor, threshold: float = default_euclidean_distance_threshold
-) -> list[tuple[int, float]]:
-    """Find similar images in the database based on Euclidean distance (one query vs. a tensor).
-
-    image_idx: index of the query image inside ``database``. Pass -1 when the
-    query vector is not literally stored inside the tensor being searched
-    (for example when searching an upper-triangular slice or a foreign DB).
-    Using a global index against a sliced tensor will incorrectly filter out
-    legitimate matches at slice-local index 0.
-    image_embedding_1d: (D,) numpy array of the query image embedding
-    database: (N, D) torch tensor of the database embeddings
-    threshold: distance threshold for considering images as similar
-    """
-    image_embedding_unsqueezed = image_embedding_1d[np.newaxis, :]  # shape (1, D)
-    image_embedding = torch.from_numpy(image_embedding_unsqueezed).to(database.device).float()
-    distances = euclidean_distance_torch_1_to_many(image_embedding, database.float())
-
-    # For a single query vector vs database, distances has shape (1, N).
-    # Squeeze to 1D so indexing and thresholding behave as expected.
-    if distances.ndim == 2 and distances.shape[0] == 1:
-        distances = distances[0]
-
-    matches = np.where(distances <= threshold)[0]
-    if image_idx >= 0:
-        similar_images = [(int(idx), float(distances[idx])) for idx in matches if idx != image_idx]
-    else:
-        similar_images = [(int(idx), float(distances[idx])) for idx in matches]
-    return similar_images

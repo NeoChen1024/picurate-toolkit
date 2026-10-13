@@ -8,7 +8,6 @@ excludes each image now, and the tag vocabulary. Scores are computed once per cr
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -119,9 +118,10 @@ class QueryEncoders:
 
             name, _, seq_len = self.model_id.partition("@")
             kwargs = {"seq_len": int(seq_len)} if seq_len else {}
-            self.image = CLIPImageEncoder(name, self.device, **kwargs)
-            if self.image.model_id != self.model_id:
-                raise ModelMismatchError(f"The encoder identifies as {self.image.model_id}, the database as {self.model_id}")
+            encoder = CLIPImageEncoder(name, self.device, **kwargs)
+            if encoder.model_id != self.model_id:
+                raise ModelMismatchError(f"The encoder identifies as {encoder.model_id}, the database as {self.model_id}")
+            self.image = encoder
         return self.image.encode_pil_images([load_image(path)])[0]
 
 
@@ -796,7 +796,7 @@ class CullingTab(QWidget):
         if self.preview_job is not None:
             self.preview_job.cancel()
         self.preview_job = Job(lambda signals: (i, qimage(load_image(path))))
-        self.preview_job.connect(self._preview_ready, lambda error: self.preview.set_image(None))
+        self.preview_job.connect(self._preview_ready, lambda error: self._preview_failed(i, error))
         self.pool.start(self.preview_job)
 
     def _preview_ready(self, result) -> None:
@@ -804,6 +804,11 @@ class CullingTab(QWidget):
         if i == self.current_item():
             self.preview.set_image(image)
             self.preview.fit()
+
+    def _preview_failed(self, i: int, error: str) -> None:
+        if i == self.current_item():  # a stale job's failure must not blank the newer preview
+            self.preview.set_image(None)
+            self.message(f"Cannot read {self.items_path(i)}: {error}")
 
     def _show_info(self) -> None:
         i = self.current_item()
@@ -904,11 +909,20 @@ class CullingTab(QWidget):
             return
         finally:
             self.project.unlock("project")
-        self.last_op = op
-        self.undo_button.setEnabled(True)
         self.manual_in[:] = False
         self.manual_out[:] = False
-        self.message(f"Excluded {count} images as operation {op} (picurate-project rollback {op} undoes it too)")
+        # The project decides what is still undecided: what this tab knew may be behind the editor or another process.
+        changed = (
+            f"; {len(targets) - count} were decided by hand since this tab loaded and stay as they are"
+            if count < len(targets)
+            else ""
+        )
+        if op is None:
+            self.message(f"Nothing excluded: every selected image was decided by hand since this tab loaded")
+        else:
+            self.last_op = op
+            self.undo_button.setEnabled(True)
+            self.message(f"Excluded {count} images as operation {op} (picurate-project rollback {op} undoes it too){changed}")
         self.reload_exclusions()
 
     def undo(self) -> None:
@@ -954,9 +968,15 @@ class CullingTab(QWidget):
         dialog.show()
 
     def shutdown(self) -> None:
+        """Stop background work. A running inference cannot be cancelled: it finishes first, then the models and the
+        embeddings are released."""
         self._cancel_thumbnails()
+        if self.preview_job is not None:
+            self.preview_job.cancel()
         self.pool.waitForDone()
         self.compute_pool.waitForDone()
+        self.encoders = None
+        self.index = None
 
 
 HELP_HTML = """

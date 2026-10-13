@@ -22,7 +22,7 @@ rendered from the tag scores of an earlier version of the image, and Export coun
 
 F1 lists the keys. The ones used most: Z / X previous / next image (or the wheel), A / S crop / fill mode, D
 preview, C cycle Unreviewed → Approved → Skipped, E cycle the exclusion (automatic → force keep → force exclude),
-F focus the caption. In the caption box Tab accepts a completion,
+F focus the caption. In the caption box Tab accepts a completion (or opens the list),
 Enter always inserts a newline, Ctrl+R searches, Esc returns to the canvas. Single-letter keys never fire in a text
 or number field.
 
@@ -38,7 +38,8 @@ escapes).
 ## Image edits
 
 Crop and fill rectangles are in the pixels of the EXIF-oriented original. Mean fill paints a rectangle with the
-average of a ring around it (4 px by default), not counting other filled rectangles. Image undo/redo is separate from
+average of a ring around it (4 px by default), not counting rectangles already painted with a mean colour (a LaMa
+repair's pixels count as picture). Image undo/redo is separate from
 caption undo. Images are rendered as 8-bit RGB: alpha, higher bit depths and ICC profiles are not kept, and animated
 files use their first frame.
 

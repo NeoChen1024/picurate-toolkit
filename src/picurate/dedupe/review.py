@@ -29,7 +29,7 @@ import logging
 import os
 import sqlite3
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -336,7 +336,11 @@ class ReviewDB:
                 gid = int(row["id"])
                 old_status = new_status = row["status"]
                 if new_status == "stale":
-                    new_status = "pending"
+                    # Back in this run: the status it had before it went stale (stale itself is never snapshotted).
+                    last = self.conn.execute(
+                        "SELECT status FROM history WHERE group_id = ? ORDER BY id DESC LIMIT 1", (gid,)
+                    ).fetchone()
+                    new_status = last["status"] if last is not None else "pending"
                 rederive = not row["touched"] and row["carried_from"] is None and new_status in ("pending", "decided")
                 if rederive:
                     new_status = start
@@ -538,15 +542,20 @@ class ReviewDB:
         note: str | None = None,
         discard: bool | None = None,
         touch: bool = True,
+        commit: bool = True,
     ) -> None:
         """Change keep flags (by item ID), status, note and/or the discard mark of a group in one committed step that ``undo`` can
-        revert. ``touch=False`` records the step without marking the group as reviewed (a bulk Policy pick).
+        revert. ``touch=False`` records the step without marking the group as reviewed (a bulk Policy pick);
+        ``commit=False`` leaves the step in the caller's transaction.
 
         Ticking a keep clears the discard mark. Setting ``status="decided"`` on a group that would keep nothing
-        without being marked discard raises ``ValueError``."""
+        without being marked discard raises ``ValueError``, and so does any change to a stale group: matching
+        replaced it, and it excludes nothing."""
         if status is not None and status not in STATUSES:
             raise ValueError(f"Unknown status {status!r}")
         g = self.group(group_id)
+        if g.status == "stale":
+            raise ValueError(f"Group {group_id} is stale (matching replaced it); it cannot be changed")
         now = time.time()
         current = {m.item: m.keep for m in self.members(group_id)}
         if keeps:
@@ -582,7 +591,8 @@ class ReviewDB:
             args.append(note)
         self.conn.execute(f"UPDATE groups SET {', '.join(sets)} WHERE id = ?", (*args, group_id))
         self._snapshot(group_id, now)
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def discard(self, group_id: int) -> None:
         """Mark a group to have every member excluded (keeps nothing, decided)."""
@@ -594,22 +604,30 @@ class ReviewDB:
             raise KeyError(item.hex())
         self.decide(group_id, keeps=keeps, status=status)
 
-    def reset_to_policy(self, group_id: int, policy: Policy, *, touch: bool = True) -> None:
+    def reset_to_policy(self, group_id: int, policy: Policy, *, touch: bool = True, commit: bool = True) -> None:
         members = self.members(group_id)
         winner = policy.select([m.record for m in members])
-        self.decide(group_id, keeps={m.item: m.item == winner.id for m in members}, touch=touch)
+        self.decide(group_id, keeps={m.item: m.item == winner.id for m in members}, touch=touch, commit=commit)
 
     def reset_pending_to_policy(self, policy: Policy) -> int:
         """Set the keeps of every pending group to ``policy``'s winner (status unchanged, one history step each, not
-        counted as reviewing the group). Returns the number of pending groups."""
+        counted as reviewing the group), committed as one transaction. Returns the number of pending groups."""
         n = 0
-        for g in self.groups(status="pending"):
-            self.reset_to_policy(g.id, policy, touch=False)
-            n += 1
+        try:
+            for g in self.groups(status="pending"):
+                self.reset_to_policy(g.id, policy, touch=False, commit=False)
+                n += 1
+            self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
         return n
 
     def undo(self, group_id: int) -> bool:
-        """Revert the last ``decide`` of a group. Returns False when there is nothing left to undo."""
+        """Revert the last ``decide`` of a group. Returns False when there is nothing left to undo; a stale group
+        cannot be changed."""
+        if self.group(group_id).status == "stale":
+            raise ValueError(f"Group {group_id} is stale (matching replaced it); it cannot be changed")
         rows = self.conn.execute(
             "SELECT id, keep_json, status, note, discard FROM history WHERE group_id = ? ORDER BY id DESC LIMIT 2", (group_id,)
         ).fetchall()
@@ -637,6 +655,12 @@ class ReviewDB:
         discarded group). Decided groups that keep nothing without being discarded exclude nothing."""
         return losers(self.conn)
 
+    def excluded_count(self) -> int:
+        """The number of distinct items :meth:`losers` would list, counted in the database."""
+        return self.conn.execute(
+            f"SELECT COUNT(DISTINCT m.item) FROM members m JOIN groups g ON g.id = m.group_id WHERE {_LOSER}"
+        ).fetchone()[0]
+
 
 def store_matches(
     review: ReviewDB,
@@ -653,22 +677,36 @@ def store_matches(
     return review.upsert_groups(items, policy, auto_threshold, by_id)
 
 
-def losers(conn: sqlite3.Connection, item: bytes | None = None) -> dict[bytes, tuple[int, list[bytes]]]:
-    """See :meth:`ReviewDB.losers`; ``item`` limits it to one item. Also used on a read-only connection."""
-    where = " AND m.item = ?" if item is not None else ""
-    groups: dict[int, list[bytes]] = {}
-    out: dict[bytes, tuple[int, list[bytes]]] = {}
+_LOSER = (
+    "g.status = 'decided' AND NOT m.keep AND (g.discard OR EXISTS (SELECT 1 FROM members k WHERE k.group_id = g.id AND k.keep))"
+)
+
+
+def losers(conn: sqlite3.Connection, items: Collection[bytes] | None = None) -> dict[bytes, tuple[int, list[bytes]]]:
+    """See :meth:`ReviewDB.losers`; ``items`` limits it to those items. Also used on a read-only connection."""
+    where, args = "", ()
+    if items is not None:
+        items = list(items)
+        if not items:
+            return {}
+        where, args = f" AND m.item IN ({','.join('?' * len(items))})", tuple(items)
     rows = conn.execute(
-        f"""SELECT m.item, g.id FROM members m JOIN groups g ON g.id = m.group_id
-            WHERE g.status = 'decided' AND NOT m.keep
-              AND (g.discard OR EXISTS (SELECT 1 FROM members k WHERE k.group_id = g.id AND k.keep)){where}
-            ORDER BY g.id""",
-        () if item is None else (item,),
+        f"SELECT m.item, g.id FROM members m JOIN groups g ON g.id = m.group_id WHERE {_LOSER}{where} ORDER BY g.id", args
     ).fetchall()
+    out: dict[bytes, tuple[int, list[bytes]]] = {}
     for member, gid in rows:
-        if member in out:
-            continue
-        if gid not in groups:
-            groups[gid] = [r[0] for r in conn.execute("SELECT item FROM members WHERE group_id = ? AND keep", (gid,))]
-        out[member] = (gid, groups[gid])
+        out.setdefault(member, (gid, []))
+    groups = {gid: kept for gid, kept in out.values()}
+    if items is None:
+        kept_rows = conn.execute(
+            "SELECT k.group_id, k.item FROM members k JOIN groups g ON g.id = k.group_id WHERE g.status = 'decided' AND k.keep ORDER BY k.rowid"
+        )
+    else:
+        marks = ",".join("?" * len(groups))
+        kept_rows = conn.execute(
+            f"SELECT group_id, item FROM members WHERE keep AND group_id IN ({marks}) ORDER BY rowid", list(groups)
+        )
+    for gid, kept in kept_rows:
+        if gid in groups:
+            groups[gid].append(kept)
     return out

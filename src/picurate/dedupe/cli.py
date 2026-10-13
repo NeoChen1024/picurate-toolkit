@@ -377,7 +377,7 @@ def dedupe(
         pixel = _review_pixel_check(review, edges, records, roots, workers, pixel_buffer) if pixel_check else None
         stats = store_matches(review, group_edges(index.n, edges), records, policy, threshold, pixel)
         counts = review.counts()
-        excluded = len(review.losers())
+        excluded = review.excluded_count()
     rule = "every pair differs by compression only" if pixel_check else f"within {threshold:g}"
     logger.info(
         "%s: %d groups this run (%d new, %d of them start decided because %s, %d took over the keeps of a changed group; "
@@ -619,7 +619,7 @@ def review_status(project_dir: str) -> None:
             different = pixel.get((status, "different"), 0)
             extra = f"  ({same} compression only, {different} with pixel differences)" if same or different else ""
             click.echo(f"  {status:8s} {n}{extra}")
-        click.echo(f"  {len(review.losers())} images excluded as duplicates")
+        click.echo(f"  {review.excluded_count()} images excluded as duplicates")
         discarded = review.groups("decided", discarded=True)
         if discarded:
             click.echo(f"  {len(discarded)} decided groups are discarded whole (every member is excluded)")

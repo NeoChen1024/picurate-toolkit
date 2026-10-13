@@ -18,11 +18,14 @@ Measured on the author's library (6158 review pairs, 200 sampled images with syn
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import multiprocessing as mp
 import os
+import signal
+import threading
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 
@@ -165,6 +168,24 @@ class _ImageCache:
                 self.used -= self._size(self._d.pop(path))
 
 
+def _init_worker() -> None:
+    # Ctrl-C is the main process's to handle; see :func:`picurate.common.pipeline._init_worker`.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+@contextlib.contextmanager
+def _sigint_ignored() -> Iterator[None]:
+    """Ignore SIGINT while the worker processes spawn (see :func:`picurate.common.pipeline._sigint_ignored`)."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 def _check_component(paths: Sequence[str], pairs: Sequence[tuple[int, int, int]], budget: int) -> list[tuple[int, PixelVerdict]]:
     """Worker: compare ``pairs`` (index into the caller's list, a, b as indices into ``paths``), decoding each image
     once as long as the cache budget allows. Pairs arrive sorted so that one side repeats across consecutive pairs."""
@@ -221,7 +242,6 @@ def check_pairs(
     names = list(ids)
 
     workers = max(1, workers or os.cpu_count() or 1)
-    budget = max(1, buffer_bytes // workers)
     tasks = []
     for edges in components.values():
         local: dict[int, int] = {}
@@ -241,12 +261,21 @@ def check_pairs(
             if progress:
                 progress(len(task_pairs))
     else:
-        with ProcessPoolExecutor(max_workers=min(workers, len(tasks)), mp_context=mp.get_context("spawn")) as pool:
-            futures = {pool.submit(_check_component, p, q, budget): len(q) for p, q in tasks}
-            for future in as_completed(futures):
-                for k, verdict in future.result():
-                    results[k] = verdict
-                if progress:
-                    progress(futures[future])
+        workers = min(workers, len(tasks))
+        budget = max(1, buffer_bytes // workers)
+        with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn"), initializer=_init_worker) as pool:
+            try:
+                with _sigint_ignored():
+                    futures = {pool.submit(_check_component, p, q, budget): len(q) for p, q in tasks}
+                for future in as_completed(futures):
+                    for k, verdict in future.result():
+                        results[k] = verdict
+                    if progress:
+                        progress(futures[future])
+            except BaseException:
+                # Interrupted: drop the queued components and wait only for the ones being compared. The wait is
+                # what makes the cancel take: the manager thread does it, and only while the executor still exists.
+                pool.shutdown(wait=True, cancel_futures=True)
+                raise
     assert all(r is not None for r in results)
     return results  # type: ignore[return-value]

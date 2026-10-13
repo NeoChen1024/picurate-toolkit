@@ -146,11 +146,12 @@ class EmbeddingDB:
     def upsert(self, rows: Iterable[tuple[ImageRecord, np.ndarray]]) -> None:
         """Insert or replace ``(record, embedding)`` pairs in a single transaction."""
         prepared = []
+        dim = self.dim
         for rec, embedding in rows:
             vec = np.ascontiguousarray(embedding, dtype=EMBEDDING_DTYPE).reshape(-1)
-            dim = self.dim
             if dim is None:
-                self.set_meta("dim", str(vec.shape[0]))
+                dim = vec.shape[0]
+                self.set_meta("dim", str(dim))
             elif vec.shape[0] != dim:
                 raise ValueError(f"Embedding for {rec.path} has dimension {vec.shape[0]}, database expects {dim}")
             prepared.append(

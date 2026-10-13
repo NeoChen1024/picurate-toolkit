@@ -169,9 +169,11 @@ def run_pipeline(
                         progress(1)
                 refill()
         except BaseException:
-            # Interrupted or failed: drop the queued decodes instead of waiting for them. Batches already passed to
-            # ``finish`` stay done; the gathered and in-flight ones are lost.
-            pool.shutdown(wait=False, cancel_futures=True)
+            # Interrupted or failed: drop the queued decodes and wait only for the ones being decoded. Batches already
+            # passed to ``finish`` stay done; the gathered and in-flight ones are lost. The wait is what makes the
+            # cancel take: the manager thread does it, and only while the executor still exists (without it, the
+            # executor is collected as the exception unwinds and every queued decode runs to the end).
+            pool.shutdown(wait=True, cancel_futures=True)
             raise
     flush()
     finish_in_flight()

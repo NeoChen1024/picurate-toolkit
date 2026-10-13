@@ -24,6 +24,15 @@ from picurate.dedupe.review import ReviewDB
 from picurate.project.project import REVIEW, Project
 
 
+def wait_idle(tab) -> None:
+    """Block until the tab's background jobs have finished and their results were delivered."""
+    for _ in range(3):  # a delivered image can start a diff; a delivered diff is the end of the chain
+        tab.pool.waitForDone()
+        tab.prefetch_pool.waitForDone()
+        QApplication.processEvents()
+        QApplication.processEvents()
+
+
 @unittest.skipIf(QApplication is None, "PySide6 not installed")
 class GuiTests(unittest.TestCase):
     @classmethod
@@ -67,7 +76,7 @@ class GuiTests(unittest.TestCase):
         self.window.show()
         self.app.setActiveWindow(self.window)
         self.win.canvas.left.setFocus()
-        self.win.wait_idle()
+        wait_idle(self.win)
 
     def tearDown(self):
         self.window.close()
@@ -76,7 +85,7 @@ class GuiTests(unittest.TestCase):
 
     def key(self, key, modifier=Qt.KeyboardModifier.NoModifier):
         QTest.keyClick(self.win.canvas.left, key, modifier)
-        self.win.wait_idle()
+        wait_idle(self.win)
 
     def test_groups_listed_surest_first_and_images_loaded(self):
         self.assertEqual([g.min_distance for g in self.win.groups_model.groups], [0.05, 0.3])
@@ -124,7 +133,7 @@ class GuiTests(unittest.TestCase):
         self.assertTrue(self.win.note.hasFocus())
         QTest.keyClicks(self.win.note, "xz keep both")
         QTest.keyClick(self.win.note, Qt.Key.Key_Return)
-        self.win.wait_idle()
+        wait_idle(self.win)
         self.assertEqual(self.win.position_label.text(), "Group 2 / 2")  # x/z did not navigate
         with ReviewDB(self.review_path) as db:
             self.assertEqual(db.group(self.win.current.id).note, "xz keep both")
@@ -158,7 +167,7 @@ class GuiTests(unittest.TestCase):
         self.win.reload_groups(select_id=pending.id)
         self.win.policy_box.setCurrentText("largest")
         self.win.reset_pending_to_policy(confirm=False)
-        self.win.wait_idle()
+        wait_idle(self.win)
         with ReviewDB(self.review_path) as db:
             self.assertEqual({m.path: m.keep for m in db.members(pending.id)}, {"a.png": True, "sub/b.png": False})
             self.assertEqual(db.group(pending.id).status, "pending")  # keeps only; still to be reviewed
@@ -178,7 +187,7 @@ class GuiTests(unittest.TestCase):
         with ReviewDB(self.review_path) as db:
             self.assertEqual(db.group(gid).status, "pending")  # neither Enter nor C decides it
         self.win.filter.setCurrentText("keeps nothing")
-        self.win.wait_idle()
+        wait_idle(self.win)
         self.assertEqual([g.id for g in self.win.groups_model.groups], [gid])
         self.key(Qt.Key.Key_R)
         with ReviewDB(self.review_path) as db:

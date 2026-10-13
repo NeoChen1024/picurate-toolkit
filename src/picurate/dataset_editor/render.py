@@ -60,10 +60,8 @@ def save_repair(directory, item_id: bytes, image: Image.Image, rect, mask: Image
 
 def render(im: Image.Image, state: dict, crop: bool = True, project_dir=None) -> Image.Image:
     """Apply the fills in order, then the crop. Mean fills sample a ring around their rectangle that excludes every
-    filled rectangle so far; LaMa fills paste their accepted patch through their mask, and refuse if an earlier edit
-    changed the pixels they were computed from."""
-    if state.get("operations"):
-        raise ValueError("This version cannot render recorded model operations")
+    rectangle painted with a mean colour so far (a LaMa repair's pixels count as picture); LaMa fills paste their
+    accepted patch through their mask, and refuse if an earlier edit changed the pixels they were computed from."""
     check_image_size(im.size, state)
     result = im.copy()
     boxes = []
@@ -145,7 +143,17 @@ def export_project(directory, snapshot: dict, cancelled=lambda: False, progress=
     backup = directory / ".output-previous"
     if backup.exists():
         raise ValueError("A previous output transaction needs recovery; reopen the project")
+    for leftover in directory.glob(".export-*"):  # the stage of an export that crashed; the output was never touched
+        if leftover.is_dir() and not leftover.is_symlink():
+            shutil.rmtree(leftover)
     stage = Path(tempfile.mkdtemp(prefix=".export-", dir=directory))
+    # mkdtemp makes a private directory; the output is an ordinary one (as the previous output, else per the umask).
+    if output.is_dir():
+        os.chmod(stage, output.stat().st_mode & 0o7777)
+    else:
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(stage, 0o777 & ~umask)
     try:
         if output.exists():
             if any(path.is_symlink() for path in output.rglob("*")):

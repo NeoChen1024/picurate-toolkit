@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 
 import PIL.Image
@@ -31,13 +32,16 @@ class Job(QRunnable):
         self.signals = Signals()
         self.cancelled = False
         self.started = False
+        self._state = threading.Lock()  # cancel() and run() race on the two flags from different threads
 
     def cancel(self) -> bool:
         """Make the job a no-op if it has not started yet; returns whether it was still waiting. (Qt deletes a
         runnable as soon as it has run, so taking it back out of the pool is not safe once it may have started; a
-        flag is.) A job that already started finishes and delivers its result as usual."""
-        self.cancelled = True
-        return not self.started
+        flag is.) A job that already started finishes and delivers its result as usual; the answer is exact, so the
+        caller can forget a job that returned True and keep waiting for one that returned False."""
+        with self._state:
+            self.cancelled = True
+            return not self.started
 
     def connect(self, result: Callable[[object], object], error: Callable[[str], object]) -> Job:
         self.signals.result.connect(lambda r: (Job._alive.discard(self), result(r)), Qt.ConnectionType.QueuedConnection)
@@ -46,10 +50,11 @@ class Job(QRunnable):
         return self
 
     def run(self) -> None:
-        self.started = True
-        if self.cancelled:
-            Job._alive.discard(self)
-            return
+        with self._state:
+            if self.cancelled:
+                Job._alive.discard(self)
+                return
+            self.started = True
         try:
             self.signals.result.emit(self.function(self.signals))
         except Exception as error:  # noqa: BLE001 - reported to the GUI

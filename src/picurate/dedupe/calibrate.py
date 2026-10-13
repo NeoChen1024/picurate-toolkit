@@ -132,11 +132,11 @@ def calibrate(
         except Exception as e:  # noqa: BLE001 - a broken file only drops one sample
             logger.warning("Skipping %s: %s", path, e)
             result.skipped.append(records[row].path)
-            continue
-        for v in variants:
-            pending.append((v, row, encoder.preprocess(VARIANTS[v](base))))
-            if len(pending) >= batch_size:
-                flush()
+        else:
+            for v in variants:
+                pending.append((v, row, encoder.preprocess(VARIANTS[v](base))))
+                if len(pending) >= batch_size:
+                    flush()
         if progress is not None:
             progress(1)
     flush()

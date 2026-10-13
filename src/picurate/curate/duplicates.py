@@ -8,7 +8,6 @@ import logging
 from collections.abc import Callable
 
 import humanize
-import PIL.Image
 from PySide6.QtCore import QEvent, QSize, Qt, QThreadPool
 from PySide6.QtGui import QAction, QActionGroup, QIcon, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
@@ -257,7 +256,7 @@ class DuplicatesTab(QWidget):
 
     def _update_counts(self) -> None:
         c = self.review.counts()
-        excluded = len(self.review.losers())
+        excluded = self.review.excluded_count()
         self.counts_label.setText(
             f"{c['pending']} pending · {c['decided']} decided · {c['skipped']} skipped · {excluded} images excluded as duplicates"
         )
@@ -329,12 +328,7 @@ class DuplicatesTab(QWidget):
             return "", None
         keeps = [i for i, m in enumerate(members) if m.keep]
         a = keeps[0] if keeps else 0
-        saved = self.members
-        self.members = members
-        try:
-            b = self._nearest(a, self.review.edges(group.id))
-        finally:
-            self.members = saved
+        b = self._nearest(a, self.review.edges(group.id), members)
         return members[a].file(self.roots), members[b].file(self.roots) if b != a else None
 
     def _prefetch(self) -> None:
@@ -366,16 +360,17 @@ class DuplicatesTab(QWidget):
         self.loading[path] = job
         pool.start(job)
 
-    def _nearest(self, i: int, edges: list[tuple[bytes, bytes, float]]) -> int:
+    def _nearest(self, i: int, edges: list[tuple[bytes, bytes, float]], members: list[MemberRow] | None = None) -> int:
         """The member closest to member ``i`` by the stored edges (edges are sorted by distance), else another one."""
-        index = {m.item: k for k, m in enumerate(self.members)}
-        me = self.members[i].item
+        members = self.members if members is None else members
+        index = {m.item: k for k, m in enumerate(members)}
+        me = members[i].item
         for a, b, _ in edges:
             if a == me and b in index:
                 return index[b]
             if b == me and a in index:
                 return index[a]
-        return next((k for k in range(len(self.members)) if k != i), i)
+        return next((k for k in range(len(members)) if k != i), i)
 
     def _refresh_group_label(self) -> None:
         g = self.current
@@ -405,11 +400,12 @@ class DuplicatesTab(QWidget):
     def _exclusion_marks(self) -> dict[bytes, str]:
         """What else decides about the members: a person (in the editor), or another decided group."""
         marks = {}
+        states = self.project.exclusions([m.item for m in self.members])
         for m in self.members:
-            if m.item not in self.project.items:
+            state = states.get(m.item)
+            if state is None:
                 marks[m.item] = "\n⚠ no longer in the project"
                 continue
-            state = self.project.state(m.item)
             human = (state["exclusion"] or {}).get("decision")
             by = state["excluded_by"]
             if state["trashed"]:
@@ -434,9 +430,10 @@ class DuplicatesTab(QWidget):
     def _show_members(self) -> None:
         self.member_list.blockSignals(True)
         self.member_list.clear()
+        stale = self.current is not None and self.current.status == "stale"
         for i, m in enumerate(self.members):
             item = QListWidgetItem(self._member_text(i))
-            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled | (Qt.ItemFlag(0) if stale else Qt.ItemFlag.ItemIsUserCheckable))
             item.setCheckState(Qt.CheckState.Checked if m.keep else Qt.CheckState.Unchecked)
             item.setData(Qt.ItemDataRole.UserRole, i)
             pix = self.thumbs.get(m.file(self.roots))
@@ -550,7 +547,12 @@ class DuplicatesTab(QWidget):
         ca = self.images.get(pa)
         cb = self.images.get(pb) if pb else (None, None)
         if ca is None or (pb and cb is None):
-            return  # still loading
+            # Still loading, or evicted by prefetched images that arrived in between: ask again (a no-op while a
+            # read is in flight).
+            for path in (pa, pb):
+                if path is not None:
+                    self._load_image(path, self.pool)
+            return
         self.shown = (pa, pb)
         self.canvas.set_images(ca[1], cb[1] if cb else None)
         if self.canvas.mode == "diff":
@@ -618,14 +620,6 @@ class DuplicatesTab(QWidget):
             self._request_diff()
             self._prefetch_diffs()
 
-    def wait_idle(self) -> None:
-        """Block until background jobs have finished and their results were delivered (for tests)."""
-        for _ in range(3):  # a delivered image can start a diff; a delivered diff is the end of the chain
-            self.pool.waitForDone()
-            self.prefetch_pool.waitForDone()
-            QApplication.processEvents()
-            QApplication.processEvents()
-
     # -- decisions -----------------------------------------------------------------------------------------------------
 
     def _decide(self, **kwargs) -> bool:
@@ -635,6 +629,7 @@ class DuplicatesTab(QWidget):
             self.review.decide(self.current.id, **kwargs)
         except ValueError as e:
             self.message(str(e))
+            self._refresh_members()  # a refused keep change: the check box goes back
             return False
         self._after_change()
         return True
@@ -736,8 +731,8 @@ class DuplicatesTab(QWidget):
     def skip_and_next(self) -> None:
         if self.current is None:
             return
-        self._decide(status="skipped")
-        self.navigate(1, pending_only=True)
+        if self._decide(status="skipped"):
+            self.navigate(1, pending_only=True)
 
     def undo(self) -> None:
         if self.current is None:

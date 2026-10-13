@@ -155,13 +155,15 @@ class CaptionEditor(QPlainTextEdit):
             self.setTextCursor(cursor)
             self.dismiss()
             return
-        if self.popup.isVisible():
-            if key == Qt.Key.Key_Tab:
+        if key == Qt.Key.Key_Tab:
+            if self.popup.isVisible():
                 self.accept()
-                return
-            if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
-                self.popup.setCurrentRow((self.popup.currentRow() + (1 if key == Qt.Key.Key_Down else -1)) % self.popup.count())
-                return
+            else:
+                self.complete()  # never a tab character in a caption
+            return
+        if self.popup.isVisible() and key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+            self.popup.setCurrentRow((self.popup.currentRow() + (1 if key == Qt.Key.Key_Down else -1)) % self.popup.count())
+            return
         if key == Qt.Key.Key_Escape:
             was_visible = self.popup.isVisible()
             self.dismiss()

@@ -91,9 +91,9 @@ class GroupListModel(QAbstractListModel):
                 "different": "\nPixels: some pair differs by more than compression",
             }.get(g.pixel or "", "")
             if g.discard:
-                keeps = "\n✕ Discarded: Apply moves every member"
+                keeps = "\n✕ Discarded: every member counts as excluded"
             elif g.kept == 0:
-                keeps = "\n∅ Keeps nothing: Apply skips this group until a member is kept or the group is discarded (R)"
+                keeps = "\n∅ Keeps nothing: excludes nothing until a member is kept or the group is discarded (R)"
             else:
                 keeps = ""
             return f"Group {g.id}: {g.n} images, distances {g.min_distance:.3f} to {g.max_distance:.3f} — {label}{pixel}{keeps}" + (

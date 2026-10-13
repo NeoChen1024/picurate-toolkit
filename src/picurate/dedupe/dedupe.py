@@ -115,10 +115,14 @@ def find_cross_pairs(
 
 
 def move_to_trash(root_dir: str, relative_path: str, trash_dir: str, *, dry_run: bool, reason: str = "") -> bool:
-    """Move one file into ``trash_dir`` preserving its relative path. Returns True when moved (or would be, in dry run)."""
+    """Move one file into ``trash_dir`` preserving its relative path. Returns True when moved (or would be, in dry
+    run). A file already at that place in the trash is never replaced: the move is refused and logged."""
     src = os.path.join(root_dir, relative_path)
     dst = os.path.join(trash_dir, relative_path)
     suffix = f" ({reason})" if reason else ""
+    if os.path.lexists(dst):
+        logger.error('Not moving "%s": the trash already holds "%s"', src, dst)
+        return False
     if dry_run:
         logger.info('[dry run] would move "%s" to trash%s', src, suffix)
         return True

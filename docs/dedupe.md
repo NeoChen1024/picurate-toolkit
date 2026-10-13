@@ -155,7 +155,8 @@ triangle of the distance matrix in blocks of rows (each distance block under 256
 threshold and merges them into connected components, since A~B and B~C does not imply A~C. 100k images take about a
 second on an RTX 4080-class GPU. On CUDA with Triton (bundled with PyTorch on Linux) a small kernel reads the FP16
 embeddings and computes `sum((a-b)^2)` in FP32 directly. Elsewhere they are upcast to FP32 and `torch.cdist` is used,
-whose `|a|^2+|b|^2-2ab` form loses about 1e-2 near zero distance on unnormalized CLIP embeddings.
+whose `|a|^2+|b|^2-2ab` form cancels near zero distance: on SigLIP2 embeddings (norm about 11) a distance of 0.1 is
+off by up to about 5e-4, and the error grows with the square of the norm.
 
 **Pixel check.** Both images are reduced to the smaller one's size (at most 1024 px on the long side, box filter),
 blurred with a Gaussian of sigma 1.5 px to remove JPEG block edges and ringing, and compared per pixel (largest

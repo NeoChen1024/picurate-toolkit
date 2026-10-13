@@ -300,11 +300,12 @@ def load_model(
         net = ViTDetTagger(cfg)
     # The RoPE tables are computed on the CPU explicitly, so they are real tensors even under the meta context.
     net.load_state_dict(load_file(weights_path), strict=True, assign=True)
-    net = net.to(device=device, dtype=dtype).eval()
-    for m in net.modules():
-        if isinstance(m, Attention):
-            m.rope_cos = m.rope_cos.float()
-            m.rope_sin = m.rope_sin.float()
+    net = net.to(device).eval()
+    # Only the weights change dtype: the RoPE tables (the model's only buffers) stay the fp32 values they were
+    # computed as, instead of fp16-rounded ones upcast back.
+    if dtype != torch.float32:
+        for p in net.parameters():
+            p.data = p.data.to(dtype)
     if len(config["tags"]) != cfg.num_classes or sum(n for _, n in config["tags_split"]) != cfg.num_classes:
         raise ValueError("Tag list / category split do not match the number of classes")
     return LoadedTagger(net, config)

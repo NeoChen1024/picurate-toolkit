@@ -452,15 +452,22 @@ class Project:
         generated, options, combine = tag_captions.generated_captions(self.directory / tag_captions.TAGS, [item])
         return tag_captions.combine(self.items[item]["caption"], generated.get(item), combine, options.separator)[0]
 
-    def _decisions(self, item: bytes | None = None) -> dict[bytes, dict]:
-        query = "SELECT item, field, value FROM state" + (" WHERE item = ?" if item is not None else "")
-        decisions = {}
+    def _decisions(self, items: Collection[bytes] | None = None) -> dict[bytes, dict]:
+        """``{item: {field: value}}`` of the stored decisions, of every item or of ``items`` only."""
+        query, args = "SELECT item, field, value FROM state", ()
+        if items is not None:
+            items = list(items)
+            if not items:
+                return {}
+            query += f" WHERE item IN ({','.join('?' * len(items))})"
+            args = tuple(items)
+        decisions: dict[bytes, dict] = {}
         with self._lock:
-            for key, field, value in self.db.execute(query, () if item is None else (item,)):
+            for key, field, value in self.db.execute(query, args):
                 decisions.setdefault(key, {})[field] = json.loads(value)
         return decisions
 
-    def _review_losers(self, item: bytes | None = None) -> dict[bytes, tuple[int, list[bytes]]]:
+    def _review_losers(self, items: Collection[bytes] | None = None) -> dict[bytes, tuple[int, list[bytes]]]:
         path = self.directory / REVIEW
         if not path.exists():
             return {}
@@ -470,7 +477,7 @@ class Project:
             if version is None or version[0] != REVIEW_SCHEMA:
                 logger.warning("%s has another schema version; its decisions are ignored until matching runs again", path)
                 return {}
-            return losers(conn, item)
+            return losers(conn, items)
         finally:
             conn.close()
 
@@ -518,14 +525,14 @@ class Project:
         elif human is None and state["item_id"] in losers:
             group, kept = losers[state["item_id"]]
             if decisions is None:
-                decisions = {k: self._decisions(k).get(k, {}) for k in kept}
+                decisions = self._decisions(kept)
             if not kept or any(self._human_exclusion(decisions.get(k, {})) != "exclude" for k in kept):
                 state["excluded_by"] = {"by": "dedupe", "group": group, "kept": [k.hex() for k in kept]}
         state["excluded"] = state["excluded_by"] is not None
 
     def update_exclusion(self, state: dict) -> None:
         """Recompute ``excluded`` and ``excluded_by`` after ``state["exclusion"]`` changed."""
-        self._combine_exclusion(state, self._review_losers(state["item_id"]))
+        self._combine_exclusion(state, self._review_losers([state["item_id"]]))
 
     def _captions(self, items: Collection[bytes] | None = None) -> tuple:
         return tag_captions.generated_captions(self.directory / tag_captions.TAGS, items)
@@ -534,9 +541,20 @@ class Project:
         """The effective state of an item: its decisions over the defaults, with the derived caption if unedited
         (``caption_source``: human, imported, tags, combined or None; ``tags_stale``: rendered from scores of another
         version of the file), and whether it is excluded (``excluded``, with ``excluded_by``)."""
-        state = self._state(item, self._decisions(item).get(item, {}), self._captions([item]))
-        self._combine_exclusion(state, self._review_losers(item))
+        state = self._state(item, self._decisions([item]).get(item, {}), self._captions([item]))
+        self._combine_exclusion(state, self._review_losers([item]))
         return state
+
+    def exclusions(self, items: Collection[bytes]) -> dict[bytes, dict]:
+        """The :meth:`state` of each of ``items`` (unknown ones left out) without the caption: what a GUI showing a
+        handful of images needs to say whether, and by whom, each is excluded."""
+        items = [item for item in items if item in self.items]
+        decisions = self._decisions(items)
+        losers = self._review_losers(items)
+        states = {item: self._state(item, decisions.get(item, {}), None) for item in items}
+        for state in states.values():
+            self._combine_exclusion(state, losers)
+        return states
 
     def states(self, captions: bool = True) -> list[dict]:
         """Every item's :meth:`state`; without ``captions``, leaving out the caption, which needs every image's tag
@@ -579,9 +597,10 @@ class Project:
                 raise
         return changed
 
-    def exclude(self, reasons: dict[bytes, str], kind: str, description: str) -> tuple[int, int]:
+    def exclude(self, reasons: dict[bytes, str], kind: str, description: str) -> tuple[int | None, int]:
         """Force exclude each item of ``reasons`` with its reason, as one operation. Items a person already decided
-        about (force keep or force exclude) are left alone. Returns ``(operation, items excluded)``."""
+        about (force keep or force exclude) are left alone. Returns ``(operation, items excluded)``; the operation is
+        None when nothing changed, since an operation without changes is not recorded."""
         with self._lock:
             self.db.execute("BEGIN")
             try:
@@ -591,11 +610,13 @@ class Project:
                     if item in self.items and self._stored(item, "exclusion") is None:
                         encoded = json.dumps({"decision": "exclude", "reason": reason}, ensure_ascii=False)
                         count += self._write(item, "exclusion", encoded, op)
+                if not count:
+                    self.db.execute("DELETE FROM ops WHERE id = ?", (op,))
                 self.db.execute("COMMIT")
             except BaseException:
                 self.db.execute("ROLLBACK")
                 raise
-        return op, count
+        return (op if count else None), count
 
     def _stored(self, item: bytes, field: str) -> str | None:
         row = self.db.execute("SELECT value FROM state WHERE item = ? AND field = ?", (item, field)).fetchone()
@@ -638,9 +659,10 @@ class Project:
         )
         return [dict(zip(("id", "at", "kind", "description", "changes"), row)) for row in rows]
 
-    def rollback(self, op: int) -> tuple[int, list[tuple[bytes, str]], int]:
+    def rollback(self, op: int) -> tuple[int, list[tuple[bytes, str]], int, int]:
         """Restore every field ``op`` changed to its value before ``op``, as a new operation. A field changed again
-        since is left alone and listed. Returns ``(new operation, skipped (item, field) pairs, restored count)``."""
+        since is left alone and listed. Returns ``(new operation, skipped (item, field) pairs, restored count, files
+        moved back out of or into the trash)``."""
         with self._lock:
             row = self.db.execute("SELECT kind, description FROM ops WHERE id = ?", (op,)).fetchone()
             if row is None:

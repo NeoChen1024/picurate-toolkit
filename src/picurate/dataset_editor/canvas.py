@@ -88,7 +88,7 @@ class Thumbnails(QAbstractListModel):
     def failed(self, row):
         self.pending.discard(row)
         self.cache[row] = QPixmap()
-        self.issues[row] = "Source image missing or unreadable"
+        self.issues[row] = "Missing source — use Relink Sources" if not self.paths[row].exists() else "Source image unreadable"
         self.dataChanged.emit(self.index(row), self.index(row))
 
     def ready(self, result):
@@ -200,6 +200,7 @@ class Canvas(QGraphicsView):
             return
         self.start = self.point(event)
         self.drag = "new"
+        self.before = (self.crop, len(self.fills))  # restored when the drag ends without a rectangle
         if self.mode == "crop" and self.crop:
             x, y, w, h = self.crop
             self.original = list(self.crop)
@@ -233,12 +234,18 @@ class Canvas(QGraphicsView):
                 h,
             ]
         else:
-            box = QRectF(self.start, p).normalized()
-            x, y, w, h = round(box.x()), round(box.y()), round(box.width()), round(box.height())
+            # The rectangle grows from the anchor (the press point, or the corner opposite the one being dragged),
+            # which stays put when a ratio shortens a side.
+            width, height = self.image_size.width(), self.image_size.height()
+            ax, ay = round(self.start.x()), round(self.start.y())
+            right, down = p.x() >= self.start.x(), p.y() >= self.start.y()
+            w = min(round(abs(p.x() - self.start.x())), width - ax if right else ax)
+            h = min(round(abs(p.y() - self.start.y())), height - ay if down else ay)
             if self.mode == "crop" and self.ratio:
                 w = min(w, round(h * self.ratio))
                 h = round(w / self.ratio)
-            rect = [x, y, min(w, self.image_size.width() - x), min(h, self.image_size.height() - y)]
+            x, y = ax if right else ax - w, ay if down else ay - h
+            rect = [x, y, min(w, width - x), min(h, height - y)]
         self.draft = rect
         if self.mode == "crop":
             self.crop = rect
@@ -253,13 +260,19 @@ class Canvas(QGraphicsView):
             self.pan = None
             return
         if self.start is not None:
-            if hasattr(self, "draft") and min(self.draft[2:]) > 0:
-                self.rectangle.emit(self.draft)
+            draft = getattr(self, "draft", None)
             self.start = None
             if hasattr(self, "draft"):
                 del self.draft
             if hasattr(self, "base_count"):
                 del self.base_count
+            if draft is not None and min(draft[2:]) > 0:
+                self.rectangle.emit(draft)  # the window redraws from its state
+            else:
+                # A click, or a drag of no area: the drawn draft (an empty crop, a fill of no size) goes away.
+                self.crop, count = self.before
+                self.fills = self.fills[:count]
+                self.draw()
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):

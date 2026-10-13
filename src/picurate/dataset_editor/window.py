@@ -161,6 +161,7 @@ class Window(QMainWindow):
         self.fills.setMaximumHeight(95)
         layout.addWidget(self.fills)
         buttons = QHBoxLayout()
+        self.edit_controls = list(self.coords)  # usable only with the image on screen: crops and fills need its size
         for label, fn in [
             ("Delete Fill", self.delete_fill),
             ("Reset Crop", self.clear_crop),
@@ -170,6 +171,8 @@ class Window(QMainWindow):
             button = QPushButton(label)
             button.clicked.connect(fn)
             buttons.addWidget(button)
+            self.edit_controls.append(button)
+        self.set_editable(False)
         layout.addLayout(buttons)
         self.review = QComboBox()
         self.review.addItems(["unreviewed", "approved", "skip"])
@@ -299,7 +302,7 @@ class Window(QMainWindow):
                 <h3>Caption editor</h3>
                 <table cellspacing="8">
                 <tr><td><b>Ctrl+R</b></td><td>Show completion candidates</td></tr>
-                <tr><td><b>Tab</b></td><td>Accept the selected completion when the list is open</td></tr>
+                <tr><td><b>Tab</b></td><td>Accept the selected completion; with the list closed, open it (never a tab character)</td></tr>
                 <tr><td><b>Up / Down</b></td><td>Select a candidate when the list is open</td></tr>
                 <tr><td><b>Enter</b></td><td>Insert a newline; never accept a completion</td></tr>
                 <tr><td><b>Comma</b></td><td>Insert a comma and end completion</td></tr>
@@ -322,6 +325,12 @@ class Window(QMainWindow):
 
     def error(self, message):
         QMessageBox.warning(self, "Unable to complete", str(message))
+
+    def set_editable(self, enabled):
+        """Whether the crop and fill controls work: only while the current image is decoded and matches its
+        recorded size (caption, review status and exclusion stay editable without it)."""
+        for widget in self.edit_controls:
+            widget.setEnabled(enabled)
 
     def index_ready(self, index):
         self.caption.index = index
@@ -447,16 +456,15 @@ class Window(QMainWindow):
         self.canvas.crop, self.canvas.fills = None, []
         self.canvas.draw()
         self.canvas.setEnabled(False)
+        self.set_editable(False)
         self.item_ids = list(self.project.items)
         self.paths = [self.project.source_path(key) for key in self.item_ids]
         self.image_position.setText(f"Image 0 / {len(self.paths):,}")
-        self.model = Thumbnails(self.paths, self.pool)
+        self.model = Thumbnails(self.paths, self.pool)  # a missing source shows up when its thumbnail is read
         for i, state in enumerate(self.project.states(captions=False)):
             self.model.status[i] = state["review_status"]
             if state["excluded"]:
                 self.model.excluded[i] = self.exclusion_text(state)
-            if not self.paths[i].is_file():
-                self.model.issues[i] = "Missing source — use Relink Sources"
         self.thumbs.setModel(self.model)
         self.thumbs.selectionModel().currentChanged.connect(self.select)
         if self.paths:
@@ -575,10 +583,16 @@ class Window(QMainWindow):
         self.im = None
         self.caption.setEnabled(False)
         self.canvas.setEnabled(False)
+        self.set_editable(False)
         self.image_position.setText(f"Image {index.row() + 1:,} / {len(self.paths):,}")
         path = self.paths[index.row()]
         self.filename.setText(path.name + " · Loading")
-        state = self.project.state(self.item_ids[index.row()])
+        try:
+            state = self.project.state(self.item_ids[index.row()])
+        except Exception as error:
+            self.filename.setText(path.name + " · cannot be read")
+            self.error(f"Cannot read the project's record of {path.name}: {error}")
+            return
         self.loaded((None, state), generation)
         self.canvas.pix.setPixmap(QPixmap())
         self.canvas.crop, self.canvas.fills = None, []
@@ -609,6 +623,7 @@ class Window(QMainWindow):
         self.im = image
         if state is None:
             self.canvas.setEnabled(True)
+            self.set_editable(True)
             self.filename.setText(f"{self.state['image']}\n{self.im.width} × {self.im.height}")
             if warning and warning[0]:
                 self.status_message.setText(warning[0])
@@ -735,7 +750,7 @@ class Window(QMainWindow):
             self.refresh()
 
     def rectangle(self, rect):
-        if not self.state or self.im is None:
+        if not self.state or self.im is None or min(rect[2:]) <= 0:
             return
         if self.canvas.mode == "fill" and self.fill_method.currentText() == "LaMa":
             try:
@@ -781,7 +796,8 @@ class Window(QMainWindow):
             return
         x, y, w, h = [spin.value() for spin in self.coords]
         w, h = min(w, self.im.width - x), min(h, self.im.height - y)
-        if min(x, y) >= 0 and min(w, h) > 0 and [x, y, w, h] != self.state["crop"]:
+        shown = self.state["crop"] or [0, 0, self.im.width, self.im.height]  # what the boxes show without a crop
+        if min(x, y) >= 0 and min(w, h) > 0 and [x, y, w, h] != shown:
             self.rectangle([x, y, w, h])
 
     def clear_crop(self):
@@ -875,34 +891,44 @@ class Window(QMainWindow):
         form.addRow(buttons)
         if not dialog.exec():
             return
-        states = [state for state in self.project.states() if not state["excluded"]]
-        if scope.currentIndex() == 2:
-            states = [state for state in states if self.state and state["item_id"] == self.state["item_id"]]
-        elif scope.currentIndex() == 1:
-            states = [state for state in states if state["review_status"] == "approved"]
-        else:
-            states = [state for state in states if state["review_status"] != "skip"]
-        if not states:
-            self.error("No images match the selected export scope")
-            return
         self.project.settings["format"] = fmt.currentText()
         self.project.save_settings()
-        stale = sum(state["tags_stale"] for state in states)
-        snapshot = self.project.export_snapshot(states, fmt.currentText())
-        directory = self.project.directory
-        progress = QProgressDialog("Building output snapshot…", "Cancel", 0, len(states), self)
+        project, directory, chosen, current = self.project, self.project.directory, scope.currentIndex(), self.state
+        progress = QProgressDialog("Reading the project…", "Cancel", 0, 0, self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
         cancelled = [False]
         progress.canceled.connect(lambda: cancelled.__setitem__(0, True))
 
-        def run(signals):
-            return export_project(directory, snapshot, lambda: cancelled[0], signals.progress.emit)
+        def prepare(signals):
+            """Off the GUI thread: the states (with every caption rendered) and the snapshot of what to export."""
+            states = [state for state in project.states() if not state["excluded"]]
+            if chosen == 2:
+                states = [state for state in states if current and state["item_id"] == current["item_id"]]
+            elif chosen == 1:
+                states = [state for state in states if state["review_status"] == "approved"]
+            else:
+                states = [state for state in states if state["review_status"] != "skip"]
+            if not states:
+                raise ValueError("No images match the selected export scope")
+            return project.export_snapshot(states, fmt.currentText()), sum(state["tags_stale"] for state in states)
 
-        job = Job(run)
-        job.signals.progress.connect(progress.setValue, Qt.ConnectionType.QueuedConnection)
+        def prepared(result):
+            snapshot, stale = result
+            if cancelled[0]:
+                progress.close()
+                return
+            progress.setLabelText("Building output snapshot…")
+            progress.setRange(0, len(snapshot["items"]))
 
-        def done(result):
+            def run(signals):
+                return export_project(directory, snapshot, lambda: cancelled[0], signals.progress.emit)
+
+            job = Job(run)
+            job.signals.progress.connect(progress.setValue, Qt.ConnectionType.QueuedConnection)
+            self.pool.start(job.connect(lambda result: done(result, stale), failed))
+
+        def done(result, stale):
             progress.close()
             count, was_cancelled = result
             QMessageBox.information(
@@ -924,7 +950,7 @@ class Window(QMainWindow):
             progress.close()
             self.error(f"Export failed; previous output preserved.\n{error}")
 
-        self.pool.start(job.connect(done, failed))
+        self.pool.start(Job(prepare).connect(prepared, failed))
 
     def closeEvent(self, event):
         if not self.save():
