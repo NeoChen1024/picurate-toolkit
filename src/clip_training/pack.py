@@ -29,6 +29,7 @@ import os
 import signal
 import sqlite3
 import time
+from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
@@ -419,26 +420,34 @@ def import_cagliostro(pack_dir, dataset, categories_db, budget, shard_gib, worke
 
 @main.command("check-cagliostro")
 @click.argument("dataset", type=click.Path(exists=True, file_okay=False))
-@click.option("--decode/--no-decode", default=True, show_default=True, help="Also decode every image.")
+@click.option(
+    "--decode/--no-decode",
+    default=True,
+    show_default=True,
+    help="Also decode images that match their MD5 (the others are always decoded).",
+)
 @click.option("--workers", "-j", type=click.IntRange(1), default=os.cpu_count(), show_default=True, help="Checking processes.")
 def check_cagliostro(dataset, decode, workers):
-    """Check the cagliostrolab-860k-ordered dataset at DATASET without writing anything: every Danbooru image against
-    the MD5 in its name, every caption readable and not empty, every image decodable, and every image paired with a
-    caption. Problems are printed to stdout, one ``path<TAB>problem`` per line."""
+    """Check the cagliostrolab-860k-ordered dataset at DATASET without writing anything: every caption readable and
+    not empty, every image paired with a caption and decodable (one that matches the MD5 in its name only with
+    --decode). Problems are printed to stdout, one ``path<TAB>problem`` per line; images that were saved again since
+    (no longer matching their MD5) but decode are counted, not printed."""
     from .cagliostro import check_pair, find_pairs
 
     unpaired = []
     pairs = list(tqdm(find_pairs(dataset, unpaired), unit=" pairs", desc="Listing"))
     for path in unpaired:
         click.echo(f"{path}\tno {'image' if path.endswith('.txt') else 'caption'}")
-    bad = 0
+    bad, statuses = 0, Counter()
     with tqdm(total=len(pairs), unit="img", desc="Checking") as progress:
-        for (_, image, _, _), problem in bounded_map(check_pair, ((*pair, decode) for pair in pairs), workers):
+        for (_, image, _, _), (problem, status) in bounded_map(check_pair, ((*pair, decode) for pair in pairs), workers):
+            statuses[status] += 1
             if problem is not None:
                 bad += 1
                 click.echo(f"{image}\t{problem}")
             progress.update()
-    click.echo(f"{len(pairs)} pairs, {bad} damaged, {len(unpaired)} files without their pair", err=True)
+    checked = ", ".join(f"{count} {status}" for status, count in statuses.most_common())
+    click.echo(f"{len(pairs)} pairs ({checked}), {bad} damaged, {len(unpaired)} files without their pair", err=True)
     if bad or unpaired:
         raise SystemExit(1)
 

@@ -6,8 +6,11 @@ dataset root is read. A Danbooru post's key is its file stem, so a post found in
 ``continued/screencap/<series>/<character>/`` holds anime frames named by number, where one number can be another
 frame in another directory, or the same frame captioned for another character: their key is the path below the
 stage directory without the extension, ``screencap/<series>/<character>/<number>`` (identical frames are then two
-records with identical stored bytes). A Danbooru file name ends in the MD5 of its contents, which the import and
-the check verify, so files damaged in copying or extraction are found. A caption reads::
+records with identical stored bytes). A Danbooru file name ends in the MD5 of the original post file. About 60% of
+the PNGs no longer match it: the dataset's makers saved them again (RGB, no metadata chunks, Pillow's 64 KiB IDAT
+chunks), as did a few dozen JPEG and WebP files. So a mismatch alone is no damage; such a file is accepted when it
+decodes completely, which PNG's checksums make a real integrity check. Some JPEGs were saved cut off at a whole
+number of MiB and are rejected for not decoding completely. A caption reads::
 
     1girl, <characters>, <copyrights>, <artists>, ||| <rating>, [nsfw,] <general tags>, <year>, <meta>, <quality>, <aesthetic>
 
@@ -209,15 +212,13 @@ def find_pairs(root: str, unpaired: list[str] | None = None) -> Iterator[tuple[s
             )
 
 
-def read_image(key: str, image_path: str) -> bytes:
-    """The file's bytes; a Danbooru file whose contents do not match the MD5 in its name raises ValueError."""
+def read_image(key: str, image_path: str) -> tuple[bytes, bool | None]:
+    """The file's bytes, and whether they match the MD5 in a Danbooru file name (None for other files)."""
     with open(image_path, "rb") as stream:
         data = stream.read()
-    if key.startswith("danbooru_"):
-        expected = key.rsplit("_", 1)[1]
-        if (actual := hashlib.md5(data).hexdigest()) != expected:
-            raise ValueError(f"contents have MD5 {actual}, the name says {expected}")
-    return data
+    if not key.startswith("danbooru_"):
+        return data, None
+    return data, hashlib.md5(data).hexdigest() == key.rsplit("_", 1)[1]
 
 
 def read_caption(caption_path: str) -> list[tuple[str, bool]]:
@@ -234,23 +235,27 @@ def encode_pair(key: str, image_path: str, caption_path: str, budget: int):
 
     try:
         tags = read_caption(caption_path)
-        return encode_file(io.BytesIO(read_image(key, image_path)), budget), tags
+        return encode_file(io.BytesIO(read_image(key, image_path)[0]), budget), tags
     except Exception as error:  # noqa: BLE001 - reported per file
         return error, []
 
 
-def check_pair(key: str, image_path: str, caption_path: str, decode: bool) -> str | None:
-    """Worker: what is wrong with a pair (unreadable, MD5 mismatch, empty caption, undecodable image), or None."""
+def check_pair(key: str, image_path: str, caption_path: str, decode: bool) -> tuple[str | None, str]:
+    """Worker: what is wrong with a pair (unreadable, empty caption, undecodable image) or None, and how the image was
+    checked: ``original`` (matches its MD5), ``resaved`` (does not) or ``unnamed`` (no MD5 in the name). An image
+    without a matching MD5 is always decoded."""
     import PIL.Image
     import PIL.ImageFile
 
+    status = "unread"
     try:
         read_caption(caption_path)
-        data = read_image(key, image_path)
-        if decode:
+        data, matches = read_image(key, image_path)
+        status = {True: "original", False: "resaved", None: "unnamed"}[matches]
+        if decode or not matches:
             PIL.ImageFile.LOAD_TRUNCATED_IMAGES = False
             with PIL.Image.open(io.BytesIO(data)) as image:
                 image.load()
     except Exception as error:  # noqa: BLE001 - reported per file
-        return f"{type(error).__name__}: {error}"
-    return None
+        return f"{type(error).__name__}: {error}", status
+    return None, status
