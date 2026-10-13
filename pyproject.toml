@@ -50,6 +50,7 @@ picurate-tag = "picurate.tagger.cli:main"
 picurate-project = "picurate.project.cli:main"
 picurate-dataset-editor = "picurate.dataset_editor.app:main"
 clip-dataset-preprocess = "clip_training.dataset_preprocessing:main"
+clip-train-bench = "clip_training.bench_train:main"
 
 [build-system]
 requires = ["setuptools>=77"]

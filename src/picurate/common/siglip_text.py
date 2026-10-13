@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 DEFAULT_REPO = "google/siglip2-so400m-patch16-naflex"
 DEFAULT_REVISION = "cc24074f717b612951c2dead130904ab9b65a81e"
@@ -105,11 +106,15 @@ class TextTower(nn.Module):
         self.layers = nn.ModuleList(Block(cfg) for _ in range(cfg.layers))
         self.final_layer_norm = nn.LayerNorm(cfg.width, eps=cfg.eps)
         self.head = nn.Linear(cfg.width, cfg.projection)
+        self.grad_checkpointing = False  # recompute each layer's activations in the backward pass (training)
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         x = self.token_embedding(ids) + self.position_embedding.weight[: ids.shape[1]]
         for layer in self.layers:
-            x = layer(x)
+            if self.grad_checkpointing and self.training:
+                x = checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
         return self.head(self.final_layer_norm(x)[:, -1])
 
 

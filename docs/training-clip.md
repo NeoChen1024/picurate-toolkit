@@ -1,8 +1,8 @@
 # Fine-tuning CLIP/SigLIP for anime images
 
 Working notes for the scripts under `src/clip_training`. Nothing here is implemented yet beyond the dataset
-preprocessing stub; this records what was researched and decided (2026-10) so the implementation does not have to
-rediscover it.
+preprocessing stub and a training-step benchmark; this records what was researched and decided so the
+implementation does not have to rediscover it.
 
 ## Two routes, not one
 
@@ -48,13 +48,47 @@ search model is free to lose the detail sensitivity the deduper needs.
   interpolation (`w = (1-a)·w_orig + a·w_ft`) before deciding a fine-tune is an improvement. Evaluate zero-shot
   retrieval on a held-out set at every checkpoint, not just the training loss. The dedupe route has no alignment to
   keep; its only metric is the variant/different gap on held-out groups.
-* Framework: train with `transformers` (`Siglip2Model`, `attn_implementation="sdpa"` or flash-attention 2,
-  gradient checkpointing built in), then convert the image tower to timm's `naflexvit_*` layout for the deduper.
-  timm's checkpoints were themselves converted from the Google release, so the mapping exists; the conversion
-  script belongs in `src/clip_training`.
+* Framework: no `transformers`. The image tower is timm's (`naflexvit_so400m_patch16_siglip.v2_webli`, with its
+  NaFlex data loader), so the trained tower is already in the layout the deduper loads; the text tower is
+  `picurate.common.siglip_text`, which loads the same checkpoint's text weights. The position embedding is resampled
+  bicubically as timm does (the official code uses bilinear). See [TODO](TODO.md).
 * Preprocessing at training time must match inference: aspect ratio kept, bicubic, mean/std 0.5, the same patch
   budget (`--seq-len`, 1024 by default). A tower trained on 256-patch inputs and evaluated at 1024 is a different
   model.
+
+## Step benchmark
+
+`clip-train-bench` (`src/clip_training/bench_train.py`) runs full training steps (forward, sigmoid loss, backward,
+fused AdamW) on synthetic data with the real architectures and random weights, finds the largest batch that fits and
+times it; `--grad-cache MICRO` with `--batch-size` times a GradCache step instead. `--memory` caps PyTorch's
+allocations to stand in for a smaller GPU; `--freeze-blocks`, `--train` and `--no-checkpointing` change what is
+trained. Every image is a full 1024-patch sequence, the worst case. Trained parameters are FP32 master weights under
+bf16 autocast; frozen ones are stored in bf16 (`--frozen-fp32` keeps them FP32), which changes their outputs by
+less than 1e-4 in cosine.
+
+Measured on an RTX 4080-class GPU, activation checkpointing on:
+
+| Setup | Largest batch | Throughput |
+|---|---|---|
+| dedupe, full image tower, 24 GiB free | 83 pairs | 7.2 pairs/s (14 images/s) |
+| dedupe, full image tower, 7 GiB | 1 pair | 6.3 pairs/s |
+| dedupe, lower 14 of 27 blocks frozen, 7 GiB | 16 pairs | 8.0 pairs/s |
+| the same with GradCache, micro-batches of 8 | 256 pairs | 6.2 pairs/s |
+| search, both towers, 24 GiB free | 74 | 13.5 pairs/s |
+| search, image tower only (14 blocks frozen), 7 GiB | 19 | 14.8 pairs/s |
+| the same with GradCache, micro-batches of 2 | 256 | 11.3 pairs/s |
+
+The GPU is saturated from a batch of about 4: a larger batch adds negatives to the loss, not speed. The full image
+tower's weights, gradients and AdamW state alone take 6.4 GiB, so an 8 GiB GPU needs frozen blocks, LoRA or offloaded
+optimizer state.
+
+Gradient accumulation does not add negatives (each micro-batch's loss only compares its own samples); GradCache does:
+it embeds the whole batch without gradients, takes the loss and its gradient with respect to the embeddings, then
+embeds each micro-batch again and back-propagates its slice. Its gradients match the full batch's (relative
+difference about 1e-6 in FP32) for one extra forward pass, 20-25% of the step. Its peak is higher than a single small
+step's, because the second micro-batch's forward holds autocast's bf16 weight copies while the first one's gradients
+exist (full image tower: 7.35 GiB against 6.51; in FP32, without those copies, 6.84 against 6.56), so the full tower
+does not fit 7 GiB with it either.
 
 ## Text side: token limits
 
