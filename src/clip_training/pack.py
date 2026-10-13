@@ -10,8 +10,9 @@ Layout of a pack directory:
   length, stored size, source size, BLAKE3 of the stored bytes); ``tags`` (name, category) and ``image_tags`` (each
   image's tags in their source order).
 
-A truncated or unreadable source is reported and skipped, never stored partly. Images are stored upright (EXIF orientation applied), RGB (transparency composited on white), and downscaled with
-Lanczos so that width x height <= ``budget`` pixels; smaller ones are kept as they are. The default budget is twice
+A truncated or unreadable source is reported and skipped, never stored partly. Images are stored upright (EXIF
+orientation applied), RGB (transparency composited on white), and downscaled with Lanczos so that width x height <=
+``budget`` pixels; smaller ones are kept as they are. The default budget is twice
 the pixels of SigLIP2's 1024 patches of 16x16, room for the crops and rescales of augmentation. Lossless WebP at
 method 4, quality 50 is about 26% smaller than optimized PNG and decodes faster; higher efforts cost 4-50 times the
 encoding time for 1-3% (measured on library images).
@@ -55,6 +56,7 @@ INDEX = "index.sqlite"
 FORMAT = "webp-lossless"
 DEFAULT_BUDGET = 2 * 1024 * 16 * 16
 DEFAULT_SHARD_BYTES = 16 * 2**30
+READ_ATTEMPTS = 4  # a network share that drops out for a moment should not end a training run
 WEBP = {"format": "WEBP", "lossless": True, "method": 4, "quality": 50}
 
 _SCHEMA = """
@@ -116,7 +118,8 @@ def encode(image: PIL.Image.Image, budget: int = DEFAULT_BUDGET) -> Encoded:
 
 
 def encode_file(path, budget: int) -> Encoded:
-    """``path`` is a file name or a binary file object. Every image is decoded at full resolution (no JPEG draft scaling) before the Lanczos downscale."""
+    """``path`` is a file name or a binary file object. Every image is decoded at full resolution (no JPEG draft
+    scaling) before the Lanczos downscale."""
     with PIL.Image.open(path) as image:
         return encode(image, budget)
 
@@ -245,16 +248,33 @@ class Pack:
         return len(self.ids)
 
     def read(self, i: int) -> bytes:
+        """The stored bytes of image ``i``. A failed or short read is tried again on a reopened file, waiting 1, 2, 4
+        seconds in between."""
         self._local()
-        shard = int(self.shards[i])
-        fd = self._files.get(shard)
-        if fd is None:
-            fd = self._files[shard] = os.open(shard_path(self.directory, shard), os.O_RDONLY)
-        length = int(self.lengths[i])
-        data = os.pread(fd, length, int(self.offsets[i]))
-        if len(data) != length:
-            raise OSError(f"{shard_path(self.directory, shard)}: image {self.keys[i]} is cut short")
-        return data
+        shard, length, offset = int(self.shards[i]), int(self.lengths[i]), int(self.offsets[i])
+        for attempt in range(READ_ATTEMPTS):
+            try:
+                fd = self._files.get(shard)
+                if fd is None:
+                    fd = self._files[shard] = os.open(shard_path(self.directory, shard), os.O_RDONLY)
+                data = bytearray()
+                while len(data) < length:
+                    chunk = os.pread(fd, length - len(data), offset + len(data))
+                    if not chunk:
+                        break
+                    data += chunk
+                if len(data) == length:
+                    return bytes(data)
+                error = OSError(f"{shard_path(self.directory, shard)}: image {self.keys[i]} is cut short")
+            except OSError as failure:
+                error = failure
+            fd = self._files.pop(shard, None)
+            if fd is not None:
+                os.close(fd)
+            if attempt + 1 < READ_ATTEMPTS:
+                logger.warning("%s, reading again", error)
+                time.sleep(2**attempt)
+        raise error
 
     def image(self, i: int) -> PIL.Image.Image:
         with PIL.Image.open(io.BytesIO(self.read(i))) as image:

@@ -267,7 +267,7 @@ def main(
     total = torch.cuda.get_device_properties(0).total_memory
     if memory is not None:
         torch.cuda.set_per_process_memory_fraction(min(1.0, memory * 2**30 / total))
-    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cuda.matmul.fp32_precision = "tf32"
     model = Bench(route, train, freeze_blocks, checkpointing).to(device).train()
     if not frozen_fp32:
         for p in model.parameters():

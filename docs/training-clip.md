@@ -1,8 +1,8 @@
 # Fine-tuning CLIP/SigLIP for anime images
 
 Working notes for the scripts under `src/clip_training`: what was researched and decided, and the parts that exist so
-far: a training-step benchmark (`clip-train-bench`), image packs (`clip-pack`) and the training batches made from
-them (`clip-data`). The training loop itself is not written yet.
+far: a training-step benchmark (`clip-train-bench`), image packs (`clip-pack`), the training batches made from them
+(`clip-data`) and the training runs (`clip-train`).
 
 ## Two routes, not one
 
@@ -51,7 +51,7 @@ search model is free to lose the detail sensitivity the deduper needs.
 * Framework: no `transformers`. The image tower is timm's (`naflexvit_so400m_patch16_siglip.v2_webli`, with its
   NaFlex data loader), so the trained tower is already in the layout the deduper loads; the text tower is
   `picurate.common.siglip_text`, which loads the same checkpoint's text weights. The position embedding is resampled
-  bicubically as timm does (the official code uses bilinear). See [TODO](TODO.md).
+  bicubically as timm does (the official code uses bilinear).
 * Preprocessing at training time must match inference: aspect ratio kept, bicubic, mean/std 0.5, the same patch
   budget (`--seq-len`, 1024 by default). A tower trained on 256-patch inputs and evaluated at 1024 is a different
   model.
@@ -155,7 +155,56 @@ batches of 64 captions there are about 45 such extra positives.
 
 `clip-data sample PACK [--route dedupe] [--out DIR]` prints a batch's captions and positives and can save what the
 model sees as PNG; `clip-data bench PACK -j N` times the loader. Eight workers of a 16-thread desktop CPU deliver
-about 500 search or 340 dedupe samples per second, against the 7-15 per second the GPU trains.
+about 500 search or 340 dedupe samples per second, against the 7-15 per second the GPU trains. Each worker keeps
+`prefetch` batches ready in shared memory, and a dedupe batch of 256 pairs at 1024 patches is about 400 MB, so the
+default is two.
+
+## Training runs
+
+    clip-train run RUN_DIR --config run.toml     # start
+    clip-train run RUN_DIR                       # continue from the newest checkpoint
+    clip-train export RUN_DIR OUTPUT --name NAME
+
+The settings are a TOML file; [clip-train.example.toml](clip-train.example.toml) lists every key at its default.
+Experiments train fully (with the lower image blocks frozen where memory is short); `[model.lora]` puts LoRA adapters
+on the trained blocks instead, with the pooling head and final norms still trained fully. Defaults: schedule-free
+AdamW at 1e-5 with 500 warm-up steps (`adamw` with cosine decay is there for comparison), clipping at norm 1, bf16
+autocast with FP32 trained parameters, and frozen ones stored in bf16. `optim.micro_batch` turns on GradCache; it
+must divide the batch size, and evaluation runs in batches of the same size, so every pass has the same shape.
+`model.compile` compiles the towers' forward passes: on an RTX 4080-class GPU dedupe steps are 12-14% faster and
+search steps 5%, for 0.7 GiB more memory and one to three minutes of compiling, once each for training, GradCache's
+gradient-free pass and evaluation (timm's NaFlex tower still breaks into several graphs). The
+logit scale and bias start from the checkpoint's (search) or SigLIP's initial log 10 and -10 (dedupe: image-image
+similarities are distributed differently from image-text ones) and are learned at their own rate.
+
+A run directory holds the settings it started with, the pack it is bound to (settings, image count and a hash of the
+keys), the checkpoints and the TensorBoard logs (`tensorboard --logdir RUN_DIR`; TensorBoard 2.21 or later, since
+earlier versions need the `pkg_resources` that current setuptools no longer ships). A checkpoint holds the trained
+parameters only, the optimizer state and the position in the data, `(epoch, batch)`: since batches follow from the
+seed and the images, nothing else is needed to continue. Checkpoints are written whole or not at all, every
+`checkpoint.every_steps` steps or `every_minutes` minutes, on Ctrl-C (after the current step) and at the end; the
+newest three are kept. A failure to load a batch (an unreachable pack, after a read has been retried for seven
+seconds) also writes a checkpoint before it ends the run. A step with a non-finite loss or gradient is skipped; ten
+in a row end the run without one. A continued run takes `--config` only for what does not change its results:
+workers, intervals, the pack's path, and `run.steps` with the schedule-free optimizer, whose lack of a schedule makes
+training longer just more steps. Different settings or a different pack are refused; a new run can start from
+another one's weights with `model.init_from`, which must stay in place, since continuing and exporting rebuild the
+frozen weights from it (as from the image tower's Hugging Face repository at `model.image_revision`). One `run` at a
+time trains in a run directory. Continuing is not bit-exact: GPU reductions in attention and matrix products are not deterministic,
+so two uninterrupted runs already differ in the third or fourth digit of the loss after a step or two, and a
+continued run differs from an uninterrupted one by as much.
+
+Evaluation runs on the evaluation weights of schedule-free AdamW, over `eval.images` held-out images whose captions
+and views are fixed across runs: made with the default caption and augmentation settings, whatever a run trains with,
+so runs are compared on the same task. It logs the loss over the whole set, recall at 1 and 5 in both directions (a hit is
+any positive: for search, any image with all of the caption's tags) and, for a dedupe tower's judgement, the cosine
+of the positive pairs (mean and 5th percentile) against that of the hardest negative per image (mean and 95th
+percentile). The real duplicate groups of a deduplicated library are the validation still to add.
+
+`export` writes a checkpoint's evaluation weights in FP32 with LoRA merged, as safetensors: `image.*` in timm's
+layout, for the search route `text.*` in `TextTower`'s, `logit_scale` and `logit_bias`, and a name in the metadata.
+The name identifies the model the way a timm model ID does: a database is bound to it, so a test version needs a
+name of its own. The deduper cannot load an export yet.
 
 ## Text side: token limits
 
@@ -175,8 +224,6 @@ about 500 search or 340 dedupe samples per second, against the 7-15 per second t
 * **Mix in natural language**: for a fraction of steps use a VLM-generated sentence instead of the tag list.
   Re-captioning is a documented gain for retrieval and keeps the text tower from only understanding comma lists.
 * Deduplicate the training set with this tool first; near-duplicate pairs with different tags remain false negatives.
-* `dataset_preprocessing.py` (which splits long tag lists into several rows, each a false negative of the others) is
-  superseded by the batches above and goes away with the transformers training script.
 
 ## Existing resources
 
@@ -193,6 +240,5 @@ about 500 search or 340 dedupe samples per second, against the 7-15 per second t
 
 1. Run the deduper with DanbooruCLIP and with the default SigLIP2 on the same library and compare the distance
    distributions of known duplicate groups vs same-character pairs. This decides how much tag fine-tuning hurts.
-2. Dedupe route: build the variant-augmentation dataset from the library, fine-tune with LoRA first, measure the
-   variant/different gap on held-out groups.
+2. Dedupe route: fine-tune on the pack, measure the variant/different gap on held-out duplicate groups.
 3. Search route: train with the text tower frozen first.

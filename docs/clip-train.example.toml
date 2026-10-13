@@ -1,0 +1,77 @@
+# Settings for `clip-train run RUN_DIR --config FILE`, at their defaults except data.pack.
+# Every key is optional; see docs/training-clip.md, "Training runs".
+
+[run]
+route = "dedupe"            # dedupe (image tower, two views per image) | search (images and captions)
+seed = 0
+steps = 10000               # optimizer steps
+log_every = 10              # steps per TensorBoard point
+
+[data]
+pack = "/path/to/pack"
+holdout = 0.01              # share of the images kept out of training
+seq_len = 1024              # patches per image, as the deduper encodes
+batch_size = 256            # samples the loss sees per step
+workers = 8
+prefetch = 2                # batches per worker in shared memory (dedupe: ~400 MB per 256 pairs)
+
+[data.captions]             # search route
+exclude = ["training"]      # tag categories left out of captions
+alpha = 0.5                 # tag weight (images with the tag + k) ^ -alpha
+k = 100.0
+uniform = 0.0               # share of uniform weight mixed in
+min_count = 10              # rarer tags are never a caption's only tag
+shuffle = 0.5               # share of captions in random order
+context = 64
+
+[data.augment]              # dedupe route
+probability = 0.8           # each view altered
+min_scale = 0.3             # smallest downscale, relative to the model's input size
+recompress = 0.7
+quality = [50, 95]
+webp = 0.3                  # share of re-compressions as lossy WebP instead of JPEG
+crop = 0.05
+max_crop = 0.04
+
+[model]
+image_tower = "naflexvit_so400m_patch16_siglip.v2_webli"
+image_revision = "e8d786c5ea9db8d0153b18a6a39114bf65ba28b0"  # "": the newest
+text_repo = "google/siglip2-so400m-patch16-naflex"
+text_revision = "cc24074f717b612951c2dead130904ab9b65a81e"
+train = "image"             # search route: image | text | both
+freeze_blocks = 0           # the patch embedding and the lowest N of the image tower's 27 blocks
+freeze_text_layers = 0      # the embeddings and the lowest N of the text tower's 27 layers
+train_token_embedding = false
+grad_checkpointing = true
+compile = false             # torch.compile: 5-14% faster steps after minutes of compiling
+precision = "bf16"          # bf16 | fp16 | fp32 autocast; trained parameters stay FP32
+init_from = ""              # a `clip-train export` file to start from
+
+# [model.lora]              # LoRA on the trained blocks instead of training them fully
+# rank = 16
+# alpha = 16.0
+
+[loss]
+# scale = 2.302585          # log of the logit scale; default: the checkpoint's (search) or log(10) (dedupe)
+# bias = -10.0              # default: the checkpoint's (search) or -10 (dedupe)
+learn_scale_bias = true
+
+[optim]
+name = "schedulefree_adamw" # schedulefree_adamw | adamw (warm-up, then cosine decay over run.steps)
+lr = 1e-5
+lr_scale_bias = 1e-3
+betas = [0.9, 0.999]
+weight_decay = 0.0          # on weight matrices only, not embeddings
+warmup_steps = 500
+max_grad_norm = 1.0         # 0: no clipping
+micro_batch = 0             # GradCache micro-batch, a divisor of data.batch_size; 0: the whole batch in one pass
+
+[eval]
+every_steps = 1000          # 0: never
+images = 1024               # held-out images evaluated, in batches of optim.micro_batch (or data.batch_size)
+at_start = true
+
+[checkpoint]
+every_steps = 1000          # 0: never
+every_minutes = 30.0        # 0: never
+keep_last = 3               # 0: keep all

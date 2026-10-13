@@ -15,8 +15,8 @@ dependencies = [
     "pillow",
     "safetensors",
     "timm",
-    "torch",
-    "torchvision",
+    "torch>=2.10",
+    "torchvision>=0.25",
     "tqdm",
 ]
 
@@ -28,19 +28,11 @@ gui = ["PySide6>=6.7", "tokenizers"]
 repair = ["einops", "hydra-core", "iopath", "setuptools"]
 # Formatting: Black and isort, configured below.
 dev = ["black", "isort"]
-# Dataset preprocessing and CLIP fine-tuning scripts (src/clip_training), not needed for deduplication.
+# CLIP fine-tuning scripts (src/clip_training), not needed for deduplication.
 training = [
-    "accelerate",
-    "datasets",
-    "jsonlines",
-    "prodigy-plus-schedule-free",
-    "prodigyopt",
-    "reflink",
-    "rich",
-    "safetensors",
-    "tensorboard",
+    "schedulefree",
+    "tensorboard>=2.21",
     "tokenizers",
-    "transformers",
 ]
 
 [project.scripts]
@@ -49,10 +41,10 @@ picurate-curate = "picurate.curate.app:main"
 picurate-tag = "picurate.tagger.cli:main"
 picurate-project = "picurate.project.cli:main"
 picurate-dataset-editor = "picurate.dataset_editor.app:main"
-clip-dataset-preprocess = "clip_training.dataset_preprocessing:main"
 clip-train-bench = "clip_training.bench_train:main"
 clip-pack = "clip_training.pack:main"
 clip-data = "clip_training.data:main"
+clip-train = "clip_training.train:main"
 
 [build-system]
 requires = ["setuptools>=77"]

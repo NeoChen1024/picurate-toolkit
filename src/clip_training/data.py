@@ -4,8 +4,8 @@ The same seed and the same images give the same batches, bit for bit: in every r
 same dataset (images are numbered in key order, not in the order parallel encoding stored them), at any number of
 loader workers, and when resuming mid-epoch. Each sample is drawn from a generator seeded by ``(seed, epoch, a hash
 of the image's key)``, an epoch's order by ``(seed, epoch)``. What it rests on outside this module: libwebp decoding
-the same pixels, Pillow resizing and libjpeg/libwebp compressing alike (their versions), and numpy's generators. Images reach the model as SigLIP2 NaFlex input, exactly as
-the deduper preprocesses them (aspect ratio kept, bicubic resize to at most ``seq_len`` 16x16 patches), but as uint8
+the same pixels, Pillow resizing and libjpeg/libwebp compressing alike (their versions), and numpy's generators.
+Images reach the model as SigLIP2 NaFlex input, exactly as the deduper preprocesses them (aspect ratio kept, bicubic resize to at most ``seq_len`` 16x16 patches), but as uint8
 patches: :func:`to_device` normalizes them on the GPU, a quarter of the bytes of float32 over the bus.
 
 * ``search``: one image and a caption made up for it on the spot from its stored tags (:class:`CaptionMaker`).
@@ -23,6 +23,7 @@ import hashlib
 import io
 import math
 import os
+import signal
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -239,6 +240,8 @@ class CaptionMaker:
         """The caption of image ``i`` and its tags."""
         config = self.config
         tags = self.table.of(i)
+        if len(tags) == 0:
+            raise ValueError(f"image {i} has no tags to caption it with")
         tags = tags[self.allowed[tags]]
         if len(tags) == 0:
             tags = self.table.of(i)
@@ -319,14 +322,14 @@ class PackDataset(Dataset):
 class Collate:
     """Stacks samples into a batch: ``patches`` (uint8), ``patch_coord`` and ``patch_valid`` padded to ``seq_len``
     (dedupe: all first views, then all second views, as ``clip-train-bench`` takes them), ``labels``, ``index`` and,
-    for search, ``text`` (token IDs) and ``captions``."""
+    for search, ``text`` (token IDs), ``captions`` and ``caption_tags``."""
 
     seq_len: int = DEFAULT_SEQ_LEN
 
     def __call__(self, samples: list[dict]) -> dict:
         views = [sample["views"][k] for k in range(len(samples[0]["views"])) for sample in samples]
         patches = torch.zeros((len(views), self.seq_len, PATCH * PATCH * 3), dtype=torch.uint8)
-        coords = torch.zeros((len(views), self.seq_len, 2), dtype=torch.int64)
+        coords = torch.zeros((len(views), self.seq_len, 2), dtype=torch.int16)  # int64 on the GPU
         valid = torch.zeros((len(views), self.seq_len), dtype=torch.bool)
         for row, (p, c) in enumerate(views):
             patches[row, : len(p)] = torch.from_numpy(p)
@@ -347,6 +350,7 @@ class Collate:
                 wanted = sample["caption_tags"].tolist()
                 labels[:, j] |= [all(tag in tags for tag in wanted) for tags in image_tags]
             batch["text"] = torch.stack([sample["text"] for sample in samples])
+            batch["caption_tags"] = [sample["caption_tags"] for sample in samples]
             batch["captions"] = [sample["caption"] for sample in samples]
         batch["labels"] = torch.from_numpy(labels)
         return batch
@@ -372,9 +376,10 @@ class EpochBatchSampler(Sampler):
             yield [(self.epoch, int(i)) for i in order[b * self.batch_size : (b + 1) * self.batch_size]]
 
 
-def make_loader(dataset: PackDataset, sampler: EpochBatchSampler, workers: int, prefetch: int = 4) -> DataLoader:
+def make_loader(dataset: PackDataset, sampler: EpochBatchSampler, workers: int, prefetch: int = 2) -> DataLoader:
     """A loader over forked workers (they share the tag table instead of unpickling a copy each), pinned for
-    asynchronous copies to the GPU."""
+    asynchronous copies to the GPU. Workers ignore Ctrl-C, which is the training loop's to handle. Up to ``workers *
+    prefetch`` batches wait in shared memory (a dedupe batch of 256 at 1024 patches is about 400 MB)."""
     return DataLoader(
         dataset,
         batch_sampler=sampler,
@@ -384,16 +389,22 @@ def make_loader(dataset: PackDataset, sampler: EpochBatchSampler, workers: int, 
         persistent_workers=workers > 0,
         prefetch_factor=prefetch if workers else None,
         multiprocessing_context="fork" if workers else None,
+        worker_init_fn=ignore_interrupt,
     )
 
 
+def ignore_interrupt(_worker: int) -> None:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
 def to_device(batch: dict, device, dtype: torch.dtype = torch.bfloat16) -> dict:
-    """The image tower's input on ``device``: patches normalized to [-1, 1] (SigLIP's mean and std of 0.5)."""
+    """The image tower's input on ``device``: patches normalized to [-1, 1] (SigLIP's mean and std of 0.5). The
+    subtraction is exact in bf16 and fp16, so the division is the only rounding, as when normalizing in FP32 first."""
     pin = batch["patches"].is_pinned()
-    patches = batch["patches"].to(device, non_blocking=pin).to(dtype).div_(127.5).sub_(1.0)
+    patches = batch["patches"].to(device, non_blocking=pin).to(dtype).sub_(127.5).div_(127.5)
     return {
         "patches": patches,
-        "patch_coord": batch["patch_coord"].to(device, non_blocking=pin),
+        "patch_coord": batch["patch_coord"].to(device, non_blocking=pin).long(),
         "patch_valid": batch["patch_valid"].to(device, non_blocking=pin),
     }
 
