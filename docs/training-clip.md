@@ -1,8 +1,8 @@
 # Fine-tuning CLIP/SigLIP for anime images
 
-Working notes for the scripts under `src/clip_training`. Nothing here is implemented yet beyond the dataset
-preprocessing stub and a training-step benchmark; this records what was researched and decided so the
-implementation does not have to rediscover it.
+Working notes for the scripts under `src/clip_training`: what was researched and decided, and the parts that exist so
+far: a training-step benchmark (`clip-train-bench`), image packs (`clip-pack`) and the training batches made from
+them (`clip-data`). The training loop itself is not written yet.
 
 ## Two routes, not one
 
@@ -13,13 +13,13 @@ character in the same pose just as much (bad: the 0.1 threshold works today prec
 sensitive to the details tags do not describe). So:
 
 1. **Dedupe route** (image tower only, no captions). Self-supervised image-image fine-tuning, SimCLR/DINO style, where
-   the positives are the variants the deduper should merge: JPEG re-saves at several qualities, downscales, WebP/AVIF
-   re-encodes, small crops and borders, watermarks and signatures, mild colour/levels edits. Negatives are other
-   images. The 75-token problem does not exist on this route. Use the real duplicate groups the current deduper finds
+   the positives are the variants the deduper should merge; negatives are other images. Duplicates met in practice
+   are mostly the same picture at another, not integer-related resolution, compressed again; crops and watermarks are
+   rarer. The 75-token problem does not exist on this route. Use the real duplicate groups the current deduper finds
    (and the near misses between 0.1 and ~1) as a validation set: the goal is a bigger gap between "variant" and
    "different picture", not a smaller absolute distance.
-2. **Search route** (both towers). Image-text alignment on tags and captions for anime semantic search. Everything in
-   the "Dataset" section below is about this route.
+2. **Search route** (both towers). Image-text alignment on tags and captions for anime semantic search. Its captions
+   are described under "Training batches" below.
 
 The two routes produce two independent models. Both start from the same SigLIP2 so400m checkpoint, but neither
 fine-tune has to preserve the other's behaviour: the dedupe tower is free to drift from the text alignment, and the
@@ -90,6 +90,73 @@ step's, because the second micro-batch's forward holds autocast's bf16 weight co
 exist (full image tower: 7.35 GiB against 6.51; in FP32, without those copies, 6.84 against 6.56), so the full tower
 does not fit 7 GiB with it either.
 
+## Image packs
+
+Training reads images from a pack, not from the dataset directory: `clip-pack` decodes every image once, makes it
+upright RGB on white, downscales it with Lanczos to at most 524,288 pixels (twice the 1024-patch budget, room for
+augmentation) and stores it as lossless WebP, back to back in 16 GiB shards with an SQLite index (key, location,
+size, BLAKE3, and each image's tags with their categories). One image is one `pread`, which suits a network share. A
+truncated or undecodable source is reported and skipped; an interrupted import is run again and resumes. `verify`
+checks every stored image against its BLAKE3 and decodes it; `info` prints the totals.
+
+On Danbooru images a pack takes about 365 KiB and 5.9 bit/px per image (500 kpx on average), around 300 GiB for the
+860k images of cagliostrolab-860k-ordered.
+
+### cagliostrolab-860k-ordered
+
+The dataset is image/caption pairs (`danbooru_<post>_<md5>.{jpg,png,webp}` and a `.txt`) imported in stages, the
+top level and `continued/`; the stages are merged, a post being keyed by its file stem. Anime frames under
+`continued/screencap/<series>/<character>/` are keyed by that path without `continued/`; the same frame filed under
+two characters becomes two records with identical bytes. A caption reads
+
+    1girl, <characters>, <copyrights>, <artists>, ||| <rating>, [nsfw,] <general tags>, <year>, <meta>, <quality>, <aesthetic>
+
+and its tags are stored in that order, without the `|||`. Categories come from the post list JSON that comes with the
+dataset, converted once into a tag database (`clip-pack cagliostro-tags JSON OUTPUT`; 861k posts and 204k tags,
+each tag in one category without conflicts). The words the dataset adds for conditioning (the rating word, `nsfw`,
+year ranges, quality and aesthetic words) get the category `training`; tags the database lacks are `name` before the
+`|||` and `general` after it.
+
+    clip-pack check-cagliostro DATASET [--no-decode] > problems.txt
+    clip-pack cagliostro-tags DATASET-tags.json tags.sqlite
+    clip-pack import-cagliostro PACK DATASET --categories tags.sqlite
+
+The MD5 in a file name is the original post's, and about 60% of the PNGs (and a few hundred JPEG and WebP files) no
+longer match it: the dataset's makers saved them again. A mismatch alone is therefore not damage; such an image is
+decoded completely and accepted if that works, which for PNG's checksums is a real integrity check. Expect about 45
+images that fail: JPEGs cut off at a whole number of MiB and a few originals that never decoded. `--settle` (300 s)
+skips files modified in the last minutes, which tar is still writing while an archive is being extracted.
+
+## Training batches
+
+`src/clip_training/data.py` turns a pack into batches for either route. The same seed and the same images give the
+same batches bit for bit: from any pack built from the same dataset (images are numbered in key order, not in the
+order parallel encoding stored them), at any number of loader workers, and when resuming mid-epoch. Each sample is
+drawn from a generator seeded by the seed, the epoch and a hash of the image's key; outside the code, this rests on
+the versions of Pillow, libwebp, libjpeg and numpy. Images go to the model as uint8 patches, preprocessed exactly as
+the deduper does (aspect ratio kept, bicubic, at most `--seq-len` patches; checked identical to timm's transform) and
+normalized on the GPU. The held-out split hashes the keys, the smallest key of a group of identical images deciding
+for the group, so it depends neither on the seed nor on the stored bytes.
+
+* **search**: the image and a caption made up from its tags at every step. It takes `L` of the image's tags, `L`
+  log-uniform between one and all of them, up to 64 tokens. Tags are drawn with weight `(images with the tag + k) ^
+  -alpha` (k = 100, alpha = 0.5), optionally mixed with a uniform share: common tags appear less often, and k keeps
+  tags seen once or twice from crowding every caption they can be in. A tag on fewer than 10 images is never a
+  caption's only tag. `training` tags are left out. The order is the source order (names first) or shuffled, half
+  and half. On this dataset the median caption has 6 tags and 20 tokens; 19% have one tag and 15% fill 60 tokens or
+  more.
+* **dedupe**: two views per image, each altered with probability 0.8: scaled down to a factor between 0.3 and 1 of
+  the model's input size with one of five filters, saved again as JPEG (quality 50-95, 4:2:0 or 4:4:4) or lossy WebP
+  70% of the time, both in random order, and cropped by up to 4% per side 5% of the time.
+
+The loss gets a matrix of positives instead of the identity: a caption also matches every other image in the batch
+that has all its tags (a one-tag caption like `blue eyes` matches many), and identical images match each other. In
+batches of 64 captions there are about 45 such extra positives.
+
+`clip-data sample PACK [--route dedupe] [--out DIR]` prints a batch's captions and positives and can save what the
+model sees as PNG; `clip-data bench PACK -j N` times the loader. Eight workers of a 16-thread desktop CPU deliver
+about 500 search or 340 dedupe samples per second, against the 7-15 per second the GPU trains.
+
 ## Text side: token limits
 
 * The SigLIP/SigLIP2 text tower takes **64 tokens**, padded to max length as trained; the classic CLIP tower takes
@@ -103,30 +170,13 @@ does not fit 7 GiB with it either.
   positions) only applies to the CLIP architecture, needs its own fine-tune, and is overkill for tag lists, which are
   unordered sets. Prefer the sampling approach below.
 
-## Dataset handling
+## Captions still to do
 
-The current `dataset_preprocessing.py` splits an over-long tag list into several `(image, chunk)` rows. Two problems:
-
-1. **False negatives.** Two chunks of the same image in one batch are treated as negatives by the contrastive loss.
-2. **Partial descriptions.** Each chunk describes part of the image; the model learns "some tags ↔ whole image",
-   which is no better than a random subset.
-
-Planned replacement: preprocessing only cleans and categorises; the caption is assembled per training step.
-
-* **Categorise tags** using Danbooru's categories: artist, copyright, character, general, meta, rating.
-  * Drop meta tags (`highres`, `absurdres`, `commentary_request`, `bad_id`, `translated`, ...): they describe the
-    file, not the picture.
-  * Keep artist tags only when the artist has enough samples to learn a style from; otherwise they are noise.
-* **Priority fill per step**: character and copyright always, rating, then general tags sampled at random until the
-  token budget is full. Different subset and order every epoch: this is tag dropout plus shuffle, and it doubles as
-  augmentation.
-* **Frequency filtering**: drop general tags below N occurrences in the dataset (unlearnable); down-weight the
-  near-universal ones (`1girl`, `solo`, `looking at viewer`) so captions do not all start the same way.
 * **Mix in natural language**: for a fraction of steps use a VLM-generated sentence instead of the tag list.
   Re-captioning is a documented gain for retrieval and keeps the text tower from only understanding comma lists.
-* **Count tokens on the assembled string**, once, with the real tokenizer. The current script tokenises each tag
-  separately and counts BOS/EOS every time, which over-counts by two per tag.
-* Deduplicate the training set with this tool first; near-duplicate pairs across batches are false negatives too.
+* Deduplicate the training set with this tool first; near-duplicate pairs with different tags remain false negatives.
+* `dataset_preprocessing.py` (which splits long tag lists into several rows, each a false negative of the others) is
+  superseded by the batches above and goes away with the transformers training script.
 
 ## Existing resources
 
@@ -145,4 +195,4 @@ Planned replacement: preprocessing only cleans and categorises; the caption is a
    distributions of known duplicate groups vs same-character pairs. This decides how much tag fine-tuning hurts.
 2. Dedupe route: build the variant-augmentation dataset from the library, fine-tune with LoRA first, measure the
    variant/different gap on held-out groups.
-3. Search route: rewrite dataset preprocessing as described, then train with the text tower frozen first.
+3. Search route: train with the text tower frozen first.

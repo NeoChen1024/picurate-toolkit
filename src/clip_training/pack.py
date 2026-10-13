@@ -207,18 +207,19 @@ class PackWriter:
 
 
 class Pack:
-    """Random access to a pack. Picklable, and safe in forked worker processes: files and the index connection are
-    opened per process on first use."""
+    """Random access to a pack, image ``i`` being the ``i``-th key in byte order: two packs of the same images number
+    them alike, whatever order parallel encoding stored them in. Picklable, and safe in forked worker processes: files
+    and the index connection are opened per process on first use."""
 
     def __init__(self, directory):
         self.directory = Path(directory)
-        conn = self._connect()
+        conn = self.connect()
         try:
             meta = dict(conn.execute("SELECT key, value FROM meta"))
             if meta.get("schema_version") != SCHEMA_VERSION or meta.get("format") != FORMAT:
                 raise ValueError(f"{self.directory} is not a pack this version reads: {meta}")
             self.meta = meta
-            rows = conn.execute("SELECT id, key, shard, offset, length, width, height FROM images ORDER BY id").fetchall()
+            rows = conn.execute("SELECT id, key, shard, offset, length, width, height FROM images ORDER BY key").fetchall()
         finally:
             conn.close()
         self.ids = np.array([r[0] for r in rows], dtype=np.int64)
@@ -228,14 +229,14 @@ class Pack:
         )
         self._pid = None
 
-    def _connect(self) -> sqlite3.Connection:
+    def connect(self) -> sqlite3.Connection:
         return sqlite3.connect(f"{(self.directory / INDEX).resolve().as_uri()}?mode=ro", uri=True, check_same_thread=False)
 
     def _local(self) -> None:
         if self._pid != os.getpid():
             self._pid = os.getpid()
             self._files: dict[int, int] = {}
-            self._conn = self._connect()
+            self._conn = self.connect()
 
     def __getstate__(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if k not in ("_files", "_conn", "_pid")} | {"_pid": None}
@@ -487,29 +488,46 @@ def info(pack_dir):
     click.echo(f"Settings: {pack.meta}")
 
 
-@main.command()
-@click.argument("pack_dir", type=click.Path(exists=True, file_okay=False))
-@click.option("--decode/--no-decode", default=True, show_default=True, help="Also decode every image.")
-def verify(pack_dir, decode):
-    """Read every image of the pack at PACK_DIR and check it against its BLAKE3 (and that it decodes)."""
-    pack = Pack(pack_dir)
-    bad = 0
-    for i in tqdm(range(len(pack)), unit="img", desc="Verifying"):
-        data = pack.read(i)
-        problem = None
-        if blake3(data).digest() != pack.digest(i):
-            problem = "checksum mismatch"
-        elif decode:
-            try:
+_packs: dict[str, Pack] = {}
+
+
+def check_images(pack_dir: str, indices: list[int], decode: bool) -> list[tuple[int, str]]:
+    """Worker: ``(index, problem)`` for the images of ``indices`` that do not match their BLAKE3 or (``decode``) do not
+    decode to their indexed size. The pack is opened once per process."""
+    pack = _packs.get(pack_dir) or _packs.setdefault(pack_dir, Pack(pack_dir))
+    problems = []
+    for i in indices:
+        try:
+            data = pack.read(i)
+            if blake3(data).digest() != pack.digest(i):
+                problems.append((i, "checksum mismatch"))
+            elif decode:
                 with PIL.Image.open(io.BytesIO(data)) as image:
                     image.load()
                     if image.size != (pack.widths[i], pack.heights[i]):
-                        problem = f"size {image.size} differs from the index"
-            except Exception as error:  # noqa: BLE001 - reported per image
-                problem = str(error)
-        if problem:
-            bad += 1
-            logger.error("%s: %s", pack.keys[i], problem)
+                        problems.append((i, f"size {image.size} differs from the index"))
+        except Exception as error:  # noqa: BLE001 - reported per image
+            problems.append((i, str(error)))
+    return problems
+
+
+@main.command()
+@click.argument("pack_dir", type=click.Path(exists=True, file_okay=False))
+@click.option("--decode/--no-decode", default=True, show_default=True, help="Also decode every image.")
+@click.option("--workers", "-j", type=click.IntRange(1), default=os.cpu_count(), show_default=True, help="Checking processes.")
+def verify(pack_dir, decode, workers):
+    """Read every image of the pack at PACK_DIR and check it against its BLAKE3 (and that it decodes)."""
+    pack = Pack(pack_dir)
+    # In storage order, so every process reads its shard stretch by stretch.
+    order = np.lexsort((pack.offsets, pack.shards)).tolist()
+    jobs = ((pack_dir, order[start : start + 256], decode) for start in range(0, len(order), 256))
+    bad = 0
+    with tqdm(total=len(pack), unit="img", desc="Verifying") as progress:
+        for (_, indices, _), problems in bounded_map(check_images, jobs, workers):
+            for i, problem in problems:
+                logger.error("%s: %s", pack.keys[i], problem)
+            bad += len(problems)
+            progress.update(len(indices))
     if bad:
         raise click.ClickException(f"{bad} of {len(pack)} images are damaged")
     click.echo(f"All {len(pack)} images are intact", err=True)
