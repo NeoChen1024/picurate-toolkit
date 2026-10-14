@@ -190,6 +190,9 @@ class DuplicatesTab(QWidget):
         self.member_list.setIconSize(QSize(*THUMB))
         self.member_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.member_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # Long paths keep both ends: the end is what tells same-named files from different sources apart.
+        self.member_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.member_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.member_list.itemChanged.connect(self._member_checked)
         self.member_list.itemClicked.connect(self._member_clicked)
         layout.addWidget(self.member_list, 1)
@@ -394,7 +397,9 @@ class DuplicatesTab(QWidget):
         m = self.members[i]
         tag = "A" if i == self.a else "B" if i == self.b else " "
         dist = "" if m.distance_to_winner is None else f" · d={m.distance_to_winner:.3f}"
-        text = f"{i + 1} [{tag}] {m.path}\n{m.width}×{m.height} · {m.format} · {humanize.naturalsize(m.size, binary=True)}{dist}"
+        size = humanize.naturalsize(m.size, binary=True)
+        source = self.roots.get(m.source_id, "?")
+        text = f"{i + 1} [{tag}] {m.path}\nin {source}\n{m.width}×{m.height} · {m.format} · {size}{dist}"
         return text + self.exclusion_marks.get(m.item, "")
 
     def _exclusion_marks(self) -> dict[bytes, str]:
@@ -436,6 +441,7 @@ class DuplicatesTab(QWidget):
             item.setFlags(Qt.ItemFlag.ItemIsEnabled | (Qt.ItemFlag(0) if stale else Qt.ItemFlag.ItemIsUserCheckable))
             item.setCheckState(Qt.CheckState.Checked if m.keep else Qt.CheckState.Unchecked)
             item.setData(Qt.ItemDataRole.UserRole, i)
+            item.setToolTip(m.file(self.roots))
             pix = self.thumbs.get(m.file(self.roots))
             if pix is not None:
                 item.setIcon(QIcon(pix))
@@ -657,6 +663,11 @@ class DuplicatesTab(QWidget):
         if self.members:
             self._decide(keeps={m.item: i == self.a for i, m in enumerate(self.members)})
 
+    def keep_all(self) -> None:
+        """Not duplicates after all: keep every member (Ctrl+A), which also takes back a discard."""
+        if self.members:
+            self._decide(keeps={m.item: True for m in self.members})
+
     def _policy_chosen(self, name: str) -> None:
         if name in self.policies:
             self.policy = self.policies[name]
@@ -775,6 +786,9 @@ class DuplicatesTab(QWidget):
             if not event.isAutoRepeat():
                 self.canvas.set_flipped(event.type() == QEvent.Type.KeyPress)
             return True
+        if event.type() == QEvent.Type.KeyPress and key == Qt.Key.Key_A and mods == Qt.KeyboardModifier.ControlModifier:
+            self.keep_all()
+            return True
         if event.type() != QEvent.Type.KeyPress or not plain:
             return super().eventFilter(obj, event)
         if key == Qt.Key.Key_Z:
@@ -857,7 +871,7 @@ _SHIFTED_DIGITS = {
 
 HELP_HTML = """
 <h2>Keyboard Shortcuts</h2>
-<p>Single letters are ignored while the note field has focus; Esc returns to the canvas.</p>
+<p>Single letters and Ctrl+A are ignored while the note field has focus; Esc returns to the canvas.</p>
 <p>A group marked <b>≈</b> passed the pixel check: every pair differs by lossy compression only, so it starts decided.
 The member panel shows each pair's result (≈ or ≠ and the largest local difference). The Show box can list only
 those groups, or only the ones with pixel differences.</p>
@@ -884,6 +898,7 @@ Show → keeps nothing / discarded lists either kind.</p>
 <tr><td><b>Shift+1-9</b></td><td>Show member n as B (Shift+click)</td></tr>
 <tr><td><b>K</b></td><td>Toggle keep on A</td></tr>
 <tr><td><b>Shift+K</b></td><td>Keep only A</td></tr>
+<tr><td><b>Ctrl+A</b></td><td>Keep every member (not duplicates after all); Enter then decides it</td></tr>
 <tr><td><b>P</b></td><td>Reset the keeps of <i>all pending groups</i> to the selected policy's choice (asks first)</td></tr>
 <tr><td><b>Shift+P</b></td><td>Reset this group's keeps to the policy's choice</td></tr>
 </table>

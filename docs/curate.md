@@ -18,9 +18,9 @@ project's review database, so a `dedupe` run waits until it is closed; the edito
 ## Duplicates
 
 Group list on the left (surest first, a status badge per row), two linked image views in the middle (side by side,
-flip while holding Space, or an amplified difference), members with thumbnails and keep checkboxes on the right.
-Groups that passed the pixel check are marked ≈; the Show box filters by status, by pixel result, and finds groups
-that keep nothing or are discarded. A group that took over the keeps of a group you had changed says so.
+flip while holding Space, or an amplified difference), members with thumbnails, source directories and keep
+checkboxes on the right. Groups that passed the pixel check are marked ≈; the Show box filters by status, by pixel
+result, and finds groups that keep nothing or are discarded. A group that took over the keeps of a group you had changed says so.
 
 The keys you need most (F1 lists all of them):
 
@@ -30,12 +30,13 @@ The keys you need most (F1 lists all of them):
 | 1-9, Shift+1-9 | show member n as A / as B |
 | Space (hold), D | flip A/B; cycle side by side → flip → diff |
 | K, Shift+K | toggle keep on A; keep only A |
+| Ctrl+A | keep every member (not duplicates after all) |
 | Enter | mark decided and go to the next pending group |
 | R | discard the whole group (every member is excluded); R again takes it back |
 | P, Shift+P | reset keeps of all pending groups / this group to the toolbar's policy |
 | U | undo the last change of this group |
 
-Single-letter keys never fire while a text field has focus. The window loads the next `--prefetch` groups (default
+Single-letter keys and Ctrl+A never fire while a text field has focus. The window loads the next `--prefetch` groups (default
 3) in the direction you are moving, diffs included in diff mode, so stepping through groups does not wait for the
 disk.
 

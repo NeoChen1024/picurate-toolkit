@@ -339,7 +339,8 @@ def dedupe(
 
     New and changed images are encoded into the project's embeddings.sqlite, and the groups go to its review.sqlite.
     Groups whose every pair differs by compression alone (with --no-pixel-check: lie within --threshold) start decided,
-    keeping the policy's winner; the others wait for review in picurate-curate. The images a decided group does not
+    keeping the policy's winner; the others, and groups holding several pages of one work (a policy's variants
+    pattern), wait for review in picurate-curate. The images a decided group does not
     keep count as excluded: the editor does not export them. Nothing is moved here. Images a person excluded take no part; run 'picurate-project sync' first to
     pick up new files. Needs picurate-curate to be closed.
     """

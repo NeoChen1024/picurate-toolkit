@@ -12,6 +12,11 @@
 #   { attr = "format",     order  = ["PNG", "JPEG", ...] }
 #                                                      categorical: rank by position in the list, unlisted last.
 #
+# A policy may also set variants = 'regex', searched in the basename, with named groups (?P<work>...) and
+# (?P<page>...). When a group holds different pages of one work, each page keeps its own best copy: files that do not
+# match go with the page they are closest to, and the criteria rank each page's copies separately. Such a group
+# starts pending, whatever the pixel check says.
+#
 # Users can add or override policies with --keeping-config my.toml, using the same [policy.<name>] layout.
 # Use single-quoted TOML strings for regexes so backslashes need no escaping.
 
@@ -42,7 +47,8 @@ criteria = [
 # folder, then prefer sources whose filenames carry the original post id (so the image can be traced back),
 # then fall back to quality.
 [policy.pic-dir]
-description = "Wallpaper folders first, then by source site (Pixiv > yande.re > Danbooru > Konachan), then quality."
+description = "Wallpaper folders first, then by source site (Pixiv > yande.re > Danbooru > Konachan), then quality; every page of a Pixiv work is kept."
+variants = '^(?P<work>[0-9]+)_p(?P<page>[0-9]+)\.'	# Pixiv: 12345678_p0.jpg and 12345678_p1.jpg are both kept
 criteria = [
     { attr = "dirname", match = 'Wallpaper' },
     { attr = "basename", match = [

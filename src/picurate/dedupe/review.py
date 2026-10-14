@@ -264,8 +264,9 @@ class ReviewDB:
         """Store the groups of one matching run.
 
         Each item is ``(member records, edges as (id_a, id_b, distance))``; ``pixel`` holds the pixel check of
-        every edge, or is ``None`` when the check is off. New groups get the policy's winner as the only kept member
-        and start as :func:`initial_status` says. Existing groups keep their decision; file metadata, edges and
+        every edge, or is ``None`` when the check is off. New groups keep what :meth:`Policy.keepers` picks (the
+        policy's winner, or one copy per page of a work) and start as :func:`initial_status` says; groups holding
+        several pages of one work start pending. Existing groups keep their decision; file metadata, edges and
         pixel results are refreshed, and an untouched group's status is re-derived. Groups not in this run that
         were still open are marked ``stale``.
         """
@@ -283,8 +284,9 @@ class ReviewDB:
             group_pixel = None if verdicts is None else ("same" if all(v.same for v in verdicts) else "different")
             if group_pixel == "same":
                 stats.pixel_same += 1
-            start = initial_status(dmax, group_pixel, auto_threshold)
-            winner = policy.select(records)
+            keepers = policy.keepers(records, edges)
+            # Different pages of one work keep a copy each, decided by a person: never a decision of matching.
+            start = "pending" if len(set(keepers.values())) > 1 else initial_status(dmax, group_pixel, auto_threshold)
             by_pair = {}
             for a, b, d in edges:
                 by_pair[(a, b)] = d
@@ -292,7 +294,7 @@ class ReviewDB:
             row = self.conn.execute("SELECT id, status, touched, carried_from FROM groups WHERE key = ?", (key,)).fetchone()
             if row is None:
                 status = start
-                keeps = {r.id: r is winner for r in records}
+                keeps = {r.id: keepers[r.id] == r.id for r in records}
                 carried = self._decided_before([r.id for r in records], seen)
                 if carried is not None:
                     carried, old_keeps = carried
@@ -323,7 +325,7 @@ class ReviewDB:
                             r.size,
                             r.format,
                             r.mtime,
-                            0.0 if r is winner else by_pair.get((r.id, winner.id)),
+                            0.0 if keepers[r.id] == r.id else by_pair.get((r.id, keepers[r.id])),
                         )
                         for r in records
                     ],
@@ -367,7 +369,7 @@ class ReviewDB:
                             r.size,
                             r.format,
                             r.mtime,
-                            0.0 if r is winner else by_pair.get((r.id, winner.id)),
+                            0.0 if keepers[r.id] == r.id else by_pair.get((r.id, keepers[r.id])),
                             gid,
                             r.id,
                         ),
@@ -606,11 +608,11 @@ class ReviewDB:
 
     def reset_to_policy(self, group_id: int, policy: Policy, *, touch: bool = True, commit: bool = True) -> None:
         members = self.members(group_id)
-        winner = policy.select([m.record for m in members])
-        self.decide(group_id, keeps={m.item: m.item == winner.id for m in members}, touch=touch, commit=commit)
+        keepers = policy.keepers([m.record for m in members], self.edges(group_id))
+        self.decide(group_id, keeps={m.item: keepers[m.item] == m.item for m in members}, touch=touch, commit=commit)
 
     def reset_pending_to_policy(self, policy: Policy) -> int:
-        """Set the keeps of every pending group to ``policy``'s winner (status unchanged, one history step each, not
+        """Set the keeps of every pending group to ``policy``'s choice (status unchanged, one history step each, not
         counted as reviewing the group), committed as one transaction. Returns the number of pending groups."""
         n = 0
         try:

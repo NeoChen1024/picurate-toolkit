@@ -57,6 +57,8 @@ picurate-curate has the project open; encoding does not hold that lock, but matc
 * Every other group starts *pending*, even one within `--threshold`: that is how artist revisions and pages of one
   pixiv set reach a human.
 * With `--no-pixel-check`, groups entirely within `--threshold` start decided instead.
+* Groups holding several pages of one work (the policy's [page variants](#keeping-policies)) start pending either way,
+  with a copy of each page kept.
 
 A looser `--review-threshold` answers "worth a human look", not "safe to merge"; it may well be looser than anything
 `calibrate` would suggest.
@@ -120,7 +122,7 @@ format, and regexes on the path). Duplicates are sorted by the criteria and the 
 | `newest` | latest mtime, then larger file |
 | `largest` | largest file, then newer |
 | `highest-quality` | most pixels, then PNG > TIFF > BMP > WebP > AVIF > JPEG > GIF, then larger file, then newer |
-| `pic-dir` | files in a `Wallpaper` folder, then by source site in the filename (Pixiv > yande.re > Danbooru > Konachan), then as `highest-quality` |
+| `pic-dir` | files in a `Wallpaper` folder, then by source site in the filename (Pixiv > yande.re > Danbooru > Konachan), then as `highest-quality`; one copy of every page of a Pixiv work |
 
 `pic-dir` encodes my own collection layout; it is there as an example of a site-specific policy. Add your own or
 override a built-in with `--keeping-config my.toml`:
@@ -135,6 +137,15 @@ criteria = [
 ```
 
 `policies.toml` documents the three criterion kinds (`prefer`, `match`, `order`).
+
+**Page variants.** A policy can also name the pages of one work by filename, as `pic-dir` does for Pixiv
+(`12345678_p0.jpg`, `12345678_p1.jpg`): `variants = '<regex>'`, searched in the basename, with the named groups
+`work` and `page`. A pixiv set that changes one expression is usually close enough to group, but every page is meant
+to stay. When a group holds at least two different pages of one work, each page keeps its own best copy. The other
+members (another work, a copy from another site, a file in a wallpaper folder) go with the page they are closest to
+along the group's pair distances, and the criteria rank each page's copies separately. Only the work ID and page
+number are compared: different works are never treated as pages of each other. Such a group always starts pending,
+since attaching the other copies to a page is a guess.
 
 ## How it works
 

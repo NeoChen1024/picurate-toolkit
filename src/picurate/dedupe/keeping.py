@@ -8,10 +8,11 @@ the schema.
 
 from __future__ import annotations
 
+import heapq
 import os
 import re
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from importlib import resources
 from typing import Any
@@ -92,6 +93,7 @@ class Policy:
     name: str
     criteria: tuple[Criterion, ...]
     description: str = ""
+    variants: re.Pattern[str] | None = None  # on the basename, with groups 'work' and 'page'
 
     @classmethod
     def from_dict(cls, name: str, raw: dict[str, Any]) -> Policy:
@@ -99,10 +101,22 @@ class Policy:
         criteria = raw.get("criteria")
         if not isinstance(criteria, list) or not criteria:
             raise PolicyError(f"{where}: 'criteria' must be a non-empty list")
+        unknown = set(raw) - {"criteria", "description", "variants"}
+        if unknown:
+            raise PolicyError(f"{where}: unknown keys {sorted(unknown)}")
+        variants = None
+        if "variants" in raw:
+            try:
+                variants = re.compile(raw["variants"])
+            except (re.error, TypeError) as e:
+                raise PolicyError(f"{where}: invalid regex in variants: {e}") from e
+            if not {"work", "page"} <= set(variants.groupindex):
+                raise PolicyError(f"{where}: variants needs the named groups (?P<work>...) and (?P<page>...)")
         return cls(
             name,
             tuple(Criterion.from_dict(c, f"{where}.criteria[{i}]") for i, c in enumerate(criteria)),
             str(raw.get("description", "")),
+            variants,
         )
 
     def sort(self, candidates: Sequence[ImageRecord]) -> list[ImageRecord]:
@@ -113,6 +127,57 @@ class Policy:
         if not candidates:
             raise ValueError("select() needs at least one candidate")
         return self.sort(candidates)[0]
+
+    def pages(self, candidates: Sequence[ImageRecord]) -> dict[bytes, tuple[str, str]]:
+        """``(work, page)`` of the candidates that are pages of a work with at least two different pages among them."""
+        if self.variants is None:
+            return {}
+        parsed = {}
+        for rec in candidates:
+            m = self.variants.search(os.path.basename(rec.path))
+            if m is not None:
+                parsed[rec.id] = (m["work"], m["page"])
+        works: dict[str, set[str]] = {}
+        for work, page in parsed.values():
+            works.setdefault(work, set()).add(page)
+        return {i: wp for i, wp in parsed.items() if len(works[wp[0]]) > 1}
+
+    def keepers(self, candidates: Sequence[ImageRecord], edges: Iterable[tuple[bytes, bytes, float]]) -> dict[bytes, bytes]:
+        """The kept candidate for each candidate, by ID. Without page variants that is :meth:`select`'s winner for
+        all. When the group holds different pages of one work, each page keeps its best copy: the other candidates
+        go with the page they are closest to along ``edges``, and each page's candidates are ranked separately."""
+        pages = self.pages(candidates)
+        if not pages:
+            winner = self.select(candidates).id
+            return {rec.id: winner for rec in candidates}
+        graph: dict[bytes, list[tuple[float, bytes]]] = {}
+        for a, b, d in edges:
+            graph.setdefault(a, []).append((d, b))
+            graph.setdefault(b, []).append((d, a))
+        # Multi-source shortest paths from the page files; ties go to the smaller page key.
+        label = dict(pages)
+        best = {i: 0.0 for i in pages}
+        heap = [(0.0, wp, i) for i, wp in pages.items()]
+        heapq.heapify(heap)
+        while heap:
+            d, wp, i = heapq.heappop(heap)
+            if d > best[i] or label[i] != wp:
+                continue
+            for w, j in graph.get(i, ()):
+                if j in pages:
+                    continue
+                if (d + w, wp) < (best.get(j, float("inf")), label.get(j, wp)):
+                    best[j] = d + w
+                    label[j] = wp
+                    heapq.heappush(heap, (d + w, wp, j))
+        split: dict[tuple[str, str] | None, list[ImageRecord]] = {}
+        for rec in candidates:
+            split.setdefault(label.get(rec.id), []).append(rec)  # None: not connected to any page
+        out = {}
+        for part in split.values():
+            winner = self.select(part).id
+            out.update((rec.id, winner) for rec in part)
+        return out
 
 
 def _parse(data: dict[str, Any], source: str) -> dict[str, Policy]:
