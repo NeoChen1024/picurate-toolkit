@@ -65,6 +65,7 @@ weight_decay = 0.0          # on weight matrices only, not embeddings
 warmup_steps = 500
 max_grad_norm = 1.0         # 0: no clipping
 micro_batch = 0             # GradCache micro-batch, a divisor of data.batch_size; 0: the whole batch in one pass
+offload = false             # FP32 weights and optimizer state in host memory, bf16 weights on the GPU; needs precision = bf16
 
 [eval]
 every_steps = 1000          # 0: never

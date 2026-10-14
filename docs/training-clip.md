@@ -34,8 +34,7 @@ search model is free to lose the detail sensitivity the deduper needs.
 * Memory budget for the full so400m image tower (~430M parameters), bf16 weights with fp32 master weights and AdamW
   states: roughly 0.9 + 1.7 + 3.4 GB ≈ 6 GB before activations. On an 8 GiB GPU that means at least one of:
   * activation checkpointing (cheap, always on);
-  * optimizer state offload to CPU (DeepSpeed ZeRO-Offload, or torch's own `fused` CPU AdamW on the offloaded
-    master copy) — the LLM-style trick that fits here, since the state is touched once per step;
+  * optimizer state offload to the host (`optim.offload`, below): the state is touched once per step;
   * freezing the text tower (search route) or the lower half of the image tower;
   * LoRA on attention projections with the base frozen, which also solves most of the forgetting problem.
 * Optimizer: [schedule_free](https://github.com/facebookresearch/schedule_free) AdamW. No schedule to tune and the
@@ -180,6 +179,16 @@ from general English and has further to move to tag captions, while the image to
 search route usually wants the text tower faster, which is smoother than freezing image blocks and combines with
 it. `optim.micro_batch` turns on GradCache; it
 must divide the batch size, and evaluation runs in batches of the same size, so every pass has the same shape.
+`optim.offload` keeps the FP32 weights and the optimizer state in pinned host memory and runs the optimizer step on
+the CPU, as ZeRO-Offload does: the GPU holds bf16 weights and FP32 gradient accumulators (the logit scale and bias
+stay FP32), 6 bytes per trained parameter instead of 16. Both towers trained with a micro-batch of 8 peak at 6.2
+GiB instead of 15.3, for about 2.5 s more per step (the schedule-free AdamW step over 840 M parameters on the
+CPU; the copies are a quarter of that), a cost per step, not per sample: a batch of 256 pays about 12%, a batch of
+64 a third. The loss follows the same trajectory (bf16 weights in the forward pass are what autocast computed with
+anyway). Checkpoints hold the FP32 weights either way, so a run can switch `offload` when continued. It is meant
+for 16 GiB GPUs, where the 16.9 GiB of weights, gradients and AdamW state of both towers do not fit at all, and for
+leaving a larger card's memory to the desktop; an 8 GiB card is better served by frozen blocks or LoRA, since it has
+neither the room for micro-batches beyond one or two nor the compute for an epoch in reasonable time.
 `model.compile` compiles the towers' forward passes: on an RTX 4080-class GPU dedupe steps are 12-14% faster and
 search steps 5%, for 0.7 GiB more memory and one to three minutes of compiling, once each for training, GradCache's
 gradient-free pass and evaluation (the position-embedding resampling, done per distinct patch grid in the batch,
@@ -196,7 +205,7 @@ seed and the images, nothing else is needed to continue. Checkpoints are written
 newest three are kept. A failure to load a batch (an unreachable pack, after a read has been retried for seven
 seconds) also writes a checkpoint before it ends the run. A step with a non-finite loss or gradient is skipped; ten
 in a row end the run without one. A continued run takes `--config` only for what does not change its results:
-workers, intervals, the pack's path, the attention layout, and `run.steps` with the schedule-free optimizer, whose lack of a schedule makes
+workers, intervals, the pack's path, the attention layout, `optim.offload`, and `run.steps` with the schedule-free optimizer, whose lack of a schedule makes
 training longer just more steps. Different settings or a different pack are refused; a new run can start from
 another one's weights with `model.init_from`, which must stay in place, since continuing and exporting rebuild the
 frozen weights from it (as from the checkpoint at `model.revision`). One `run` at a

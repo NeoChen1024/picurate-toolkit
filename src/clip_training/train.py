@@ -144,6 +144,7 @@ class OptimConfig:
     warmup_steps: int = 500
     max_grad_norm: float = 1.0  # 0: no clipping
     micro_batch: int = 0  # GradCache micro-batch, a divisor of data.batch_size; 0: the whole batch in one pass
+    offload: bool = False  # FP32 weights and optimizer state in host memory; the GPU holds bf16 weights and FP32 gradients
 
 
 @dataclass
@@ -207,6 +208,7 @@ class Config:
             ),
             (all(0 <= b < 1 for b in o.betas) and len(o.betas) == 2, "optim.betas must be two values in [0, 1)"),
             (o.warmup_steps >= 0 and o.max_grad_norm >= 0 and o.micro_batch >= 0, "optim values must not be negative"),
+            (not o.offload or m.precision == "bf16", "optim.offload needs model.precision = bf16"),
             (not o.micro_batch or d.batch_size % o.micro_batch == 0, "data.batch_size must be a multiple of optim.micro_batch"),
             (self.eval.every_steps >= 0 and self.eval.images >= 1, "eval.every_steps must not be negative, eval.images >= 1"),
             (
@@ -235,7 +237,7 @@ class Config:
     def mutable(self) -> set[str]:
         """Settings a continued run may change: they do not change what it computes."""
         keys = {"run.log_every", "data.pack", "data.workers", "data.prefetch", "eval.every_steps", "model.compile"}
-        keys.add("model.attention")
+        keys |= {"model.attention", "optim.offload"}
         keys |= {"checkpoint.every_steps", "checkpoint.every_minutes", "checkpoint.keep_last"}
         if self.optim.name == "schedulefree_adamw":
             keys.add("run.steps")
@@ -414,6 +416,64 @@ def _fsync(path: Path) -> None:
         os.close(fd)
 
 
+class Offload:
+    """FP32 master weights and the optimizer on pinned host memory, as ZeRO-Offload does on one GPU.
+
+    The model's trained parameters become bf16 on the GPU (0-d ones, the logit scale and bias, stay FP32); their
+    gradients, bf16 as autocast computes them, are added into FP32 accumulators on the GPU as they arrive, so
+    GradCache's micro-batches sum up in FP32 as without offload. A step copies the accumulators to the host, runs the
+    optimizer there and copies the masters back as bf16. The GPU is left with 2 bytes of weight and 4 of gradient
+    per parameter instead of 4 of weight, 4 of gradient and 8 of AdamW state.
+    """
+
+    def __init__(self, params: list[torch.Tensor], dtype: torch.dtype):
+        self.params = params
+        self.masters: list[torch.nn.Parameter] = []
+        self.grads: list[torch.Tensor] = []  # FP32 accumulators on the GPU
+        self.staging: list[torch.Tensor] = []  # pinned, in the GPU copy's dtype
+        self.index = {p: i for i, p in enumerate(params)}
+        for p in params:
+            master = torch.nn.Parameter(p.detach().to("cpu", torch.float32, copy=True).pin_memory())
+            master.grad = torch.zeros_like(master).pin_memory()
+            self.masters.append(master)
+            if p.ndim > 0:
+                p.data = p.data.to(dtype)
+            self.grads.append(torch.zeros(p.shape, dtype=torch.float32, device=p.device))
+            self.staging.append(torch.empty(p.shape, dtype=p.dtype, pin_memory=True))
+            p.register_post_accumulate_grad_hook(self._accumulate)
+
+    def _accumulate(self, p: torch.Tensor) -> None:
+        self.grads[self.index[p]].add_(p.grad)
+        p.grad = None
+
+    def master(self, p: torch.Tensor) -> torch.nn.Parameter:
+        return self.masters[self.index[p]]
+
+    def clip(self, limit: float) -> torch.Tensor:
+        """Clip the accumulated gradients to ``limit`` (0: no clipping); the total norm before clipping."""
+        norm = torch.nn.utils.get_total_norm(self.grads)
+        if limit > 0:
+            torch._foreach_mul_(self.grads, torch.clamp(limit / (norm + 1e-6), max=1.0))
+        return norm
+
+    def step(self, optimizer: torch.optim.Optimizer) -> None:
+        for master, grad in zip(self.masters, self.grads):
+            master.grad.copy_(grad, non_blocking=True)
+        torch.cuda.synchronize()
+        optimizer.step()
+        self.push()
+
+    def zero_grad(self) -> None:
+        torch._foreach_zero_(self.grads)
+
+    def push(self) -> None:
+        """Copy the master weights to the GPU (after a step, or after schedule-free AdamW swapped them)."""
+        for p, master, staging in zip(self.params, self.masters, self.staging):
+            staging.copy_(master)
+            p.data.copy_(staging, non_blocking=True)
+        torch.cuda.synchronize()
+
+
 class Trainer:
     def __init__(self, run_dir: Path, config: Config, pack: Pack, resume: Path | None):
         self.run_dir, self.config = run_dir, config
@@ -472,14 +532,14 @@ class Trainer:
         self.image_trained = any(p.requires_grad for p in self.model.image.parameters())
         self.text_trained = self.model.text is not None and any(p.requires_grad for p in self.model.text.parameters())
         self.names = {p: n for n, p in self.model.named_parameters() if p.requires_grad}
+        self.offload = Offload(self.params, self.dtype) if config.optim.offload else None
         self.optimizer, self.scheduler = self._optimizer()
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.dtype == torch.float16)
         self.step, self.epoch, self.batch = 0, 0, 0
         if resume is not None:
             self._load(resume)
         self.schedule_free = config.optim.name == "schedulefree_adamw"
-        if self.schedule_free:
-            self.optimizer.train()
+        self._weights("train")
         self.model.train()
         # Drops what an earlier attempt logged after the checkpoint continued from (all of it without one).
         self.writer = SummaryWriter(run_dir / "tensorboard", purge_step=self.step + 1 if resume else 0)
@@ -493,6 +553,18 @@ class Trainer:
         self._eval_loader: DataLoader | None = None
         self.stop = False
         self.skipped = 0  # consecutive steps with non-finite gradients
+
+    def _weights(self, mode: str) -> None:
+        """Switch schedule-free AdamW between its training and evaluation weights (nothing else has two sets), and
+        put the current ones on the GPU when they live on the host."""
+        if self.schedule_free:
+            getattr(self.optimizer, mode)()
+            if self.offload is not None:
+                self.offload.push()
+
+    def values(self) -> list[torch.Tensor]:
+        """The trained parameters' FP32 values, in ``self.params`` order."""
+        return self.offload.masters if self.offload is not None else self.params
 
     def _optimizer(self):
         """Parameter groups: each tower at its own learning rate (``lr`` for the image tower, ``lr_text`` for the text
@@ -517,6 +589,9 @@ class Trainer:
         groups.append({"params": scale_bias, "lr": o.lr_scale_bias, "weight_decay": 0.0, "name": "scale_bias"})
         groups = [g for g in groups if g["params"]]
         assert sum(len(g["params"]) for g in groups) == len(self.params), "every trained parameter in exactly one group"
+        if self.offload is not None:  # the optimizer updates the host masters
+            for g in groups:
+                g["params"] = [self.offload.master(p) for p in g["params"]]
         if o.name == "schedulefree_adamw":
             import schedulefree
 
@@ -577,15 +652,23 @@ class Trainer:
                     pa, pb = self._embed(batch, s, e, sides)
                 pairs = [(t.float(), g[s:e]) for t, g in ((pa, a.grad), (pb, b.grad)) if t is not None]
                 torch.autograd.backward([t for t, _ in pairs], [g for _, g in pairs])
-        self.scaler.unscale_(self.optimizer)
         limit = self.config.optim.max_grad_norm
-        norm = torch.nn.utils.clip_grad_norm_(self.params, limit if limit > 0 else float("inf"))
-        loss, norm = loss.item(), norm.item()
-        finite = math.isfinite(loss) and math.isfinite(norm)
-        if finite or self.scaler.is_enabled():
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        self.optimizer.zero_grad(set_to_none=True)
+        if self.offload is not None:
+            norm = self.offload.clip(limit)
+            loss, norm = loss.item(), norm.item()
+            finite = math.isfinite(loss) and math.isfinite(norm)
+            if finite:
+                self.offload.step(self.optimizer)
+            self.offload.zero_grad()
+        else:
+            self.scaler.unscale_(self.optimizer)
+            norm = torch.nn.utils.clip_grad_norm_(self.params, limit if limit > 0 else float("inf"))
+            loss, norm = loss.item(), norm.item()
+            finite = math.isfinite(loss) and math.isfinite(norm)
+            if finite or self.scaler.is_enabled():
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
         if self.scheduler is not None:
             self.scheduler.step()
         if finite or self.scaler.is_enabled():
@@ -604,8 +687,7 @@ class Trainer:
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
         """Metrics on the held-out images, with the evaluation weights."""
-        if self.schedule_free:
-            self.optimizer.eval()
+        self._weights("eval")
         self.model.eval()
         size, count = self.eval_batch, len(self.eval_indices)
         if self._eval_loader is None:
@@ -650,8 +732,7 @@ class Trainer:
             "hardest_negative_cos_p95": float(hardest.quantile(0.95)),
         }
         self.model.train()
-        if self.schedule_free:
-            self.optimizer.train()
+        self._weights("train")
         return metrics
 
     def _labels(self, caption_tags: list[np.ndarray]) -> torch.Tensor:
@@ -670,15 +751,15 @@ class Trainer:
         final = self.run_dir / CHECKPOINTS / f"step-{self.step:07d}"
         if final.exists():
             return  # continued from it and stopped before another step
-        if self.schedule_free:
-            self.optimizer.eval()
-        if not all(bool(torch.isfinite(p).all()) for p in self.params):
+        self._weights("eval")
+        if not all(bool(torch.isfinite(p).all()) for p in self.values()):
             raise click.ClickException(f"non-finite weights at step {self.step}; no checkpoint written")
         epoch, batch = (self.epoch + 1, 0) if self.batch >= self.batches_per_epoch else (self.epoch, self.batch)
         partial = final.with_suffix(".partial")
         shutil.rmtree(partial, ignore_errors=True)
         partial.mkdir(parents=True)
-        save_file({name: p.detach().contiguous() for p, name in self.names.items()}, partial / "trainable.safetensors")
+        values = dict(zip(self.params, self.values()))
+        save_file({name: values[p].detach().contiguous() for p, name in self.names.items()}, partial / "trainable.safetensors")
         state = {"optimizer": self.optimizer.state_dict(), "scaler": self.scaler.state_dict()}
         if self.scheduler is not None:
             state["scheduler"] = self.scheduler.state_dict()
@@ -689,8 +770,7 @@ class Trainer:
             _fsync(path)
         os.replace(partial, final)
         _fsync(final.parent)
-        if self.schedule_free:
-            self.optimizer.train()
+        self._weights("train")
         keep = self.config.checkpoint.keep_last
         if keep:
             for old in checkpoints(self.run_dir)[:-keep]:
@@ -699,12 +779,15 @@ class Trainer:
 
     def _load(self, path: Path) -> None:
         tensors = load_file(path / "trainable.safetensors")
-        by_name = {name: p for p, name in self.names.items()}
+        values = dict(zip(self.params, self.values()))
+        by_name = {name: values[p] for p, name in self.names.items()}
         if set(tensors) != set(by_name):
             raise click.ClickException(f"{path} holds other trained parameters than this configuration trains")
         for name, tensor in tensors.items():
             by_name[name].data.copy_(tensor)
-        state = torch.load(path / "optimizer.pt", map_location=self.device, weights_only=True)
+        if self.offload is not None:
+            self.offload.push()
+        state = torch.load(path / "optimizer.pt", map_location="cpu" if self.offload else self.device, weights_only=True)
         self.optimizer.load_state_dict(state["optimizer"])
         self.scaler.load_state_dict(state["scaler"])
         if self.scheduler is not None:
