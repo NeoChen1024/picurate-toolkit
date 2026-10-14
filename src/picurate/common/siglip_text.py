@@ -23,9 +23,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-DEFAULT_REPO = "google/siglip2-so400m-patch16-naflex"
-DEFAULT_REVISION = "cc24074f717b612951c2dead130904ab9b65a81e"
-IMAGE_TOWER = "naflexvit_so400m_patch16_siglip.v2_webli"  # the timm image tower this text tower matches
+from .siglip_image import DEFAULT_REPO, DEFAULT_REVISION, IMAGE_TOWER  # noqa: F401 - the checkpoint both towers share
 
 
 @dataclass(frozen=True, slots=True)

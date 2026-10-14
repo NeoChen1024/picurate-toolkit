@@ -9,7 +9,7 @@ limit standing in for a smaller GPU, and measures steps per second there:
 * ``search``: the image tower and the text tower of :mod:`picurate.common.siglip_text`, with the sigmoid image-text
   loss and a learned scale and bias.
 
-The towers are the real architectures (timm ``naflexvit_so400m_patch16_siglip.v2_webli`` and our text tower) with
+The towers are the real architectures (``picurate.common.siglip_image`` and ``siglip_text``) with
 random weights: speed and memory do not depend on the values, and nothing is downloaded. Every image is a full
 sequence of ``--seq-len`` patches, the worst case of the NaFlex budget; texts are 64 tokens, as SigLIP2 always pads.
 Trained parameters stay FP32 (the master weights) under autocast, so the optimizer state is what AdamW keeps in the
@@ -26,12 +26,12 @@ import time
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import click
-import timm
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from picurate.common.siglip_text import IMAGE_TOWER, TextConfig, TextTower
+from picurate.common.siglip_image import ATTENTIONS, ImageTower
+from picurate.common.siglip_text import TextConfig, TextTower
 
 PRECISIONS = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
@@ -45,10 +45,10 @@ def sigmoid_loss(a: torch.Tensor, b: torch.Tensor, scale: torch.Tensor, bias: to
 
 
 class Bench(nn.Module):
-    def __init__(self, route: str, train: str, freeze_blocks: int, checkpointing: bool):
+    def __init__(self, route: str, train: str, freeze_blocks: int, checkpointing: bool, attention: str | None = None):
         super().__init__()
         self.route = route
-        self.image = timm.create_model(IMAGE_TOWER, pretrained=False, num_classes=0)
+        self.image = ImageTower(attention=attention)
         self.text = TextTower(TextConfig()) if route == "search" else None
         # SigLIP2's initial values; learned in both routes.
         self.scale = nn.Parameter(torch.tensor(math.log(10.0)))
@@ -220,6 +220,12 @@ def report(result: dict | None, batch: int) -> None:
 )
 @click.option("--compile", is_flag=True, help="torch.compile the step's forward (dynamic shapes).")
 @click.option(
+    "--attention",
+    type=click.Choice(ATTENTIONS),
+    default=None,
+    help="Attention layout of the image tower; default: flash with flash-attn installed, else sdpa.",
+)
+@click.option(
     "--memory",
     type=float,
     default=None,
@@ -251,6 +257,7 @@ def main(
     frozen_fp32,
     seq_len,
     compile,
+    attention,
     memory,
     micro,
     batch_size,
@@ -268,7 +275,7 @@ def main(
     if memory is not None:
         torch.cuda.set_per_process_memory_fraction(min(1.0, memory * 2**30 / total))
     torch.backends.cuda.matmul.fp32_precision = "tf32"
-    model = Bench(route, train, freeze_blocks, checkpointing).to(device).train()
+    model = Bench(route, train, freeze_blocks, checkpointing, attention).to(device).train()
     if not frozen_fp32:
         for p in model.parameters():
             if not p.requires_grad:
@@ -283,8 +290,8 @@ def main(
         + (f" (training {train})" if route == "search" else "")
         + f": {trainable / 1e6:.0f}M of {sum(p.numel() for p in model.parameters()) / 1e6:.0f}M parameters trained,"
         f" {freeze_blocks} image blocks frozen, checkpointing {'on' if checkpointing else 'off'}, {precision} autocast,"
-        f" frozen ones in {'fp32' if frozen_fp32 else precision}, {seq_len} patches per image{', compiled' if compile else ''}"
-        + (f", GradCache with micro-batches of {micro}" if micro else "")
+        f" frozen ones in {'fp32' if frozen_fp32 else precision}, {seq_len} patches per image, {model.image.attention} attention"
+        f"{', compiled' if compile else ''}" + (f", GradCache with micro-batches of {micro}" if micro else "")
     )
     click.echo(
         f"Weights, gradients and AdamW state: {(sum(p.numel() * p.element_size() for p in model.parameters()) + trainable * 12) / 2**30:.2f} GiB"

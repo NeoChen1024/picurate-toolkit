@@ -34,10 +34,9 @@ crop = 0.05
 max_crop = 0.04
 
 [model]
-image_tower = "naflexvit_so400m_patch16_siglip.v2_webli"
-image_revision = "e8d786c5ea9db8d0153b18a6a39114bf65ba28b0"  # "": the newest
-text_repo = "google/siglip2-so400m-patch16-naflex"
-text_revision = "cc24074f717b612951c2dead130904ab9b65a81e"
+repo = "google/siglip2-so400m-patch16-naflex"  # the checkpoint both towers start from
+revision = "cc24074f717b612951c2dead130904ab9b65a81e"  # "": the newest
+attention = ""              # flash | sdpa; "": flash with flash-attn installed, else sdpa
 train = "image"             # search route: image | text | both
 freeze_blocks = 0           # the patch embedding and the lowest N of the image tower's 27 blocks
 freeze_text_layers = 0      # the embeddings and the lowest N of the text tower's 27 layers
@@ -58,7 +57,8 @@ learn_scale_bias = true
 
 [optim]
 name = "schedulefree_adamw" # schedulefree_adamw | adamw (warm-up, then cosine decay over run.steps)
-lr = 1e-5
+lr = 1e-5                   # image tower
+lr_text = 0.0               # text tower; 0: the same as lr
 lr_scale_bias = 1e-3
 betas = [0.9, 0.999]
 weight_decay = 0.0          # on weight matrices only, not embeddings

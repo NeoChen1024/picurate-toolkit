@@ -50,21 +50,21 @@ model_options = _options(
         "-m",
         default=default_model_id,
         show_default=True,
-        help="timm model name of the image tower (any CLIP/SigLIP tower timm ships).",
+        help="The image tower: the SigLIP2 so400m NaFlex checkpoint by name, or the path of a clip-train export file.",
     ),
     click.option("--device", "-c", default=default_device, show_default=True, help="Device to run the model and the matching on."),
     click.option(
         "--compile",
         "compile_",
         is_flag=True,
-        help="torch.compile the model (dynamic shapes, 20-30 s warm-up). ~17%% faster for fixed-resolution towers, no gain for NaFlex towers yet.",
+        help="torch.compile the model (dynamic shapes, 20-30 s warm-up).",
     ),
     click.option(
         "--seq-len",
         type=int,
         default=default_seq_len,
         show_default=True,
-        help="NaFlex towers only: patch budget per image (16x16 patches, aspect ratio kept). 1024 matches a 512px fixed model in speed and VRAM; part of the model identity a DB is bound to.",
+        help="Patch budget per image (16x16 patches, aspect ratio kept). 1024 matches a 512px fixed model in speed and VRAM; part of the model identity a DB is bound to.",
     ),
 )
 

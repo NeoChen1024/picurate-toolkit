@@ -48,10 +48,15 @@ search model is free to lose the detail sensitivity the deduper needs.
   interpolation (`w = (1-a)·w_orig + a·w_ft`) before deciding a fine-tune is an improvement. Evaluate zero-shot
   retrieval on a held-out set at every checkpoint, not just the training loss. The dedupe route has no alignment to
   keep; its only metric is the variant/different gap on held-out groups.
-* Framework: no `transformers`. The image tower is timm's (`naflexvit_so400m_patch16_siglip.v2_webli`, with its
-  NaFlex data loader), so the trained tower is already in the layout the deduper loads; the text tower is
-  `picurate.common.siglip_text`, which loads the same checkpoint's text weights. The position embedding is resampled
-  bicubically as timm does (the official code uses bilinear).
+* Framework: no `transformers`, no timm. Both towers are ours (`picurate.common.siglip_image` and `siglip_text`),
+  built from the one `google/siglip2-so400m-patch16-naflex` checkpoint. The image tower keeps timm's parameter names
+  and computes the same function as timm's `naflexvit_so400m_patch16_siglip.v2_webli` (checked bit-exact on real
+  images in FP32 and bf16), so a trained tower is in the layout the deduper loads. The position embedding is
+  resampled bicubically as timm does (the official code uses bilinear). Attention runs on flash-attn's
+  variable-length kernels when the package is installed (`model.attention = "flash"`, the default then): the valid
+  patches of a batch are packed into one sequence, so padding costs nothing and no mask is needed. Without it
+  (`"sdpa"`), the padded batch is masked in PyTorch's `scaled_dot_product_attention`, which then cannot use its
+  flash kernel.
 * Preprocessing at training time must match inference: aspect ratio kept, bicubic, mean/std 0.5, the same patch
   budget (`--seq-len`, 1024 by default). A tower trained on 256-patch inputs and evaluated at 1024 is a different
   model.
@@ -134,7 +139,7 @@ same batches bit for bit: from any pack built from the same dataset (images are 
 order parallel encoding stored them), at any number of loader workers, and when resuming mid-epoch. Each sample is
 drawn from a generator seeded by the seed, the epoch and a hash of the image's key; outside the code, this rests on
 the versions of Pillow, libwebp, libjpeg and numpy. Images go to the model as uint8 patches, preprocessed exactly as
-the deduper does (aspect ratio kept, bicubic, at most `--seq-len` patches; checked identical to timm's transform) and
+the deduper does (aspect ratio kept, bicubic, at most `--seq-len` patches; `picurate.common.siglip_image.to_patches`) and
 normalized on the GPU. The held-out split hashes the keys, the smallest key of a group of identical images deciding
 for the group, so it depends neither on the seed nor on the stored bytes.
 
@@ -169,11 +174,16 @@ The settings are a TOML file; [clip-train.example.toml](clip-train.example.toml)
 Experiments train fully (with the lower image blocks frozen where memory is short); `[model.lora]` puts LoRA adapters
 on the trained blocks instead, with the pooling head and final norms still trained fully. Defaults: schedule-free
 AdamW at 1e-5 with 500 warm-up steps (`adamw` with cosine decay is there for comparison), clipping at norm 1, bf16
-autocast with FP32 trained parameters, and frozen ones stored in bf16. `optim.micro_batch` turns on GradCache; it
+autocast with FP32 trained parameters, and frozen ones stored in bf16. `optim.lr` is the image tower's learning rate
+and `optim.lr_text` the text tower's (0: the same), with one warm-up and decay curve for both: the text tower starts
+from general English and has further to move to tag captions, while the image tower is better moved gently, so the
+search route usually wants the text tower faster, which is smoother than freezing image blocks and combines with
+it. `optim.micro_batch` turns on GradCache; it
 must divide the batch size, and evaluation runs in batches of the same size, so every pass has the same shape.
 `model.compile` compiles the towers' forward passes: on an RTX 4080-class GPU dedupe steps are 12-14% faster and
 search steps 5%, for 0.7 GiB more memory and one to three minutes of compiling, once each for training, GradCache's
-gradient-free pass and evaluation (timm's NaFlex tower still breaks into several graphs). The
+gradient-free pass and evaluation (the position-embedding resampling, done per distinct patch grid in the batch,
+still splits the image tower into several graphs). The
 logit scale and bias start from the checkpoint's (search) or SigLIP's initial log 10 and -10 (dedupe: image-image
 similarities are distributed differently from image-text ones) and are learned at their own rate.
 
@@ -186,10 +196,10 @@ seed and the images, nothing else is needed to continue. Checkpoints are written
 newest three are kept. A failure to load a batch (an unreachable pack, after a read has been retried for seven
 seconds) also writes a checkpoint before it ends the run. A step with a non-finite loss or gradient is skipped; ten
 in a row end the run without one. A continued run takes `--config` only for what does not change its results:
-workers, intervals, the pack's path, and `run.steps` with the schedule-free optimizer, whose lack of a schedule makes
+workers, intervals, the pack's path, the attention layout, and `run.steps` with the schedule-free optimizer, whose lack of a schedule makes
 training longer just more steps. Different settings or a different pack are refused; a new run can start from
 another one's weights with `model.init_from`, which must stay in place, since continuing and exporting rebuild the
-frozen weights from it (as from the image tower's Hugging Face repository at `model.image_revision`). One `run` at a
+frozen weights from it (as from the checkpoint at `model.revision`). One `run` at a
 time trains in a run directory. Continuing is not bit-exact: GPU reductions in attention and matrix products are not deterministic,
 so two uninterrupted runs already differ in the third or fourth digit of the loss after a step or two, and a
 continued run differs from an uninterrupted one by as much.

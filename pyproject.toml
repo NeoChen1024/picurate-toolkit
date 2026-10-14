@@ -14,7 +14,6 @@ dependencies = [
     "numpy",
     "pillow",
     "safetensors",
-    "timm",
     "torch>=2.10",
     "torchvision>=0.25",
     "tqdm",
@@ -33,6 +32,8 @@ training = [
     "schedulefree",
     "tensorboard>=2.21",
     "tokenizers",
+    # flash-attn is optional: built from source against the installed torch, it gives the image tower its fast
+    # variable-length attention (docs/training-clip.md).
 ]
 
 [project.scripts]

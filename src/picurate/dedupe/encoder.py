@@ -1,22 +1,22 @@
-"""timm image tower wrapper used to turn preprocessed images into embeddings.
+"""The image tower that turns preprocessed images into embeddings.
 
-Only the image tower of a CLIP/SigLIP model is needed for deduplication, so the model is loaded straight from timm
-(`timm.create_model`), which is also what open_clip uses under the hood for these architectures. Embeddings are
-bit-identical to open_clip's ``encode_image`` for the same checkpoint, at 40% of the download size.
+The tower is ``picurate.common.siglip_image`` (SigLIP2 so400m NaFlex), loaded from the base checkpoint or from a
+``clip-train export`` file. Images keep their aspect ratio and are resized to at most ``seq_len`` 16x16 patches, so
+nothing is squashed or cropped; ``seq_len`` is part of the model identity a database is bound to.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Sequence
+import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
 import PIL.Image
-import timm
-import timm.data
 import torch
-from timm.models.naflexvit import NaFlexVit
+
+from ..common.siglip_image import DEFAULT_SEQ_LEN, IMAGE_TOWER, ImageTower, load_image_tower, to_patches
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 # relative to its inter-image spread (50% downscale up to 1.4, 25% up to 4.3, different images 8.7+). PE-Core-bigG
 # (vit_pe_core_bigG_14_448.fb) was tried first but is so sensitive to compression artifacts that a JPEG q90 re-save
 # lands 5-15 away.
-default_model_id = "naflexvit_so400m_patch16_siglip.v2_webli"
-default_seq_len = 1024
+default_model_id = IMAGE_TOWER
+default_seq_len = DEFAULT_SEQ_LEN
 
 # Accepted spellings for the precision option -> torch dtype
 _PRECISIONS: dict[str, torch.dtype] = {
@@ -41,32 +41,22 @@ _PRECISIONS: dict[str, torch.dtype] = {
 }
 precision_choices = tuple(_PRECISIONS)
 
-
-class _FixedPreprocess:
-    """PIL (any mode) -> ``(C, H, W)`` array in ``dtype``, fully preprocessed for a fixed-resolution tower. Picklable for workers."""
-
-    def __init__(self, transform: Callable, dtype: np.dtype):
-        self.transform = transform
-        self.dtype = dtype
-
-    def __call__(self, img: PIL.Image.Image) -> np.ndarray:
-        return self.transform(img.convert("RGB")).numpy().astype(self.dtype, copy=False)
+Preprocessed = tuple[np.ndarray, np.ndarray]
 
 
 class _NaFlexPreprocess:
-    """PIL -> ``(patches, coords)``: the image resized (aspect ratio kept) to at most ``seq_len`` patches, normalized
-    and patchified to ``(N, P*P*C)`` in ``dtype`` plus ``(N, 2)`` int32 (y, x) patch coordinates. Picklable."""
+    """PIL -> ``(patches, coords)``: the image resized (aspect ratio kept, bicubic) to at most ``seq_len`` patches,
+    normalized to [-1, 1] in FP32 as SigLIP was trained (then cast to ``dtype``) and patchified to ``(N, 16*16*3)``,
+    plus ``(N, 2)`` int32 (row, column) patch coordinates. Picklable for worker processes."""
 
-    def __init__(self, transform: Callable, dtype: np.dtype):
-        self.transform = transform
+    def __init__(self, seq_len: int, dtype: np.dtype):
+        self.seq_len = seq_len
         self.dtype = dtype
 
-    def __call__(self, img: PIL.Image.Image) -> tuple[np.ndarray, np.ndarray]:
-        d = self.transform(img.convert("RGB"))
-        return d["patches"].numpy().astype(self.dtype, copy=False), d["patch_coord"].numpy().astype(np.int32, copy=False)
-
-
-Preprocessed = np.ndarray | tuple[np.ndarray, np.ndarray]
+    def __call__(self, img: PIL.Image.Image) -> Preprocessed:
+        patches, coords = to_patches(img.convert("RGB"), self.seq_len)
+        normalized = (patches.astype(np.float32) / 255.0 - 0.5) / 0.5
+        return normalized.astype(self.dtype, copy=False), coords.astype(np.int32, copy=False)
 
 
 @dataclass(slots=True)
@@ -83,18 +73,14 @@ class PendingBatch:
 
 
 class CLIPImageEncoder:
-    """Loads a timm image tower once and encodes batches of preprocessed images.
+    """Loads the image tower once and encodes batches of preprocessed images.
 
-    ``dtype`` defaults to fp16 on CUDA and fp32 elsewhere. fp16 inference is what makes the stored fp16 embeddings
-    lossless: every value the model emits is already an fp16 number.
+    ``model_id`` is the base tower's name (``default_model_id``) or the path of a ``clip-train export`` file, whose
+    ``name`` then identifies the model. ``dtype`` defaults to fp16 on CUDA and fp32 elsewhere. fp16 inference is what
+    makes the stored fp16 embeddings lossless: every value the model emits is already an fp16 number.
 
-    NaFlex towers (timm ``naflexvit_*``) take the image at its own aspect ratio as a sequence of at most ``seq_len``
-    patches; fixed-resolution towers get the whole image squashed to their input size. Either way the workers deliver
-    fully preprocessed arrays and ``submit`` only pads, pins, copies and runs.
-
-    ``compile=True`` wraps the forward in ``torch.compile(dynamic=True)``, so batches of any size share one graph
-    (20-30 s warm-up). Fixed-resolution towers gain about 17% on an RTX 4080; NaFlex towers gain nothing today
-    because timm's NaFlex position-embedding path breaks the graph (measured: 62 vs 63 img/s eager).
+    The workers deliver fully preprocessed arrays and ``submit`` only pads, pins, copies and runs. ``compile=True``
+    wraps the forward in ``torch.compile(dynamic=True)``, so batches of any size share one graph (20-30 s warm-up).
     """
 
     def __init__(
@@ -105,6 +91,7 @@ class CLIPImageEncoder:
         *,
         compile: bool = False,
         seq_len: int = default_seq_len,
+        attention: str | None = None,
     ):
         if dtype is None:
             dtype = "fp16" if "cuda" in device else "fp32"
@@ -112,41 +99,27 @@ class CLIPImageEncoder:
             self.tdtype = _PRECISIONS[dtype.lower()]
         except KeyError:
             raise ValueError(f"Unknown dtype {dtype!r}; expected one of {precision_choices}") from None
+        if seq_len < 1:
+            raise ValueError("seq_len must be positive")
         self.device = device
+        self.seq_len = seq_len
         logger.info("Loading image model %s on %s (%s%s)", model_id, device, dtype, ", compiled" if compile else "")
-        self.model = timm.create_model(model_id, pretrained=True, num_classes=0).to(device=device, dtype=self.tdtype).eval()
-        self.naflex = isinstance(self.model, NaFlexVit)
-        cfg = timm.data.resolve_data_config({}, model=self.model)
-        if self.naflex:
-            if seq_len < 1:
-                raise ValueError("seq_len must be positive")
-            self.seq_len = seq_len
-            self.patch_size = tuple(self.model.embeds.patch_size)
-            # Embeddings depend on the patch budget, so it is part of the identity a database is bound to.
-            self.model_id = f"{model_id}@{seq_len}"
-            transform = timm.data.create_transform(
-                input_size=cfg["input_size"],
-                interpolation=cfg["interpolation"],
-                mean=cfg["mean"],
-                std=cfg["std"],
-                is_training=False,
-                naflex=True,
-                patch_size=self.patch_size,
-                max_seq_len=seq_len,
-                patchify=True,
-            )
-            self.preprocess: Callable[[PIL.Image.Image], Preprocessed] = _NaFlexPreprocess(transform, self.array_dtype)
+        if model_id == default_model_id:
+            name = model_id
+            self.model = load_image_tower(device=device, dtype=self.tdtype, attention=attention)
+        elif os.path.isfile(model_id):
+            name, trained_seq_len, self.model = _load_export(model_id, attention)
+            if trained_seq_len and trained_seq_len != seq_len:
+                logger.warning("%s was trained with a patch budget of %d, not %d", model_id, trained_seq_len, seq_len)
+            self.model = self.model.to(device=device, dtype=self.tdtype).eval()
         else:
-            self.seq_len = None
-            self.model_id = model_id
-            # CLIP-style models are trained on the whole image squashed to the input size. timm's default eval
-            # transform center-crops 90%, which would shift every embedding; override to the exact open_clip one.
-            cfg.update(crop_pct=1.0, crop_mode="squash")
-            self.preprocess = _FixedPreprocess(timm.data.create_transform(**cfg, is_training=False), self.array_dtype)
+            raise ValueError(f"Unknown model {model_id!r}: expected {default_model_id!r} or the path of a clip-train export")
+        # Embeddings depend on the patch budget, so it is part of the identity a database is bound to.
+        self.model_id = f"{name}@{seq_len}"
+        self.preprocess = _NaFlexPreprocess(seq_len, self.array_dtype)
+        self._forward = torch.compile(self.model, dynamic=True) if compile else self.model
 
-        self._forward: Callable[..., torch.Tensor] = torch.compile(self.model, dynamic=True) if compile else self.model
-
-    def get_preprocessor(self) -> Callable[[PIL.Image.Image], Preprocessed]:
+    def get_preprocessor(self) -> _NaFlexPreprocess:
         """The full PIL -> numpy preprocessing, picklable so worker processes can run it. Its output is what
         ``submit`` takes."""
         return self.preprocess
@@ -169,29 +142,21 @@ class CLIPImageEncoder:
         if n == 0:
             raise ValueError("Empty batch")
         pin = self.device.startswith("cuda")
-        if self.naflex:
-            first = preprocessed[0]
-            assert isinstance(first, tuple), "NaFlex tower expects (patches, coords) pairs"
-            patch_dim = first[0].shape[1]
-            patches = torch.zeros((n, self.seq_len, patch_dim), dtype=self.tdtype, pin_memory=pin)
-            coords = torch.zeros((n, self.seq_len, 2), dtype=torch.int64, pin_memory=pin)
-            valid = torch.zeros((n, self.seq_len), dtype=torch.bool, pin_memory=pin)
-            for i, (p, c) in enumerate(preprocessed):
-                k = p.shape[0]
-                patches[i, :k].copy_(torch.from_numpy(np.ascontiguousarray(p)))
-                coords[i, :k].copy_(torch.from_numpy(np.ascontiguousarray(c)))
-                valid[i, :k] = True
-            dev = {
-                "patches": patches.to(self.device, non_blocking=pin),
-                "patch_coord": coords.to(self.device, non_blocking=pin),
-                "patch_valid": valid.to(self.device, non_blocking=pin),
-            }
-            return PendingBatch(self._forward(dev), n, (patches, coords, valid))
-        host = torch.empty((n, *preprocessed[0].shape), dtype=self.tdtype, pin_memory=pin)
-        for i, a in enumerate(preprocessed):
-            host[i].copy_(torch.from_numpy(np.ascontiguousarray(a)))
-        batch = host.to(self.device, non_blocking=pin)
-        return PendingBatch(self._forward(batch), n, (host,))
+        patch_dim = preprocessed[0][0].shape[1]
+        patches = torch.zeros((n, self.seq_len, patch_dim), dtype=self.tdtype, pin_memory=pin)
+        coords = torch.zeros((n, self.seq_len, 2), dtype=torch.int64, pin_memory=pin)
+        valid = torch.zeros((n, self.seq_len), dtype=torch.bool, pin_memory=pin)
+        for i, (p, c) in enumerate(preprocessed):
+            k = p.shape[0]
+            patches[i, :k].copy_(torch.from_numpy(np.ascontiguousarray(p)))
+            coords[i, :k].copy_(torch.from_numpy(np.ascontiguousarray(c)))
+            valid[i, :k] = True
+        dev = {
+            "patches": patches.to(self.device, non_blocking=pin),
+            "patch_coord": coords.to(self.device, non_blocking=pin),
+            "patch_valid": valid.to(self.device, non_blocking=pin),
+        }
+        return PendingBatch(self._forward(dev), n, (patches, coords, valid))
 
     def collect(self, pending: PendingBatch) -> np.ndarray:
         """Wait for a submitted batch and return its ``(N, D)`` float32 embeddings."""
@@ -213,3 +178,20 @@ class CLIPImageEncoder:
         del self.model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+def _load_export(path: str, attention: str | None) -> tuple[str, int, ImageTower]:
+    """A ``clip-train export`` file: its ``name``, the patch budget it was trained with (0 if unknown) and the image
+    tower with its ``image.*`` weights, on the CPU."""
+    from safetensors import safe_open
+
+    with safe_open(path, "pt") as export:
+        metadata = export.metadata() or {}
+        state = {k[len("image.") :]: export.get_tensor(k) for k in export.keys() if k.startswith("image.")}
+    name = metadata.get("name")
+    if not name or not state:
+        raise ValueError(f"{path} is not a clip-train export (no name or no image.* tensors)")
+    with torch.device("meta"):
+        tower = ImageTower(attention=attention)
+    tower.load_state_dict(state, strict=True, assign=True)
+    return name, int(metadata.get("seq_len", 0)), tower

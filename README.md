@@ -104,7 +104,8 @@ GNU GPL version 3 or later; see [LICENSE](LICENSE).
 
 ## Credits
 
-* [timm](https://github.com/huggingface/pytorch-image-models) and Google's SigLIP2 for the image embeddings.
+* Google's SigLIP2 for the image and text embeddings; the towers follow timm's
+  [NaFlex ViT](https://github.com/huggingface/pytorch-image-models) layout.
 * [PixAI](https://huggingface.co/pixai-labs/pixai-tagger-v1.0) for the tagger.
 * [Anima](https://huggingface.co/circlestone-labs/Anima)'s prompt format and kohya's
   [sd-scripts](https://github.com/kohya-ss/sd-scripts) WD14 tagger, whose caption layouts `picurate-tag` follows.

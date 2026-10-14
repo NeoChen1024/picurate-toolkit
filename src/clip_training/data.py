@@ -32,13 +32,12 @@ import click
 import numpy as np
 import PIL.Image
 import torch
-from timm.data.naflex_transforms import get_image_size_for_seq
 from torch.utils.data import DataLoader, Dataset, Sampler
+
+from picurate.common.siglip_image import DEFAULT_SEQ_LEN, PATCH, image_size_for_seq, to_patches
 
 from .pack import Pack
 
-PATCH = 16
-DEFAULT_SEQ_LEN = 1024
 ROUTES = ("search", "dedupe")
 _FILTERS = (
     PIL.Image.Resampling.LANCZOS,
@@ -50,17 +49,6 @@ _FILTERS = (
 
 
 # -- images ---------------------------------------------------------------------------------------------------------
-
-
-def to_patches(image: PIL.Image.Image, seq_len: int = DEFAULT_SEQ_LEN) -> tuple[np.ndarray, np.ndarray]:
-    """``(N, 16*16*3)`` uint8 patches and ``(N, 2)`` (y, x) coordinates of ``image``, resized as timm's NaFlex eval
-    transform does (the deduper's preprocessing) and in its patch layout (row by row, pixels row by row, RGB)."""
-    _, (height, width) = get_image_size_for_seq((image.height, image.width), PATCH, seq_len)
-    pixels = np.asarray(image.convert("RGB").resize((width, height), PIL.Image.Resampling.BICUBIC))
-    rows, columns = height // PATCH, width // PATCH
-    patches = pixels.reshape(rows, PATCH, columns, PATCH, 3).transpose(0, 2, 1, 3, 4).reshape(rows * columns, -1)
-    coords = np.stack(np.meshgrid(np.arange(rows), np.arange(columns), indexing="ij"), -1).reshape(-1, 2)
-    return patches, coords
 
 
 def from_patches(patches: np.ndarray, coords: np.ndarray) -> PIL.Image.Image:
@@ -105,7 +93,7 @@ class Augment:
         return image
 
     def _rescale(self, image: PIL.Image.Image, rng: np.random.Generator, seq_len: int) -> PIL.Image.Image:
-        _, (height, width) = get_image_size_for_seq((image.height, image.width), PATCH, seq_len)
+        height, width = image_size_for_seq(image.height, image.width, seq_len)
         scale = math.exp(rng.uniform(math.log(self.min_scale), 0.0)) * min(height / image.height, width / image.width)
         if scale >= 1.0:
             return image

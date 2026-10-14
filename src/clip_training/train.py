@@ -44,7 +44,6 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import click
 import numpy as np
-import timm
 import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
@@ -54,7 +53,8 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from picurate.common.log import setup_logging
-from picurate.common.siglip_text import DEFAULT_REPO, DEFAULT_REVISION, IMAGE_TOWER, TextTower, load_text_encoder
+from picurate.common.siglip_image import ATTENTIONS, DEFAULT_REPO, DEFAULT_REVISION, IMAGE_TOWER, ImageTower, load_image_tower
+from picurate.common.siglip_text import TextTower, load_text_encoder
 
 from .data import (
     DEFAULT_SEQ_LEN,
@@ -78,7 +78,6 @@ PRECISIONS = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float
 OPTIMIZERS = ("schedulefree_adamw", "adamw")
 EVAL_SEED = 0x5EED  # captions and views of the evaluation set: the same in every run
 CHECKPOINTS = "checkpoints"
-IMAGE_REVISION = "e8d786c5ea9db8d0153b18a6a39114bf65ba28b0"  # of the image tower's Hugging Face repository
 MAX_SKIPPED = 10  # consecutive steps with non-finite gradients that end a run
 
 
@@ -113,10 +112,9 @@ class LoraConfig:
 
 @dataclass
 class ModelConfig:
-    image_tower: str = IMAGE_TOWER
-    image_revision: str = IMAGE_REVISION  # "": the newest
-    text_repo: str = DEFAULT_REPO
-    text_revision: str = DEFAULT_REVISION
+    repo: str = DEFAULT_REPO  # the Hugging Face checkpoint both towers start from
+    revision: str = DEFAULT_REVISION  # "": the newest
+    attention: str = ""  # flash | sdpa; "": flash with flash-attn installed, else sdpa (same results, speed differs)
     train: str = "image"  # search: image | text | both (dedupe always trains the image tower)
     freeze_blocks: int = 0  # the patch embedding and the lowest N of the image tower's 27 blocks
     freeze_text_layers: int = 0  # the embeddings and the lowest N of the text tower's 27 layers
@@ -138,7 +136,8 @@ class LossConfig:
 @dataclass
 class OptimConfig:
     name: str = "schedulefree_adamw"  # schedulefree_adamw | adamw (with warm-up and cosine decay over run.steps)
-    lr: float = 1e-5
+    lr: float = 1e-5  # image tower
+    lr_text: float = 0.0  # text tower; 0: the same as lr
     lr_scale_bias: float = 1e-3
     betas: tuple[float, float] = (0.9, 0.999)
     weight_decay: float = 0.0  # on matrices only
@@ -200,8 +199,12 @@ class Config:
             (0 <= c.uniform <= 1 and 0 <= c.shuffle <= 1, "data.captions.uniform and shuffle must be in [0, 1]"),
             (c.alpha >= 0 and c.k >= 0 and c.min_count >= 1 and c.context >= 2, "data.captions values out of range"),
             (m.freeze_blocks >= 0 and m.freeze_text_layers >= 0, "model.freeze_* must not be negative"),
+            (m.attention in ("",) + ATTENTIONS, f"model.attention must be one of {ATTENTIONS}"),
             (m.lora is None or (m.lora.rank >= 1 and m.lora.alpha > 0), "model.lora.rank and alpha must be positive"),
-            (o.lr > 0 and o.lr_scale_bias >= 0 and o.weight_decay >= 0, "optim learning rates and weight decay out of range"),
+            (
+                o.lr > 0 and o.lr_text >= 0 and o.lr_scale_bias >= 0 and o.weight_decay >= 0,
+                "optim learning rates and weight decay out of range",
+            ),
             (all(0 <= b < 1 for b in o.betas) and len(o.betas) == 2, "optim.betas must be two values in [0, 1)"),
             (o.warmup_steps >= 0 and o.max_grad_norm >= 0 and o.micro_batch >= 0, "optim values must not be negative"),
             (not o.micro_batch or d.batch_size % o.micro_batch == 0, "data.batch_size must be a multiple of optim.micro_batch"),
@@ -232,6 +235,7 @@ class Config:
     def mutable(self) -> set[str]:
         """Settings a continued run may change: they do not change what it computes."""
         keys = {"run.log_every", "data.pack", "data.workers", "data.prefetch", "eval.every_steps", "model.compile"}
+        keys.add("model.attention")
         keys |= {"checkpoint.every_steps", "checkpoint.every_minutes", "checkpoint.keep_last"}
         if self.optim.name == "schedulefree_adamw":
             keys.add("run.steps")
@@ -323,15 +327,16 @@ def build_model(config: Config) -> Towers:
     parts, LoRA adapters (seeded by ``run.seed``) and gradient checkpointing."""
     m, route = config.model, config.run.route
     exported = load_file(m.init_from) if m.init_from else None
-    overlay = {}
-    if m.image_revision:
-        overlay["hf_hub_id"] = f"{timm.models.get_pretrained_cfg(m.image_tower).hf_hub_id}@{m.image_revision}"
-    image = timm.create_model(m.image_tower, pretrained=exported is None, num_classes=0, pretrained_cfg_overlay=overlay)
+    attention = m.attention or None
+    if exported is None:
+        image = load_image_tower(m.repo, m.revision or None, attention=attention)
+    else:
+        image = ImageTower(attention=attention)
     if m.freeze_blocks > len(image.blocks):
         raise ValueError(f"model.freeze_blocks is {m.freeze_blocks}; the image tower has {len(image.blocks)} blocks")
     text, scale, bias = None, math.log(10.0), -10.0
     if route == "search":
-        encoder = load_text_encoder(m.text_repo, m.text_revision)
+        encoder = load_text_encoder(m.repo, m.revision or None)
         text, scale, bias = encoder.tower, encoder.logit_scale, encoder.logit_bias
         if m.freeze_text_layers > len(text.layers):
             raise ValueError(f"model.freeze_text_layers is {m.freeze_text_layers}; the text tower has {len(text.layers)}")
@@ -350,7 +355,7 @@ def build_model(config: Config) -> Towers:
     torch.manual_seed(config.run.seed)
     if route == "dedupe" or m.train in ("image", "both"):
         blocks = image.blocks[m.freeze_blocks :]
-        heads = [image.norm, image.attn_pool, image.fc_norm, image.head]
+        heads = [image.norm, image.attn_pool]
         if m.freeze_blocks == 0 and m.lora is None:
             image.embeds.requires_grad_(True)
         _train(blocks, heads, m.lora)
@@ -490,23 +495,28 @@ class Trainer:
         self.skipped = 0  # consecutive steps with non-finite gradients
 
     def _optimizer(self):
-        o, decay, flat, scale_bias = self.config.optim, [], [], []
-        # No decay on vectors, position and token embeddings, and the pooling query.
+        """Parameter groups: each tower at its own learning rate (``lr`` for the image tower, ``lr_text`` for the text
+        tower), each split into matrices (weight decay) and the rest (no decay: vectors, position and token
+        embeddings, the pooling query), and the logit scale and bias at ``lr_scale_bias``."""
+        o = self.config.optim
         exempt = {f"image.{name}" for name in self.model.image.no_weight_decay()} | {"image.attn_pool.latent"}
-        for p in self.params:
-            name = self.names[p]
-            if p is self.model.scale or p is self.model.bias:
-                scale_bias.append(p)
-            elif p.ndim < 2 or name in exempt or name.endswith("_embedding.weight"):
-                flat.append(p)
-            else:
-                decay.append(p)
-        groups = [
-            {"params": decay, "lr": o.lr, "weight_decay": o.weight_decay},
-            {"params": flat, "lr": o.lr, "weight_decay": 0.0},
-            {"params": scale_bias, "lr": o.lr_scale_bias, "weight_decay": 0.0},
-        ]
+        groups = []
+        for tower, lr in (("image", o.lr), ("text", o.lr_text or o.lr)):
+            decay, flat = [], []
+            for p in self.params:
+                name = self.names[p]
+                if p is self.model.scale or p is self.model.bias or not name.startswith(f"{tower}."):
+                    continue
+                if p.ndim < 2 or name in exempt or name.endswith("_embedding.weight"):
+                    flat.append(p)
+                else:
+                    decay.append(p)
+            groups.append({"params": decay, "lr": lr, "weight_decay": o.weight_decay, "name": tower})
+            groups.append({"params": flat, "lr": lr, "weight_decay": 0.0, "name": f"{tower}_flat"})
+        scale_bias = [p for p in (self.model.scale, self.model.bias) if p.requires_grad]
+        groups.append({"params": scale_bias, "lr": o.lr_scale_bias, "weight_decay": 0.0, "name": "scale_bias"})
         groups = [g for g in groups if g["params"]]
+        assert sum(len(g["params"]) for g in groups) == len(self.params), "every trained parameter in exactly one group"
         if o.name == "schedulefree_adamw":
             import schedulefree
 
@@ -745,12 +755,16 @@ class Trainer:
                     progress.set_postfix(loss=f"{loss:.4f}", epoch=self.epoch)
                     if self.step % config.run.log_every == 0:
                         elapsed = time.perf_counter() - window - paused  # training only, not evaluation or saving
-                        group = self.optimizer.param_groups[0]
+                        rates = {
+                            f"lr_{g['name']}": g.get("scheduled_lr", g["lr"])
+                            for g in self.optimizer.param_groups
+                            if g["name"] in ("image", "text")
+                        }
                         self.log(
                             {
                                 "loss": float(np.mean(losses)),
                                 "grad_norm": float(np.mean(norms)),
-                                "lr": group.get("scheduled_lr", group["lr"]),
+                                **rates,
                                 "logit_scale": float(self.model.scale.detach().exp()),
                                 "logit_bias": float(self.model.bias.detach()),
                                 "samples_per_s": samples / elapsed,
@@ -768,8 +782,8 @@ class Trainer:
                         self.log(metrics, "eval")
                         logger.info("Step %d: %s", self.step, ", ".join(f"{k} {v:.4f}" for k, v in metrics.items()))
                     every = config.checkpoint
-                    due = every.every_steps and self.step % every.every_steps == 0
-                    due |= every.every_minutes and time.monotonic() - last_checkpoint >= 60 * every.every_minutes
+                    due = bool(every.every_steps) and self.step % every.every_steps == 0
+                    due = due or (every.every_minutes > 0 and time.monotonic() - last_checkpoint >= 60 * every.every_minutes)
                     if due and self.step < config.run.steps and not self.stop:
                         self.save()
                         last_checkpoint = time.monotonic()
@@ -891,7 +905,7 @@ def export(run_dir: Path, output: Path, name: str, step: int | None):
     out["logit_scale"], out["logit_bias"] = model.scale.detach(), model.bias.detach()
     metadata = {
         "name": name,
-        "image_tower": config.model.image_tower,
+        "image_tower": IMAGE_TOWER,
         "seq_len": str(config.data.seq_len),
         "route": config.run.route,
         "step": path.name.split("-")[1],

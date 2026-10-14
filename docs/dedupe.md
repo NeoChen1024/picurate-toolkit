@@ -91,16 +91,17 @@ keeps, and is never re-derived: a human decision is only replaced by another one
   excluded do not count as already present. `--import-db` keeps the import side's embeddings for the next run or for
   `update-db --reuse-from`; without it they go to a temporary file. Duplicates within the import directory are not
   looked for.
-* `-m, --model-id`: a timm model name; any CLIP/SigLIP image tower timm ships works, NaFlex (`naflexvit_*`) or
-  fixed-resolution (e.g. `vit_so400m_patch16_siglip_512.v2_webli`). A database is bound to the model it was encoded
-  with; switching models on an existing database requires `-f, --force-update`, which re-encodes everything.
-* `--seq-len` (default `1024`): for NaFlex towers, the patch budget per image (at most this many 16x16 patches, aspect
-  ratio kept). 1024 costs the same as a 512px fixed model; lower it on small GPUs. Part of the database binding.
+* `-m, --model-id`: the image tower, by default the SigLIP2 so400m NaFlex checkpoint
+  (`naflexvit_so400m_patch16_siglip.v2_webli`); or the path of a `clip-train export` file, whose name then
+  identifies the model. A database is bound to the model it was encoded with; switching models on an existing
+  database requires `-f, --force-update`, which re-encodes everything.
+* `--seq-len` (default `1024`): the patch budget per image (at most this many 16x16 patches, aspect ratio kept).
+  1024 costs the same as a 512px fixed model; lower it on small GPUs. Part of the database binding.
 * `-b, --batch-size`: images per forward pass. The default model is compute bound already at 4.
 * `-j, --workers`: decoder processes (default: one per CPU). On network or spinning storage reads are the
   bottleneck, so more workers than CPUs helps there.
-* `--compile`: `torch.compile` the model with dynamic shapes. About 17% faster for fixed-resolution towers, 20-30 s
-  warm-up; no gain for the default NaFlex tower yet (timm's NaFlex position embedding breaks the graph).
+* `--compile`: `torch.compile` the model with dynamic shapes, 20-30 s warm-up. No measurable gain today: the
+  position embedding is resampled per patch grid in the batch, which splits the graph.
 
 FP16 inference is not batch-invariant: the same image encoded in a different batch comes out up to ~0.04 away. That
 is far below the default threshold, but it is why near-identical files are not exactly zero apart.
@@ -186,14 +187,14 @@ to the same process, which keeps decoded images within its share of `--pixel-buf
 others), and submits each batch to the GPU without waiting; a batch's result is written to the database once the
 next one is queued. Memory is bounded by `2 * workers` arrays plus two batches.
 
-**Model.** Only the image tower is needed, so it is loaded straight from timm:
-`naflexvit_so400m_patch16_siglip.v2_webli`, the SigLIP2 so400m NaFlex tower (1.6 GiB). NaFlex takes the image at its
-own aspect ratio, resized to at most `--seq-len` patches and padded with a validity mask, so nothing is squashed or
-cropped. That is what keeps lossy copies close: distance to the original / to the nearest different image is 0.5 /
+**Model.** Only the image tower is needed: SigLIP2 so400m NaFlex, our own implementation
+(`picurate.common.siglip_image`, the `vision_model` of `google/siglip2-so400m-patch16-naflex`; it computes exactly
+what timm's `naflexvit_so400m_patch16_siglip.v2_webli` does, whose name still identifies the model). NaFlex takes
+the image at its own aspect ratio, resized to at most `--seq-len` patches, so nothing is squashed or cropped; with
+flash-attn installed the valid patches of a batch are packed and attended without padding, otherwise padding is
+masked. That is what keeps lossy copies close: distance to the original / to the nearest different image is 0.5 /
 5.6 for a JPEG q90 re-save, 0.4 / 5.6 for a 50% downscale and 2.4 / 5.6 for a 25% one, against 0.7 / 8.7, 1.4 / 8.7
-and 4.3 / 8.7 for the fixed 512px SigLIP tower. Fixed-resolution towers are fed the whole image squashed to their
-input size with bicubic resampling, as they were trained (timm's default eval transform crops 90% and shifts
-embeddings by several units). timm resamples the NaFlex position embedding to the patch grid bicubically, where the
+and 4.3 / 8.7 for the fixed 512px SigLIP tower. The position embedding is resampled to the patch grid bicubically as timm does, where the
 official SigLIP2 code (and transformers) does it bilinearly: the stored embeddings are about 0.9 apart from the
 official ones (cosine ~0.98). Kept on purpose: lossy copies land slightly closer this way, and text queries against
 the stored embeddings still rank images the same. PE-Core towers are noticeably more sensitive to compression artifacts: a JPEG q90
