@@ -131,6 +131,27 @@ decoded completely and accepted if that works, which for PNG's checksums is a re
 images that fail: JPEGs cut off at a whole number of MiB and a few originals that never decoded. `--settle` (300 s)
 skips files modified in the last minutes, which tar is still writing while an archive is being extracted.
 
+### deepghs konachan_full
+
+A deepghs `*_full` booru mirror is one row per post in `table.parquet` (id, file name, MIME type, rating, a
+space-separated tag string), the tag dictionary with Moebooru type numbers in `tags.parquet`, and the original files
+in `images/<n>.tar`, each with a `.json` listing every member's offset, size and SHA-256. The importer reads a post's
+bytes straight from the archive at that offset, checks the SHA-256 and decodes them; nothing is extracted. Posts are
+keyed `konachan_<id>` (`--prefix`), so one pack can hold several boorus. Tags are stored names first, as the captions
+expect: character, copyright, artist, circle, style, then general and tags of unknown type (no category), alphabetical
+within a category as the dataset lists them. The rating is stored first as `safe`, `questionable` or `explicit` in
+the category `training`, like the rating word of cagliostro. GIF posts (animations) and posts missing from the
+archives are counted and skipped.
+
+    clip-pack check-deepghs DATASET [--no-decode] > problems.txt
+    clip-pack import-deepghs PACK DATASET [--prefix konachan] [--limit N]
+
+`check-deepghs` reads every post's file, checks it against its SHA-256 and decodes it (the table's size must match),
+and compares archive sizes with their listings, ids and tags with the tables, before anything is imported.
+
+Written for konachan_full (319k posts, 875 GB of originals, 2 Mpx median); the sister datasets with the same table
+columns should import the same way but have not been tried. Stored, a konachan image takes about 460 KiB.
+
 ## Training batches
 
 `src/clip_training/data.py` turns a pack into batches for either route. The same seed and the same images give the

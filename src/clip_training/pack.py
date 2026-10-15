@@ -295,7 +295,7 @@ class Pack:
 # -- command line ---------------------------------------------------------------------------------------------------
 
 
-def _encode_job(path: str, budget: int, tags: list[tuple[str, str | None]]):
+def _encode_job(key: str, path: str, tags: list[tuple[str, str | None]], budget: int):
     try:
         return encode_file(path, budget), tags
     except Exception as error:  # noqa: BLE001 - reported per file
@@ -339,37 +339,74 @@ def main(verbose: bool) -> None:
     setup_logging(verbose, ("picurate", "clip_training"))
 
 
+def _import_options(command):
+    for option in reversed(
+        (
+            click.option(
+                "--budget",
+                type=click.IntRange(1024),
+                default=DEFAULT_BUDGET,
+                show_default=True,
+                help="Maximum pixels per stored image.",
+            ),
+            click.option("--shard-gib", type=click.FloatRange(0.001), default=16.0, show_default=True, help="Maximum shard size."),
+            click.option(
+                "--workers", "-j", type=click.IntRange(1), default=os.cpu_count(), show_default=True, help="Encoding processes."
+            ),
+            click.option("--limit", type=click.IntRange(1), default=None, help="Add at most this many images (a trial run)."),
+        )
+    ):
+        command = option(command)
+    return command
+
+
+def _import(pack_dir, items: Iterable[tuple[str, tuple]], encode, *, budget, shard_gib, workers, limit, left_out=None, finish=None):
+    """The import loop every source shares: open the pack, take the ``(key, job)`` items whose key it lacks (at most
+    ``limit``), run ``encode(*job, budget)`` in ``workers`` processes, which returns ``(Encoded or exception, tags)``,
+    and add each image with ``finish(tags)`` (``tags`` as they are by default). ``left_out`` is a ``{reason: count}``
+    the item source fills in while listing, reported after it."""
+    writer = PackWriter(pack_dir, budget=budget, shard_bytes=int(shard_gib * 2**30))
+    try:
+        done = writer.keys()
+        left_out = left_out if left_out is not None else {}
+        todo, queued = [], set()
+        for key, job in items:
+            if key in queued:
+                left_out["listed twice"] = left_out.get("listed twice", 0) + 1
+            elif key not in done:
+                queued.add(key)
+                todo.append((key, job))
+            if limit is not None and len(todo) >= limit:
+                break
+        notes = "".join(f", {count} {reason}" for reason, count in left_out.items())
+        click.echo(f"{len(todo)} images to add, {len(done)} already in the pack{notes}", err=True)
+        failed = 0
+        with tqdm(total=len(todo), unit="img", desc="Packing") as progress:
+            jobs = ((key, *job, budget) for key, job in todo)
+            for (key, *_), (result, tags) in bounded_map(encode, jobs, workers):
+                if isinstance(result, Exception):
+                    failed += 1
+                    logger.warning("%s: %s", key, result)
+                else:
+                    writer.add(key, result, finish(tags) if finish else tags)
+                progress.update()
+    finally:
+        writer.close()
+    click.echo(f"Done; {failed} images could not be read" if failed else "Done", err=True)
+
+
 @main.command("import-dir")
 @click.argument("pack_dir", type=click.Path(file_okay=False))
 @click.argument("source", type=click.Path(exists=True, file_okay=False))
 @click.option("--recursive", "-r", is_flag=True, help="Include subdirectories.")
 @click.option("--txt-tags", is_flag=True, help="Read comma-separated tags from a same-stem .txt next to each image.")
-@click.option(
-    "--budget", type=click.IntRange(1024), default=DEFAULT_BUDGET, show_default=True, help="Maximum pixels per stored image."
-)
-@click.option("--shard-gib", type=click.FloatRange(0.001), default=16.0, show_default=True, help="Maximum shard size.")
-@click.option("--workers", "-j", type=click.IntRange(1), default=os.cpu_count(), show_default=True, help="Encoding processes.")
-def import_dir(pack_dir, source, recursive, txt_tags, budget, shard_gib, workers):
+@_import_options
+def import_dir(pack_dir, source, recursive, txt_tags, **options):
     """Add the images under SOURCE to the pack at PACK_DIR (created if needed), keyed by their relative path. Images
     already in the pack are skipped, so an interrupted run is simply run again."""
-    writer = PackWriter(pack_dir, budget=budget, shard_bytes=int(shard_gib * 2**30))
-    try:
-        done = writer.keys()
-        paths = [p for p in list_directory_relative(source, recursive=recursive) if is_image_path(p) and p not in done]
-        click.echo(f"{len(paths)} images to add, {len(done)} already in the pack", err=True)
-        jobs = ((os.path.join(source, p), budget, _txt_tags(os.path.join(source, p)) if txt_tags else []) for p in paths)
-        failed = 0
-        with tqdm(total=len(paths), unit="img", desc="Packing") as progress:
-            for (path, _, _), (result, tags) in bounded_map(_encode_job, jobs, workers):
-                if isinstance(result, Exception):
-                    failed += 1
-                    logger.warning("%s: %s", path, result)
-                else:
-                    writer.add(os.path.relpath(path, source), result, tags)
-                progress.update()
-    finally:
-        writer.close()
-    click.echo(f"Done; {failed} images could not be read" if failed else "Done", err=True)
+    paths = (p for p in list_directory_relative(source, recursive=recursive) if is_image_path(p))
+    items = ((p, (os.path.join(source, p), _txt_tags(os.path.join(source, p)) if txt_tags else [])) for p in paths)
+    _import(pack_dir, items, _encode_job, **options)
 
 
 @main.command("import-cagliostro")
@@ -383,19 +420,14 @@ def import_dir(pack_dir, source, recursive, txt_tags, budget, shard_gib, workers
     help="Tag database to take tag categories from (made by cagliostro-tags).",
 )
 @click.option(
-    "--budget", type=click.IntRange(1024), default=DEFAULT_BUDGET, show_default=True, help="Maximum pixels per stored image."
-)
-@click.option("--shard-gib", type=click.FloatRange(0.001), default=16.0, show_default=True, help="Maximum shard size.")
-@click.option("--workers", "-j", type=click.IntRange(1), default=os.cpu_count(), show_default=True, help="Encoding processes.")
-@click.option(
     "--settle",
     type=click.FloatRange(0),
     default=300,
     show_default=True,
     help="Skip pairs with a file modified less than this many seconds ago (still being extracted).",
 )
-@click.option("--limit", type=click.IntRange(1), default=None, help="Add at most this many posts (a trial run).")
-def import_cagliostro(pack_dir, dataset, categories_db, budget, shard_gib, workers, settle, limit):
+@_import_options
+def import_cagliostro(pack_dir, dataset, categories_db, settle, **options):
     """Add the image/caption pairs of the cagliostrolab-860k-ordered dataset at DATASET (every directory below it)
     to the pack at PACK_DIR, with categorized tags (see clip_training.cagliostro). Posts already in
     the pack are skipped, so an interrupted run, or one over a partly extracted dataset, is simply run again."""
@@ -406,37 +438,36 @@ def import_cagliostro(pack_dir, dataset, categories_db, budget, shard_gib, worke
     except (sqlite3.Error, ValueError) as error:
         raise click.ClickException(f"{categories_db}: {error}") from error
     click.echo(f"{len(dictionary)} tag categories from {categories_db}", err=True)
-    writer = PackWriter(pack_dir, budget=budget, shard_bytes=int(shard_gib * 2**30))
-    try:
-        done = writer.keys()
-        pairs, unsettled = [], 0
-        cutoff = time.time() - settle
-        for pair in find_pairs(dataset):
-            if pair[0] in done:
-                continue
-            if max(os.stat(pair[1]).st_mtime, os.stat(pair[2]).st_mtime) > cutoff:
-                unsettled += 1
+    left_out: dict[str, int] = {}
+    cutoff = time.time() - settle
+
+    def settled():
+        for key, image, caption in find_pairs(dataset):
+            if max(os.stat(image).st_mtime, os.stat(caption).st_mtime) > cutoff:
+                reason = f"modified in the last {settle:g} s, left for later"
+                left_out[reason] = left_out.get(reason, 0) + 1
             else:
-                pairs.append(pair)
-            if limit is not None and len(pairs) >= limit:
-                break
-        click.echo(
-            f"{len(pairs)} posts to add, {len(done)} already in the pack, {unsettled} modified in the last {settle:g} s left for later",
-            err=True,
-        )
-        failed = 0
-        with tqdm(total=len(pairs), unit="img", desc="Packing") as progress:
-            jobs = ((key, image, caption, budget) for key, image, caption in pairs)
-            for (key, image, _, _), (result, tags) in bounded_map(encode_pair, jobs, workers):
-                if isinstance(result, Exception):
-                    failed += 1
-                    logger.warning("%s: %s", image, result)
-                else:
-                    writer.add(key, result, categorize(tags, dictionary))
-                progress.update()
-    finally:
-        writer.close()
-    click.echo(f"Done; {failed} posts could not be read" if failed else "Done", err=True)
+                yield key, (image, caption)
+
+    _import(pack_dir, settled(), encode_pair, left_out=left_out, finish=lambda tags: categorize(tags, dictionary), **options)
+
+
+@main.command("import-deepghs")
+@click.argument("pack_dir", type=click.Path(file_okay=False))
+@click.argument("dataset", type=click.Path(exists=True, file_okay=False))
+@click.option("--prefix", default="konachan", show_default=True, help="Keys are <prefix>_<post id>.")
+@_import_options
+def import_deepghs(pack_dir, dataset, prefix, **options):
+    """Add the posts of a deepghs *_full booru mirror (table.parquet, tags.parquet, images/<n>.tar with their .json
+    listings; written for konachan_full) at DATASET to the pack at PACK_DIR, with categorized tags (see
+    clip_training.deepghs). Posts already in the pack are skipped, so an interrupted run is simply run again."""
+    from .deepghs import encode_post, posts
+
+    left_out: dict[str, int] = {}
+    items = (
+        (post.key, (post.archive, post.offset, post.size, post.sha256, post.tags)) for post in posts(dataset, prefix, left_out)
+    )
+    _import(pack_dir, items, encode_post, left_out=left_out, **options)
 
 
 @main.command("check-cagliostro")
@@ -470,6 +501,31 @@ def check_cagliostro(dataset, decode, workers):
     checked = ", ".join(f"{count} {status}" for status, count in statuses.most_common())
     click.echo(f"{len(pairs)} pairs ({checked}), {bad} damaged, {len(unpaired)} files without their pair", err=True)
     if bad or unpaired:
+        raise SystemExit(1)
+
+
+@main.command("check-deepghs")
+@click.argument("dataset", type=click.Path(exists=True, file_okay=False))
+@click.option("--decode/--no-decode", default=True, show_default=True, help="Also decode every image and compare its size.")
+@click.option("--workers", "-j", type=click.IntRange(1), default=os.cpu_count(), show_default=True, help="Checking processes.")
+def check_deepghs(dataset, decode, workers):
+    """Check a deepghs *_full dataset at DATASET before importing it: archive sizes against their listings, every
+    post's file against its SHA-256 (and, with --decode, that it decodes to the size the table says), ids listed
+    once, tags in the dictionary. Problems are printed to stdout, one ``file<TAB>problem`` per line."""
+    from .deepghs import check_listing, check_post
+
+    problems, posts = check_listing(dataset)
+    for what, problem in problems:
+        click.echo(f"{what}\t{problem}")
+    bad = len(problems)
+    with tqdm(total=len(posts), unit="img", desc="Checking") as progress:
+        for (filename, *_), problem in bounded_map(check_post, ((*post, decode) for post in posts), workers):
+            if problem is not None:
+                bad += 1
+                click.echo(f"{filename}\t{problem}")
+            progress.update()
+    click.echo(f"{len(posts)} posts in the archives, {bad} problems", err=True)
+    if bad:
         raise SystemExit(1)
 
 

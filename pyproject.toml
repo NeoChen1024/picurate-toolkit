@@ -29,6 +29,7 @@ repair = ["einops", "hydra-core", "iopath", "setuptools"]
 dev = ["black", "isort"]
 # CLIP fine-tuning scripts (src/clip_training), not needed for deduplication.
 training = [
+    "pyarrow",
     "schedulefree",
     "tensorboard>=2.21",
     "tokenizers",

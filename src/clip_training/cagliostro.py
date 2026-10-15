@@ -230,7 +230,7 @@ def read_caption(caption_path: str) -> list[tuple[str, bool]]:
 
 
 def encode_pair(key: str, image_path: str, caption_path: str, budget: int):
-    """Worker: the encoded image and the parsed caption, or the exception."""
+    """Worker: the encoded image and the parsed caption (categorized by the caller), or the exception and no tags."""
     from .pack import encode_file
 
     try:
